@@ -1,5 +1,6 @@
-# Go
+# Go build/test artifacts
 *.exe
+*.exe~
 *.dll
 *.so
 *.dylib
@@ -8,19 +9,19 @@
 coverage.out
 coverage.html
 
-# Build output
+# Local binaries / build output
 /bin/
 /dist/
 /build/
 
-# ChronicleDB runtime artifacts
+# ChronicleDB runtime/database artifacts
 /data/
 /tmp/
 *.wal
 *.snap
 *.db
 
-# IDE
+# Editors / IDEs
 .idea/
 .vscode/
 *.swp
