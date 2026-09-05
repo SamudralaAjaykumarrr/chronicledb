@@ -1,0 +1,36 @@
+# Go
+*.exe
+*.dll
+*.so
+*.dylib
+*.test
+*.out
+coverage.out
+coverage.html
+
+# Build output
+/bin/
+/dist/
+/build/
+
+# ChronicleDB runtime artifacts
+/data/
+/tmp/
+*.wal
+*.snap
+*.db
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Environment / secrets
+.env
+.env.*
+!.env.example
