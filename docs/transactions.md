@@ -1,7 +1,12 @@
 # Transaction Model
 
-Status: Architecture Foundation. No transaction implementation exists
-yet.
+Status: Phase 2 implemented (`internal/txn`), except §6-7 (`RequestID`
+idempotency and uncertain-outcome handling), which remain Phase 3
+scope per `docs/roadmap.md` and are not implemented by this phase. §1-5
+below are implemented as specified and tested against
+`docs/scenario-corpus.md` §Transactions. See §9 for implementation-time
+decisions, including where the deterministic-apply role described in §4
+currently lives before `internal/fsm` exists (Phase 3).
 
 This document defines the transaction lifecycle, idempotency, and
 uncertain-outcome handling. MVCC visibility and conflict rules are
@@ -232,3 +237,62 @@ matters to the caller."
   and **submitted durable commit command** (durable, replicated,
   outcome-stable). See [`docs/invariants.md`](invariants.md)
   `REQUEST-OUTCOME-STABILITY`.
+
+## 9. Phase 2 implementation decisions (resolved)
+
+- **No `internal/fsm` yet**: Phase 3 (`docs/roadmap.md`) is what
+  factors the deterministic `Apply` boundary out into its own package.
+  Until then, `internal/txn.Manager` plays that role directly for
+  `CommitTxn` commands: `Manager.commit` (live path) and
+  `Manager.recover` (restart replay path) both run the identical
+  conflict-check-then-apply sequence against `internal/mvcc`, so
+  replay reconstructs exactly the outcome a live apply would have
+  produced (docs/recovery.md §11-12). Moving this into `internal/fsm`
+  in Phase 3 is expected to be a mechanical extraction, not a semantic
+  change.
+- **No `RequestID` field in the Phase 2 command format**: the
+  `CommitTxn` payload `internal/txn` encodes carries only `TxnID`,
+  `StartSeq`, and `Mutations` — not the `RequestID` this document's §3
+  eventually specifies. Reserving an unused field now would be
+  speculative; the payload carries an explicit format-version byte
+  (`commitTxnRecordVersion`) specifically so Phase 3 can introduce a new
+  version that adds it without ambiguity.
+- **Conflict check happens before the durable append, not after**: in
+  standalone mode there is no leader/replica split yet, so "optional
+  leader pre-check" and "authoritative apply-time check" (§4.1)
+  collapse into a single atomic operation performed once, under
+  `Manager.mu`, immediately before appending. A transaction that
+  conflicts is therefore never appended to the WAL at all — no
+  `CommitTxn` record exists for it — rather than being appended and
+  then recorded as an `ABORTED` apply result. This is a valid Phase 2
+  collapse of the two steps §4.1 describes as conceptually distinct;
+  Phase 4/5 (once proposals and applies are genuinely separated by
+  replication latency) is expected to reintroduce the two-step form
+  described in §4.1, including the possibility of a committed Raft log
+  entry whose deterministic apply result is `ABORTED`.
+- **Read-only commits are not durably recorded**: a transaction whose
+  local write set is empty at `COMMIT` time commits trivially without
+  appending anything to the WAL — there is no mutation set whose
+  durability or conflict status could matter (§2: only a submitted
+  mutation set becomes a durable command).
+- **A durability failure during commit is terminal for that
+  transaction**: if the WAL append or the subsequent `Sync` fails,
+  `Manager.commit` returns the underlying error, applies nothing to
+  `internal/mvcc`, and the transaction becomes terminal (`Aborted`) —
+  there is no partial/retriable "commit in doubt" state exposed within
+  a single transaction's lifecycle in Phase 2 (that is what §7's future
+  `RequestID`-based retry contract is for, once Phase 3 exists). A
+  known, explicitly out-of-scope-for-Phase-2 risk this does not solve:
+  if a `Sync` failure is itself transient (the underlying file
+  descriptor remains usable) rather than a hard fault, bytes from the
+  failed attempt could in principle still be flushed to disk by a
+  *later*, unrelated successful `Sync` on the same segment, and thus
+  reappear on a subsequent restart's replay. `internal/wal`'s own Phase
+  1 fault-injection test (`TestSyncFailurePropagatesNotTreatedAsSuccess`)
+  demonstrates the concrete scenario it protects against (a closed
+  segment) also breaks all subsequent appends, so this could not
+  manifest there; a genuinely transient fsync fault that leaves the
+  WAL still writable is a `docs/wal.md`-level durability-contract
+  question, not something `internal/txn` can safely paper over on its
+  own, and is recorded as a remaining risk rather than silently
+  patched.

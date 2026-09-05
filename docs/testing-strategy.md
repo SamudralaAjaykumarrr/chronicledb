@@ -1,9 +1,14 @@
 # Testing Strategy
 
-Status: Architecture Foundation. No tests exist yet; this document
-specifies the testing architecture future implementation phases must
-build toward. No test counts, coverage numbers, or pass/fail results
-are claimed here.
+Status: Unit, component, property, and fuzz tests exist for Phase 1
+(`internal/wal`, `internal/storage`) and Phase 2 (`internal/mvcc`,
+`internal/txn`) — see `docs/scenario-corpus.md` for exactly which
+scenarios pass. The deterministic distributed simulator (§3) and the
+categories that depend on it (partition tests, chaos tests) remain
+unimplemented target design only, since `internal/raft` does not exist
+until Phase 4. This document specifies the testing architecture future
+implementation phases must build toward; it does not itself assert an
+aggregate coverage or pass-count claim (see §2's guiding principle).
 
 Testing targets **correctness properties** (the invariants in
 [`docs/invariants.md`](invariants.md)), not coverage percentage.

@@ -1,6 +1,9 @@
 # MVCC Model
 
-Status: Architecture Foundation. No MVCC implementation exists yet.
+Status: Phase 2 implemented (`internal/mvcc`). The visibility and
+conflict rules below are implemented as specified and tested against
+`docs/scenario-corpus.md` §Transactions (TX-1 through TX-8). See §8 for
+implementation-time decisions.
 
 ## 1. Isolation level: Snapshot Isolation, precisely scoped
 
@@ -210,3 +213,36 @@ data model does not need to change shape later:
   the same result (per §3, visibility is a pure function of
   `StartSeq`, the version chain as of apply time it was computed
   against, and `T`'s own write set) — SI subsumes repeatable read.
+
+## 8. Phase 2 implementation decisions (resolved)
+
+- **In-memory representation**: `internal/mvcc.Store` holds one
+  `map[string][]Version` protected by a single `sync.RWMutex`, exactly
+  the "in-memory materialized state, rebuilt from durable history at
+  startup" §1 anticipates — no on-disk index, B-tree, or LSM structure.
+  Each key's `[]Version` is maintained sorted ascending by `CommitSeq`
+  purely as a consequence of how it is built (`ApplyCommit` only ever
+  appends a strictly larger `CommitSeq` than the chain's current tail);
+  `Visible` locates the newest version with `CommitSeq <= StartSeq` via
+  binary search over that invariant, verified against a linear-scan
+  reference model under randomized inputs
+  (`internal/mvcc/mvcc_test.go`'s `TestVisibilityPropertyAgainstReferenceModel`).
+- **Conflict check granularity**: `CheckConflicts` evaluates every
+  mutation's key under one `RLock` (not one lock per key), so the
+  answer reflects a single consistent instant of the store rather than
+  a torn view across separate lookups — required because §4's rule
+  ("if any key conflicts, the whole transaction aborts") must be
+  evaluated as one atomic question, not key-by-key.
+- **Atomicity implementation**: `ApplyCommit` validates every
+  mutation's monotonicity precondition (new `CommitSeq` strictly
+  greater than that key's current tail) in a first pass, and only then
+  mutates any chain in a second pass — so a precondition failure on one
+  key of a multi-key commit can never leave an earlier key in the same
+  batch mutated while a later one is not (§5 ATOMICITY, tested by
+  `TestApplyCommitAtomicOnMonotonicityViolation`). In correct usage
+  (all writes funneled through `internal/txn.Manager`'s single
+  serialization point) this precondition can never actually fail; it
+  exists as a defensive invariant check, not an expected runtime path.
+- **`GCWatermark`/version GC**: not implemented, per §6 and
+  `docs/non-goals.md` §MVCC version garbage collection — every version
+  ever committed is retained for the lifetime of the process.

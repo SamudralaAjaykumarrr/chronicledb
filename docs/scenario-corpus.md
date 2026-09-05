@@ -1,7 +1,10 @@
 # Scenario Corpus
 
-Status: Architecture Foundation. **None of these scenarios currently
-pass, because none of them are implemented yet.** This document
+Status: LD-1 through LD-6 (Phase 1, `internal/wal`) and TX-1 through
+TX-8 (Phase 2, `internal/mvcc` + `internal/txn`) have passing,
+reproducible tests — see each scenario's **Status** line below for the
+specific test. **Every other scenario in this document does not
+currently pass, because it is not implemented yet.** This document
 specifies the deterministic scenarios future test suites (see
 [`docs/testing-strategy.md`](testing-strategy.md)) must implement and
 pass before the corresponding maturity level
@@ -111,6 +114,7 @@ executable.
 - **Invariants**: `MVCC VISIBILITY`, `ATOMICITY`.
 - **Oracle**: component test against `internal/mvcc` + `internal/txn`.
 - **Phase**: 2.
+- **Status**: passing — `internal/txn/txn_test.go::TestTX1_BeginReadWriteCommit`.
 
 ### TX-2: Aborted transaction
 
@@ -118,6 +122,7 @@ executable.
 - **Expected state**: no new version of `K`.
 - **Invariants**: `ABORT SAFETY`.
 - **Phase**: 2.
+- **Status**: passing — `internal/txn/txn_test.go::TestTX2_AbortedTransaction`.
 
 ### TX-3: Multi-key atomic commit
 
@@ -129,6 +134,7 @@ executable.
 - **Oracle**: concurrent-reader test asserting no reader ever observes
   exactly 1 or 2 of the 3 new versions.
 - **Phase**: 2.
+- **Status**: passing — `internal/txn/txn_test.go::TestTX3_MultiKeyAtomicCommit`.
 
 ### TX-4: Concurrent non-conflicting transactions
 
@@ -138,6 +144,9 @@ executable.
   exist.
 - **Invariants**: `CONFLICT CORRECTNESS`.
 - **Phase**: 2.
+- **Status**: passing — `internal/txn/txn_test.go::TestTX4_ConcurrentNonConflictingTransactions`;
+  concurrent (goroutine-level, `-race`-clean) variant in
+  `internal/txn/concurrent_test.go::TestConcurrentNonConflictingWritersAllCommit`.
 
 ### TX-5: Concurrent conflicting transactions
 
@@ -151,6 +160,9 @@ executable.
 - **Oracle**: exact reproduction of [`docs/mvcc.md`](mvcc.md) §4
   example.
 - **Phase**: 2.
+- **Status**: passing — `internal/txn/txn_test.go::TestTX5_ConcurrentConflictingTransactions`;
+  concurrent (goroutine-level, `-race`-clean) variant with 50 concurrent
+  writers in `internal/txn/concurrent_test.go::TestConcurrentConflictingWritersExactlyOneWins`.
 
 ### TX-6: Read snapshot remains stable
 
@@ -159,6 +171,7 @@ executable.
 - **Expected state**: `T1`'s second read still returns `v0`.
 - **Invariants**: `MVCC VISIBILITY`.
 - **Phase**: 2.
+- **Status**: passing — `internal/txn/txn_test.go::TestTX6_ReadSnapshotStable`.
 
 ### TX-7: Delete/tombstone visibility
 
@@ -167,6 +180,7 @@ executable.
 - **Expected state**: `T1` sees `K` as not-found (tombstone honored).
 - **Invariants**: `MVCC VISIBILITY`.
 - **Phase**: 2.
+- **Status**: passing — `internal/txn/txn_test.go::TestTX7_DeleteTombstoneVisibility`.
 
 ### TX-8: Snapshot Isolation write-skew example
 
@@ -186,6 +200,7 @@ executable.
   undocumented/unproven SERIALIZABLE behavior) or the test itself
   drifted from the documented scenario.
 - **Phase**: 2.
+- **Status**: passing — `internal/txn/txn_test.go::TestTX8_SnapshotIsolationWriteSkew`.
 
 ---
 
@@ -452,8 +467,10 @@ executable.
 | 6 | SN-1 .. SN-6, ID-4 (after snapshot+compaction) |
 | 7 | Chaos/combined variants of RF-11, RF-13, RF-15 under randomized fault schedules |
 
-No scenario in this document is claimed to currently pass. This table
-exists to make future maturity claims falsifiable: a claim that
-ChronicleDB has reached a given roadmap phase must be checked against
-whether the scenarios listed for that phase (and all prior phases)
-actually have passing, reproducible tests.
+Only scenarios with an explicit **Status: passing** line above
+currently pass (LD-1 through LD-6, TX-1 through TX-8); every other
+scenario in this document is not claimed to pass. This table exists to
+make future maturity claims falsifiable: a claim that ChronicleDB has
+reached a given roadmap phase must be checked against whether the
+scenarios listed for that phase (and all prior phases) actually have
+passing, reproducible tests.

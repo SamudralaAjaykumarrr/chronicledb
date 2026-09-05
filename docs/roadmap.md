@@ -25,13 +25,29 @@ manipulation to reproduce torn-tail and corruption scenarios. See
 [`docs/storage.md`](storage.md) and [`docs/wal.md`](wal.md) for the
 design as implemented.
 
-### Phase 2 — MVCC + transactions + Snapshot Isolation
+### Phase 2 — MVCC + transactions + Snapshot Isolation — COMPLETE
 
 `internal/mvcc` and `internal/txn` implement the visibility and
 conflict rules in [`docs/mvcc.md`](mvcc.md) and
 [`docs/transactions.md`](transactions.md), running on top of Phase 1's
-durable log in standalone (Raft-less) mode. Tested against
-[`docs/scenario-corpus.md`](scenario-corpus.md) §Transactions.
+durable log in standalone (Raft-less) mode. Tested and passing against
+[`docs/scenario-corpus.md`](scenario-corpus.md) §Transactions (TX-1
+through TX-8), including: a property test checking MVCC visibility
+against a reference model over randomized version chains; concurrent
+(goroutine-level, race-detector-clean) non-conflicting and conflicting
+writer tests; a real subprocess kill-based crash test proving a
+committed transaction survives an ungraceful process kill; and restart-
+recovery tests for committed single- and multi-key transactions,
+aborted transactions, never-committed workspace state, tombstones, and
+CommitSeq ordering, all via `internal/txn.Manager`'s real recovery path
+(no in-memory shortcut). `internal/fsm` (the deterministic Apply
+boundary) does not exist yet — Phase 2 plays that role directly inside
+`internal/txn.Manager` for `CommitTxn` commands (docs/transactions.md
+§9); factoring it out into `internal/fsm` is Phase 3 scope. Per
+[`docs/roadmap.md`](roadmap.md) §Maturity Model, the `TRANSACTIONAL
+ENGINE` maturity level formally requires Phase 3 (`RequestID`
+idempotency) as well, which is explicitly out of scope for this phase
+— see the maturity claim in [`README.md`](../README.md).
 
 ### Phase 3 — Deterministic state-machine boundary + `RequestID` idempotency
 

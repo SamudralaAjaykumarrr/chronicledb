@@ -25,5 +25,7 @@ jobs:
         run: go test ./...
       - name: go test -race
         run: go test -race ./...
-      - name: fuzz smoke
+      - name: fuzz smoke (wal)
         run: go test ./internal/wal/... -fuzz FuzzDecodeFrameBytes -fuzztime 15s
+      - name: fuzz smoke (txn)
+        run: go test ./internal/txn/... -fuzz FuzzDecodeCommitTxn -fuzztime 15s

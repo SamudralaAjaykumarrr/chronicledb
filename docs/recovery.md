@@ -1,7 +1,10 @@
 # Recovery Model
 
-Status: Architecture Foundation. No recovery implementation exists
-yet.
+Status: Phase 1 (`internal/wal.Open`, §1 steps 1, 5-8) and Phase 2
+(`internal/txn.Manager.recover`, §1 step 11 for `CommitTxn` commands in
+standalone mode) are implemented. Steps 2-4, 9-10, and 12-14 remain
+Phase 3+ scope (`RequestID` outcome restoration, Raft hard state,
+snapshots) and are not implemented yet.
 
 This document defines the exact restart/recovery sequence a
 ChronicleDB node follows, so that a durable-but-uncommitted suffix,
@@ -158,3 +161,38 @@ answer it would have gotten from the node that originally applied the
 command — this is what `REQUEST-OUTCOME-STABILITY` (see
 [`docs/invariants.md`](invariants.md)) requires across restarts, not
 just across retries against a single continuously-running process.
+`RequestID` outcome restoration itself is Phase 3 scope (no such table
+exists yet); this section's principle — replay reconstructs the same
+answer a live node would give — is what Phase 2 already proves for
+transaction outcomes themselves (§6 below).
+
+## 6. Phase 2: standalone transactional recovery (implemented)
+
+`internal/txn.Manager.recover` implements this document's §1 step 11
+for `CommitTxn` commands, in standalone mode: it calls
+`internal/wal.WAL.Replay(1)`, decodes each `RecordTypeLogEntry` payload,
+and runs the exact same conflict-check-then-apply sequence
+`Manager.commit` runs for a live commit (docs/transactions.md §9), in
+order, into a freshly constructed, empty `internal/mvcc.Store`.
+
+Because Phase 2's live commit path only ever durably appends a
+`CommitTxn` record *after* it has already passed its conflict check
+(docs/transactions.md §9), every record recovery finds is guaranteed,
+by construction, to re-apply as `COMMITTED` when replayed in the exact
+same order against the exact same (initially empty) starting state. If
+`recover` ever finds a record that its own deterministic re-evaluation
+says would conflict, that is not treated as "this transaction must have
+aborted" — it is treated as proof that the durable log is not a
+legitimate, deterministically reproducible history (a form of
+corruption `internal/wal`'s checksums cannot detect, since the bytes
+are individually well-formed), and recovery fails closed
+(`RECOVERY-NON-INVENTION`) rather than guessing.
+
+This gives Phase 2 the properties this document requires without a
+`RequestID` table or Raft's committed-boundary machinery, both still
+absent: standalone mode has no possibility of a durable-but-uncommitted
+suffix from another node's perspective (§2.1), and every `CommitTxn`
+record that exists in the log was, by the live commit path's own
+construction, already a legitimately committed transaction — so replay
+never needs to distinguish "committed" from "merely present" the way
+Raft-mode recovery eventually will.

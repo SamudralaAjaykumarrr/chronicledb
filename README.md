@@ -21,15 +21,36 @@ LD-6), including real subprocess kill-based crash tests and direct
 on-disk corruption injection. See [`docs/wal.md`](docs/wal.md) and
 [`docs/storage.md`](docs/storage.md) for the implemented design.
 
-No transaction, MVCC, replication, Raft, or SQL implementation exists
-yet. See [`docs/roadmap.md`](docs/roadmap.md) §Maturity Model for the
+Phase 2 — MVCC + transactions + Snapshot Isolation (`internal/mvcc`,
+`internal/txn`) — is also implemented and tested against the
+`docs/scenario-corpus.md` §Transactions scenarios (TX-1 through TX-8):
+MVCC visibility, own-write shadowing, first-committer-wins write-write
+conflicts, atomic multi-key commit, abort safety, tombstone visibility,
+stable snapshots, and a demonstrated Snapshot-Isolation write-skew
+example (ChronicleDB does **not** claim SERIALIZABLE isolation — see
+[`docs/mvcc.md`](docs/mvcc.md) §1.1). Transaction commits are durably
+integrated with Phase 1's WAL and proven to survive restart, including
+a real subprocess kill-based crash test. See
+[`docs/mvcc.md`](docs/mvcc.md) and
+[`docs/transactions.md`](docs/transactions.md) for the implemented
+design.
+
+Per [`docs/roadmap.md`](docs/roadmap.md) §Maturity Model, the next
+maturity level, `TRANSACTIONAL ENGINE`, formally requires Phase 3
+(`RequestID` idempotency, and factoring `internal/fsm` out as its own
+deterministic Apply boundary) in addition to Phase 2 — Phase 3 is not
+implemented, so that maturity level is not yet claimed here even though
+Phase 2 itself is complete and evidenced.
+
+No replication, Raft, or SQL implementation exists yet. See
+[`docs/roadmap.md`](docs/roadmap.md) §Maturity Model for the
 evidence-based gates that govern every future maturity claim, and
 [`docs/architecture.md`](docs/architecture.md) for the system design
 itself.
 
-The next milestone is **Phase 2 — MVCC + transactions + Snapshot
-Isolation** (see [`docs/roadmap.md`](docs/roadmap.md)). Implementation
-has not begun.
+The next milestone is **Phase 3 — deterministic state-machine boundary
++ `RequestID` idempotency** (see
+[`docs/roadmap.md`](docs/roadmap.md)). Implementation has not begun.
 
 ## Documentation
 
