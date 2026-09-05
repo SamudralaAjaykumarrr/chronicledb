@@ -166,3 +166,19 @@ about.
   level in [`docs/failure-model.md`](failure-model.md); the exact
   error surfaced by a given OS/filesystem combination is an
   implementation detail validated in Phase 1 testing.
+
+### Phase 1 implementation decisions (resolved)
+
+- **Segment growth**: segments grow dynamically (`WriteAt` at the
+  current logical end-of-file); no pre-allocation. This is the smallest
+  implementation that preserves the append/fsync/checksum contract, and
+  pre-allocation can be added later purely as a performance optimization
+  without changing the on-disk format.
+- **Rotation threshold**: `internal/wal.DefaultSegmentMaxSize` is 16 MiB,
+  used when a caller does not specify one. This is a Phase 1 default,
+  not a correctness-relevant constant; any value preserves the segment
+  model above.
+- **Fsync failure handling**: `Segment.Sync`/`Segment.Append` wrap and
+  propagate the underlying OS error rather than retrying or masking it;
+  `internal/wal` never treats a failed `Sync` as successful (see
+  `internal/wal`'s `TestSyncFailurePropagatesNotTreatedAsSuccess`).

@@ -13,12 +13,17 @@ covering every system boundary listed in
 [`docs/architecture.md`](architecture.md). No implementation. This is
 the phase this repository is in as of this document.
 
-### Phase 1 — Single-node durable storage + WAL + crash recovery
+### Phase 1 — Single-node durable storage + WAL + crash recovery — COMPLETE
 
 `internal/storage`, `internal/wal`, and the recovery sequence in
 [`docs/recovery.md`](recovery.md) (minus Raft-specific parts) are
 implemented and tested against the scenarios in
-[`docs/scenario-corpus.md`](scenario-corpus.md) §Local Durability.
+[`docs/scenario-corpus.md`](scenario-corpus.md) §Local Durability
+(LD-1 through LD-6), including a real subprocess kill-based crash test
+(not merely a function-return simulation) and direct on-disk byte
+manipulation to reproduce torn-tail and corruption scenarios. See
+[`docs/storage.md`](storage.md) and [`docs/wal.md`](wal.md) for the
+design as implemented.
 
 ### Phase 2 — MVCC + transactions + Snapshot Isolation
 
@@ -138,8 +143,8 @@ interpretation guidance, not exhaustive:
 | Maturity level | Evidence gate |
 |---|---|
 | `INITIALIZED` | Repository scaffolding exists; no architecture, no implementation. |
-| `ARCHITECTURE FOUNDATION` | All documents/ADRs in [`docs/README.md`](README.md) exist, are internally consistent (see the cross-document consistency review performed for this phase), define every system boundary listed in [`docs/architecture.md`](architecture.md), and no database implementation has begun. **This repository's target state as of this document.** |
-| `SINGLE-NODE DURABLE ENGINE` | Phase 1 complete: `docs/scenario-corpus.md` §Local Durability scenarios pass, reproducibly, in CI. |
+| `ARCHITECTURE FOUNDATION` | All documents/ADRs in [`docs/README.md`](README.md) exist, are internally consistent (see the cross-document consistency review performed for this phase), define every system boundary listed in [`docs/architecture.md`](architecture.md), and no database implementation has begun. |
+| `SINGLE-NODE DURABLE ENGINE` | Phase 1 complete: `docs/scenario-corpus.md` §Local Durability scenarios pass, reproducibly, in CI. **This repository's current state.** `internal/storage`/`internal/wal` implement and test LD-1 through LD-6 (see test files under those packages); a GitHub Actions workflow (`.github/workflows/ci.yml`) runs `go test -race ./...` on every push, though this workflow has not yet executed on GitHub's servers since this repository has not yet been pushed there. |
 | `TRANSACTIONAL ENGINE` | Phases 2-3 complete: §Transactions and §Idempotency (immediate/after-restart) scenarios pass. |
 | `REPLICATED PROTOTYPE` | Phases 4-5 complete: §Raft/Replication scenarios pass in the deterministic simulator and in a real multi-process three-node deployment. |
 | `STRONG DISTRIBUTED V1` | Phases 6-7 complete: §Snapshots scenarios pass; chaos/combined fault schedules run for a meaningful duration without an invariant violation. |

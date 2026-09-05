@@ -59,8 +59,11 @@ terminology every other document depends on.
 
 ## What this documentation does not claim
 
-No document in this directory claims that any storage engine,
-transaction system, MVCC implementation, Raft consensus module, SQL
-layer, or CLI currently exists or has been tested. See
-[`vision.md`](vision.md) and [`roadmap.md`](roadmap.md) §Maturity
-Model for how capability claims are gated on implementation evidence.
+Phase 1's durable storage and WAL engine (`internal/storage`,
+`internal/wal`) is implemented and tested — see [`storage.md`](storage.md)
+and [`wal.md`](wal.md) for the design as actually built. No document in
+this directory claims that any transaction system, MVCC implementation,
+Raft consensus module, SQL layer, or CLI currently exists or has been
+tested. See [`vision.md`](vision.md) and [`roadmap.md`](roadmap.md)
+§Maturity Model for how capability claims are gated on implementation
+evidence.

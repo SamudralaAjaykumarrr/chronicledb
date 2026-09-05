@@ -11,20 +11,25 @@ store, or a wrapper around an existing finished database or consensus
 library. See [`docs/vision.md`](docs/vision.md) for the full statement
 of intent and explicit non-goals.
 
-Current maturity: **ARCHITECTURE FOUNDATION**
+Current maturity: **SINGLE-NODE DURABLE ENGINE**
 
-No storage-engine, transaction, MVCC, replication, Raft, or SQL
-implementation exists yet. This repository currently contains only the
-architecture specification and Architecture Decision Records that will
-guide that implementation. See
-[`docs/roadmap.md`](docs/roadmap.md) §Maturity Model for the
+Phase 1 — durable append-only segment storage (`internal/storage`) and
+a checksummed, replayable write-ahead log with crash recovery
+(`internal/wal`) — is implemented and tested against the
+`docs/scenario-corpus.md` §Local Durability scenarios (LD-1 through
+LD-6), including real subprocess kill-based crash tests and direct
+on-disk corruption injection. See [`docs/wal.md`](docs/wal.md) and
+[`docs/storage.md`](docs/storage.md) for the implemented design.
+
+No transaction, MVCC, replication, Raft, or SQL implementation exists
+yet. See [`docs/roadmap.md`](docs/roadmap.md) §Maturity Model for the
 evidence-based gates that govern every future maturity claim, and
 [`docs/architecture.md`](docs/architecture.md) for the system design
 itself.
 
-The next milestone is **Phase 1 — Single-node durable storage + WAL +
-crash recovery** (see [`docs/roadmap.md`](docs/roadmap.md)).
-Implementation has not begun.
+The next milestone is **Phase 2 — MVCC + transactions + Snapshot
+Isolation** (see [`docs/roadmap.md`](docs/roadmap.md)). Implementation
+has not begun.
 
 ## Documentation
 

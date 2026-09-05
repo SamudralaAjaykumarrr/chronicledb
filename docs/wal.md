@@ -193,3 +193,28 @@ Raft-specific persistent state (`currentTerm`, `votedFor`, log
 entries) is described in [`docs/raft.md`](raft.md) §Persistent State
 and is stored via the `HardState`/`LogEntry` record types defined
 above — it is not a second, parallel metadata store.
+
+## 9. Phase 1 implementation decisions (resolved)
+
+- **Non-`LogEntry` index field**: per §2, `HardState`/`Metadata`
+  records are "tracked by most recent record of this type rather than
+  by index." The implemented choice is that such records carry `index
+  = 0` in the frame and are identified purely by encountering them
+  during a forward, in-order scan — the last one seen (of a given type)
+  wins. `LogEntry` records use the field for their real, gap-free
+  logical index, which the implementation validates on every replay
+  (out-of-order or duplicate indices are treated as corruption per §6).
+- **Maximum record payload size**: `MaxRecordPayloadSize` is 64 MiB.
+  Any fully-framed record claiming a larger payload is rejected
+  (`ErrRecordTooLarge`) before any allocation is attempted, per
+  `docs/failure-model.md` §6's bounded-allocation requirement; a record
+  that is merely torn (not enough bytes physically present, regardless
+  of what its length field claims) is still classified as a torn tail,
+  never as oversized.
+- **`internal/wal.Open`** implements the Phase-1 subset of
+  `docs/recovery.md` §1 (steps 1, 5-8): it locates segments, replays and
+  checksum-verifies every record in order, truncates a torn tail found
+  only in the current (last) segment, and refuses startup unconditionally
+  on any other classification of corruption, an out-of-order log index,
+  an unsupported per-record or per-metadata format version, or a
+  non-empty log with no `Metadata` record at all.
