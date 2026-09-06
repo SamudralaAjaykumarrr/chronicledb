@@ -1,6 +1,10 @@
 # Raft Architecture
 
-Status: Architecture Foundation. No Raft implementation exists yet.
+Status: Phase 4 (`internal/raft` core + `internal/fault` deterministic
+simulator) is implemented and tested — see §9 for exactly what that
+does and does not yet mean. Production wiring to real transport/disk
+(`internal/transport`, an `internal/wal`-backed `raft.Storage`,
+`internal/node`) remains Phase 5, not yet implemented.
 
 ChronicleDB's architecture is designed to implement and expose real
 Raft mechanics as first-class, inspectable architecture, rather than
@@ -218,3 +222,118 @@ Full recovery ordering is specified in [`docs/recovery.md`](recovery.md).
 - No batching/pipelining optimizations are assumed by the correctness
   argument in this document; they may be added later as long as they
   do not change the commit rule in §4.
+
+## 9. Phase 4 implementation notes
+
+This section records implementation-time clarifications made while
+building `internal/raft` and `internal/fault` against the design above.
+None of it changes an accepted ADR; it documents the specific,
+previously-unspecified choices §1's `Step(state, input) -> outputs`
+sketch left open.
+
+### 9.1 Packages and division of responsibility
+
+- `internal/raft` — the pure core (`Core.Step`), its message/entry/
+  hard-state types, and the two interfaces it owns: `Storage`
+  (durable-state contract, ADR-0009) and `Rand` (election-timeout
+  jitter source, called directly by `Step` — ADR-0009 explicitly scopes
+  Randomness this way, unlike Storage/Transport/Clock). `Core.Step`
+  itself never calls `Storage`.
+- `internal/fault` — the deterministic simulator
+  (docs/testing-strategy.md §3): `Transport` (in-memory, explicitly
+  controllable message queue: drop/duplicate/delay/partition/isolate/
+  reorder), `MemoryStorage` (an in-memory `raft.Storage`, §9.4), a
+  seeded `Rand`, `Node` (owns one `Core` + `MemoryStorage` + the
+  logical timer countdowns that turn `Core.Output` timer-reset requests
+  into actual `InputElectionTimeout`/`InputHeartbeatTimeout` calls —
+  this is where ADR-0009's "Clock" interface is realized for Phase 4;
+  Phase 4 does not introduce a separate `raft.Clock` Go interface,
+  since nothing in the pure core needs to call one directly — ticks are
+  driven externally per §9.2), and `Cluster` (wires several `Node`s
+  together through one `Transport`, per docs/testing-strategy.md §3.1).
+
+### 9.2 Timer model: countdown ticks, not a `raft.Clock` interface
+
+`Core.Output` tells its driver *whether* to (re)arm a timer and *for
+how many logical ticks* (`ElectionTimeoutTicks`/`HeartbeatTimeoutTicks`,
+sampled using the injected `Rand`) — it never tracks elapsed ticks
+itself. `internal/fault.Node` is the driver that owns per-timer
+countdowns and calls `Core.Step` with `InputElectionTimeout`/
+`InputHeartbeatTimeout` when a countdown reaches zero, driven by
+`Cluster.Tick`/`AdvanceTicks` (docs/testing-strategy.md §3.1's single
+global logical clock; there is no `time.Sleep` anywhere in either
+package). A Leader's election timer and a Follower/Candidate's
+heartbeat timer are never explicitly disarmed — an `InputElectionTimeout`
+delivered to a Leader (or `InputHeartbeatTimeout` delivered to anyone
+else) is simply ignored by `Step` and produces no reset request, so the
+stale timer self-extinguishes on its own without special-case driver
+logic.
+
+### 9.3 Persistence-gating: exactly what waits for `InputPersistenceComplete`
+
+Per ADR-0008 ("before they can affect other nodes' state — granting a
+vote, acknowledging replication"), exactly three effects are withheld
+until their `PersistRequest.Seq` is acknowledged complete:
+
+1. A granted `RequestVoteResponse` (a denial is never gated — losing an
+   unpersisted denial on crash is always safe, §9.5).
+2. A successful `AppendEntriesResponse` (a follower's acknowledgement
+   that it has durably stored the entries in question).
+3. A Leader's own `matchIndex[self]` update (and the commit-rule
+   re-evaluation that follows from it) for an entry it just proposed —
+   the leader's own copy counts toward a majority only once the
+   leader's own persistence of it is confirmed, mirroring
+   docs/replication.md §1.2 steps 2-3's ordering.
+
+Sending `RequestVoteRequest`/`AppendEntriesRequest` (in either
+direction, including a Candidate's own vote-for-self) is **not**
+gated: losing an unpersisted send on crash is always self-correcting
+(the recipient's own persistence-before-grant rule is what actually
+protects `RAFT-ELECTION-SAFETY`; a resent/re-derived request after
+restart is harmless). Gating is implemented via a small internal
+pending-item queue keyed by `PersistRequest.Seq`, each item additionally
+tagged with the term (and, for log-index-tied items, the entry's term)
+it was created under, so a pending effect that has since gone stale
+(term changed; the entry was truncated by a later divergent-suffix
+repair) is silently dropped rather than incorrectly released.
+
+### 9.4 Storage: in-memory for Phase 4, `internal/wal`-backed adapter is Phase 5
+
+`internal/fault.MemoryStorage` is Phase 4's only `raft.Storage`
+implementation. `internal/wal` today (Phase 1-3) only ever appends
+sequentially (`WAL.AppendLogEntry`) — it has no operation to truncate
+an already-durable suffix, which Raft's divergent-suffix repair (§3)
+requires. Wiring a real `internal/wal`-backed `raft.Storage` adapter —
+including whatever `internal/wal` extension that truncation needs — is
+explicitly Phase 5 scope (`internal/node` wiring Phase 4's core to
+Phase 1-3's durable log), consistent with docs/roadmap.md's Phase 4/5
+boundary ("without yet wiring in production transport/disk"). This is
+the one point where Phase 4 deliberately stops short of "the real
+durable path" per its own charter, not an oversight:
+`ApplyPersistRequest` (the exact truncate-then-append-then-set-hard-
+state sequence a `Storage` must apply) is written against the
+`raft.Storage` interface generically, so a Phase 5 `internal/wal`-backed
+implementation is a drop-in replacement for `MemoryStorage`, not a
+redesign of `internal/raft`.
+
+### 9.5 No leader no-op entry on election
+
+This document does not specify a no-op-entry-on-election policy (a
+common Raft optimization to quickly extend current-term commitment to
+prior-term entries). Per this phase's instructions not to invent one,
+`Core.becomeLeader` does not append one; a newly elected leader commits
+a previous term's entries only once a legitimate client proposal in its
+own term reaches a majority (§4), exactly as this document already
+specifies. A future ADR may add one explicitly if a future phase's
+failover-latency goals require it.
+
+### 9.6 Log indexing convention
+
+`Core`'s internal log is 1-indexed with a fixed sentinel entry at index
+0 (`Term` 0), which is never persisted or exposed via `Core.Entries()`
+— it exists purely so `prevLogIndex == 0` consistency checks are
+trivially satisfied without a special case in the `AppendEntries`
+handler. `raft.Storage` implementations (including `MemoryStorage`) do
+not store this sentinel; `NewCore` reconstructs it from a gap-free
+`entries` slice starting at index 1 on every construction, including
+restart.

@@ -66,13 +66,26 @@ command history reach byte-identical outcomes) and restart-recovery
 tests proving a conflicted `RequestID`'s `ABORTED` outcome — not just a
 committed one — survives restart and is never re-evaluated on retry.
 
-### Phase 4 — Raft state machine + deterministic transport/clock simulator
+### Phase 4 — Raft state machine + deterministic transport/clock simulator — COMPLETE (at this phase's own scope)
 
-`internal/raft` core (§1 of [`docs/raft.md`](raft.md)) and
-`internal/fault`'s deterministic simulator
+`internal/raft` core (§1 of [`docs/raft.md`](raft.md); implementation
+notes in §9 there) and `internal/fault`'s deterministic simulator
 ([`docs/testing-strategy.md`](testing-strategy.md) §3) are implemented
-and proven against single-node-equivalent and small in-simulator
-cluster scenarios, without yet wiring in production transport/disk.
+and proven against small in-simulator cluster scenarios — election
+safety, vote safety (including across restart), log matching/divergent
+suffix repair, the current-term commit rule, quorum safety under
+partition, stale-leader step-down, and determinism/reproducibility —
+per the Phase-4 subset of [`docs/scenario-corpus.md`](scenario-corpus.md)
+§Raft/Replication (see that document's Phase 4 note for exactly what
+"passing in the deterministic simulator" does and does not claim).
+Production transport/disk are explicitly not wired in yet: `Storage` in
+Phase 4 is `internal/fault.MemoryStorage`, not `internal/wal` (see
+[`docs/raft.md`](raft.md) §9.4 for why — `internal/wal` does not yet
+support the truncation Raft's log-matching repair needs). This phase
+does **not** by itself advance the [`README.md`](../README.md) maturity
+claim past `TRANSACTIONAL ENGINE` — per §Maturity Model below,
+`REPLICATED PROTOTYPE` requires Phase 5 (a real multi-process
+deployment) as well.
 
 ### Phase 5 — Real replicated storage + quorum commit + leader failover
 

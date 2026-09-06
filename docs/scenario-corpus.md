@@ -1,14 +1,26 @@
 # Scenario Corpus
 
-Status: LD-1 through LD-6 (Phase 1, `internal/wal`) and TX-1 through
-TX-8 (Phase 2, `internal/mvcc` + `internal/txn`) have passing,
-reproducible tests — see each scenario's **Status** line below for the
-specific test. **Every other scenario in this document does not
-currently pass, because it is not implemented yet.** This document
-specifies the deterministic scenarios future test suites (see
-[`docs/testing-strategy.md`](testing-strategy.md)) must implement and
-pass before the corresponding maturity level
+Status: LD-1 through LD-6 (Phase 1, `internal/wal`), TX-1 through TX-8
+(Phase 2, `internal/mvcc` + `internal/txn`), ID-1 through ID-7
+immediate/after-restart (Phase 3), and a Phase-4 subset of RF-1 through
+RF-15 (`internal/raft` + `internal/fault`'s deterministic simulator —
+see each scenario's **Status** line below for exactly which, and note
+below) have passing, reproducible tests. **Every other scenario in this
+document does not currently pass, because it is not implemented yet.**
+This document specifies the deterministic scenarios future test suites
+(see [`docs/testing-strategy.md`](testing-strategy.md)) must implement
+and pass before the corresponding maturity level
 ([`docs/roadmap.md`](roadmap.md)) can be claimed.
+
+**Phase 4 note on the RF-\* scenarios below**: a Status line reading
+"passing in the deterministic simulator" means the scenario is proven
+against real, unmodified `internal/raft.Core` instances wired through
+`internal/fault`'s in-memory transport/clock/storage (Phase 4) — it
+does **not** mean the scenario has been proven against real
+transport/disk in a multi-process deployment, which
+[`docs/roadmap.md`](roadmap.md)'s `REPLICATED PROTOTYPE` maturity gate
+also requires (Phase 5). A scenario with no Status line below is not
+yet covered by any test, in the simulator or otherwise.
 
 Each scenario specifies: initial state, action/failure, event
 ordering, expected state, client-visible outcome, invariants involved,
@@ -304,6 +316,9 @@ executable.
   applied state.
 - **Invariants**: `STATE MACHINE SAFETY`.
 - **Phase**: 5.
+- **Status**: passing in the deterministic simulator (Phase 4) —
+  `internal/fault/cluster_test.go::TestRF1_NormalReplication`. Real
+  multi-process three-node proof remains Phase 5.
 
 ### RF-2: Follower lag
 
@@ -315,6 +330,9 @@ executable.
 - **Invariants**: `QUORUM SAFETY` (majority-only requirement),
   `RAFT LOG MATCHING`.
 - **Phase**: 5.
+- **Status**: passing in the deterministic simulator (Phase 4) —
+  `internal/fault/cluster_test.go::TestFollowerLagAndSlowFollower`.
+  Real multi-process three-node proof remains Phase 5.
 
 ### RF-3: Follower crash/restart
 
@@ -323,6 +341,11 @@ executable.
   snapshot install, converges.
 - **Invariants**: `STATE MACHINE SAFETY`.
 - **Phase**: 5 (log catch-up), 6 (snapshot catch-up).
+- **Status**: log-catch-up leg passing in the deterministic simulator
+  (Phase 4) —
+  `internal/fault/cluster_test.go::TestRestartSafety_LogAndCommitmentSurvive`.
+  Real multi-process proof and the snapshot-catch-up leg remain Phase
+  5/6.
 
 ### RF-4: Leader crash before quorum
 
@@ -359,6 +382,10 @@ executable.
   no-op or harmless re-confirmation.
 - **Invariants**: `RAFT LOG MATCHING`.
 - **Phase**: 5.
+- **Status**: passing in the deterministic simulator (Phase 4) —
+  `internal/raft/core_test.go::TestAppendEntriesDuplicateIsNoOp`,
+  `internal/fault/cluster_test.go::TestDuplicateAndDroppedMessages_RF7`.
+  Real multi-process three-node proof remains Phase 5.
 
 ### RF-8: Stale `AppendEntriesRPC`
 
@@ -368,6 +395,9 @@ executable.
   change.
 - **Invariants**: `RAFT ELECTION SAFETY`.
 - **Phase**: 5.
+- **Status**: passing in the deterministic simulator (Phase 4) —
+  `internal/raft/core_test.go::TestAppendEntriesRejectsStaleTerm`. Real
+  multi-process three-node proof remains Phase 5.
 
 ### RF-9: Divergent suffix
 
@@ -377,6 +407,10 @@ executable.
   never affects already-committed entries.
 - **Invariants**: `RAFT LOG MATCHING`, `LEADER COMPLETENESS`.
 - **Phase**: 5.
+- **Status**: passing in the deterministic simulator (Phase 4) —
+  `internal/raft/core_test.go::TestDivergentSuffixTruncated`,
+  `internal/fault/cluster_test.go::TestStaleLeaderSafety_HealAndStepDown`.
+  Real multi-process three-node proof remains Phase 5.
 
 ### RF-10: Stale leader
 
@@ -386,6 +420,9 @@ executable.
   immediately.
 - **Invariants**: `RAFT ELECTION SAFETY`.
 - **Phase**: 5.
+- **Status**: passing in the deterministic simulator (Phase 4) —
+  `internal/fault/cluster_test.go::TestStaleLeaderSafety_HealAndStepDown`.
+  Real multi-process three-node proof remains Phase 5.
 
 ### RF-11: Minority partition
 
@@ -395,6 +432,10 @@ executable.
   [`docs/replication.md`](replication.md) §5.
 - **Invariants**: `QUORUM SAFETY`.
 - **Phase**: 5, 7.
+- **Status**: passing in the deterministic simulator (Phase 4) —
+  `internal/fault/cluster_test.go::TestQuorumSafety_MinorityPartitionCannotCommit`.
+  Real multi-process three-node proof and the chaos variant remain
+  Phase 5/7.
 
 ### RF-12: Majority election
 
@@ -404,6 +445,10 @@ executable.
   within bounded simulated time.
 - **Invariants**: `RAFT ELECTION SAFETY`, `LEADER COMPLETENESS`.
 - **Phase**: 5.
+- **Status**: passing in the deterministic simulator (Phase 4) —
+  `internal/fault/cluster_test.go::TestQuorumSafety_MinorityPartitionCannotCommit`,
+  `TestStaleLeaderSafety_HealAndStepDown`. Real multi-process
+  three-node proof remains Phase 5.
 
 ### RF-13: Old leader rejoin
 
@@ -413,6 +458,10 @@ executable.
   resumes as a normal follower; no committed entry lost.
 - **Invariants**: `RAFT LOG MATCHING`, `LEADER COMPLETENESS`.
 - **Phase**: 5, 7.
+- **Status**: passing in the deterministic simulator (Phase 4) —
+  `internal/fault/cluster_test.go::TestStaleLeaderSafety_HealAndStepDown`.
+  Real multi-process three-node proof and the chaos variant remain
+  Phase 5/7.
 
 ### RF-14: Slow follower
 
@@ -422,6 +471,9 @@ executable.
   responsive nodes; slow follower eventually catches up.
 - **Invariants**: `QUORUM SAFETY`.
 - **Phase**: 5.
+- **Status**: passing in the deterministic simulator (Phase 4) —
+  `internal/fault/cluster_test.go::TestFollowerLagAndSlowFollower`. Real
+  multi-process three-node proof remains Phase 5.
 
 ### RF-15: Repeated election
 
@@ -432,6 +484,14 @@ executable.
   duplicated across the churn.
 - **Invariants**: `RAFT ELECTION SAFETY`, `STATE MACHINE SAFETY`.
 - **Phase**: 5, 7 (chaos variant).
+- **Status**: passing in the deterministic simulator (Phase 4) —
+  `internal/fault/cluster_test.go::TestElectionSafety_AtMostOneLeaderPerTerm`
+  (forces repeated elections via leader crashes),
+  `internal/fault/property_test.go::TestProperty_RandomizedScheduleNeverViolatesSafety`
+  (40 randomized seeds combining elections, partitions, crashes, and
+  restarts, asserting election safety and log matching hold after every
+  scheduled action). Real multi-process three-node proof and the full
+  chaos variant remain Phase 5/7.
 
 ---
 
@@ -498,14 +558,20 @@ executable.
 | 1 | LD-1 .. LD-6 |
 | 2 | TX-1 .. TX-8 |
 | 3 | ID-1 .. ID-5 (partial) |
-| 5 | RF-1 .. RF-15, ID-4 (immediate/after-restart already from 3) |
-| 6 | SN-1 .. SN-6, ID-4 (after snapshot+compaction) |
+| 4 | RF-1, RF-2, RF-3 (log-catch-up leg), RF-7 .. RF-15 — in the deterministic simulator only (see the Phase 4 note above) |
+| 5 | RF-1 .. RF-15 in a real multi-process deployment, ID-4 (immediate/after-restart already from 3) |
+| 6 | SN-1 .. SN-6, ID-4 (after snapshot+compaction), RF-3's snapshot-catch-up leg |
 | 7 | Chaos/combined variants of RF-11, RF-13, RF-15 under randomized fault schedules |
 
-Only scenarios with an explicit **Status: passing** line above
-currently pass (LD-1 through LD-6, TX-1 through TX-8); every other
-scenario in this document is not claimed to pass. This table exists to
-make future maturity claims falsifiable: a claim that ChronicleDB has
-reached a given roadmap phase must be checked against whether the
-scenarios listed for that phase (and all prior phases) actually have
-passing, reproducible tests.
+Scenarios with an explicit **Status: passing** line above currently
+pass at the stated scope — LD-1 through LD-6, TX-1 through TX-8, ID-1
+through ID-7 (immediate/after-restart), and the Phase-4,
+simulator-only subset of RF-1 through RF-15 listed in the Phase 4 row
+above. Every other scenario in this document is not claimed to pass,
+and even a passing Phase-4 RF-\* status is explicitly not a claim that
+the real multi-process (Phase 5) leg of that same scenario passes. This
+table exists to make future maturity claims falsifiable: a claim that
+ChronicleDB has reached a given roadmap phase must be checked against
+whether the scenarios listed for that phase (and all prior phases), at
+the scope that phase actually requires, have passing, reproducible
+tests.

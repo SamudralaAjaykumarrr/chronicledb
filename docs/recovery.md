@@ -3,9 +3,16 @@
 Status: Phase 1 (`internal/wal.Open`, §1 steps 1, 5-8), Phase 2
 (`internal/txn.Manager.recover`, §1 step 11 for `CommitTxn` commands in
 standalone mode), and Phase 3 (§1 step 12, `RequestID` outcome
-restoration via `internal/fsm.Apply` replay) are implemented. Steps
-2-4, 9-10, and 13-14 remain Raft/snapshot scope (Phase 4+) and are not
-implemented yet.
+restoration via `internal/fsm.Apply` replay) are implemented. Phase 4
+implements step 9's *logic* — `raft.NewCore` reconstructing
+currentTerm/votedFor/log from a `raft.Storage`, with commitIndex/
+appliedIndex always starting at 0 per §2 below — and proves it against
+`internal/fault`'s simulated (in-memory) durable store
+(`internal/fault/cluster_test.go::TestVoteSafety_SurvivesRestart`,
+`TestRestartSafety_LogAndCommitmentSurvive`); it does not yet wire this
+against the real `internal/wal` (that remains `internal/node`'s job,
+Phase 5 — see [`docs/raft.md`](raft.md) §9.4). Steps 2-4, 10, and 13-14
+remain Raft/snapshot scope and are not implemented yet.
 
 This document defines the exact restart/recovery sequence a
 ChronicleDB node follows, so that a durable-but-uncommitted suffix,

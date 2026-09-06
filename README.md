@@ -54,7 +54,23 @@ design.
 Per [`docs/roadmap.md`](docs/roadmap.md) §Maturity Model, `TRANSACTIONAL
 ENGINE` is Phases 2-3 together; both are now complete and evidenced.
 
-No replication, Raft, or SQL implementation exists yet. See
+Phase 4 — a deterministic Raft consensus core (`internal/raft`) and a
+deterministic distributed-systems test harness (`internal/fault`) — is
+also implemented: real, unmodified `internal/raft.Core` instances
+(follower/candidate/leader roles, term/vote safety, log replication and
+divergent-suffix repair, the current-term commit rule) are proven
+against election safety, vote safety across restart, quorum safety
+under partition, stale-leader step-down, and determinism, all via
+`internal/fault`'s in-memory transport/clock/storage — see
+[`docs/raft.md`](docs/raft.md) §9 and
+[`docs/scenario-corpus.md`](docs/scenario-corpus.md) §Raft/Replication
+for exactly what is (and is not) covered. Phase 4 deliberately stops
+short of real transport/disk and a client-facing protocol — per
+[`docs/roadmap.md`](docs/roadmap.md), that is Phase 5, and this phase
+does **not** advance the maturity claim past `TRANSACTIONAL ENGINE` on
+its own; `REPLICATED PROTOTYPE` requires Phase 5 as well.
+
+No SQL implementation exists yet. See
 [`docs/roadmap.md`](docs/roadmap.md) §Maturity Model for the
 evidence-based gates that govern every future maturity claim, and
 [`docs/architecture.md`](docs/architecture.md) for the system design

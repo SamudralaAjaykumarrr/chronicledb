@@ -29,3 +29,7 @@ jobs:
         run: go test ./internal/wal/... -fuzz FuzzDecodeFrameBytes -fuzztime 15s
       - name: fuzz smoke (fsm)
         run: go test ./internal/fsm/... -fuzz FuzzDecodeCommitTxn -fuzztime 15s
+      - name: fuzz smoke (raft append-entries reconciliation)
+        run: go test ./internal/raft/... -fuzz FuzzAppendEntriesReconciliation -fuzztime 15s
+      - name: fuzz smoke (raft request-vote handling)
+        run: go test ./internal/raft/... -fuzz FuzzRequestVoteHandling -fuzztime 15s

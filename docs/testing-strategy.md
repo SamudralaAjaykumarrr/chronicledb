@@ -2,18 +2,23 @@
 
 Status: Unit, component, property, and fuzz tests exist for Phase 1
 (`internal/wal`, `internal/storage`), Phase 2 (`internal/mvcc`,
-`internal/txn`), and Phase 3 (`internal/fsm`, plus `internal/txn`'s
-idempotency/recovery integration tests) — see `docs/scenario-corpus.md`
-for exactly which scenarios pass. Phase 3 additionally exercises
-deterministic replay equivalence (two independently constructed
-`internal/fsm.FSM` instances fed the identical command history) as a
-concrete instance of the "Deterministic distributed simulation" row
-below, in miniature and without any networking/Raft — the full
-simulator itself remains unimplemented target design, since
-`internal/raft` does not exist until Phase 4. This document specifies
-the testing architecture future implementation phases must build
-toward; it does not itself assert an aggregate coverage or pass-count
-claim (see §2's guiding principle).
+`internal/txn`), Phase 3 (`internal/fsm`, plus `internal/txn`'s
+idempotency/recovery integration tests), and Phase 4 (`internal/raft`
+unit/fuzz tests plus `internal/fault`'s deterministic simulator and its
+own cluster-level invariant/property tests) — see
+`docs/scenario-corpus.md` for exactly which scenarios pass. Phase 3
+exercised deterministic replay equivalence (two independently
+constructed `internal/fsm.FSM` instances fed the identical command
+history) as a concrete instance of the "Deterministic distributed
+simulation" row below, in miniature and without any networking/Raft;
+Phase 4 now implements that row's full target design — real
+`internal/raft.Core` instances wired through `internal/fault`'s
+in-memory transport and logical clock — though still without
+production transport/disk (see docs/raft.md §9 and the Phase 4/5
+boundary in docs/roadmap.md). This document specifies the testing
+architecture future implementation phases must build toward; it does
+not itself assert an aggregate coverage or pass-count claim (see §2's
+guiding principle).
 
 Testing targets **correctness properties** (the invariants in
 [`docs/invariants.md`](invariants.md)), not coverage percentage.
@@ -116,6 +121,20 @@ scheduler eliminate all three problems for the Raft/replication test
 surface. Real-time end-to-end tests (§1, "End-to-end tests") still have
 a place for validating the production transport/clock adapters
 themselves, but not for validating Raft safety logic.
+
+### 3.4 Implementation status (Phase 4)
+
+§3.1's design is implemented by `internal/fault`: `Transport` (message
+queues + drop/duplicate/delay/partition/isolate/reorder controls),
+`Node`'s per-timer tick countdowns (the logical clock), `MemoryStorage`
+(the simulated disk — in-memory for Phase 4; a real `internal/wal`-
+backed adapter is Phase 5, see docs/raft.md §9.4), and `Cluster` (the
+scheduler tying them together). `internal/fault/transport_test.go`
+component-tests the transport itself (ADR-0009's own proof obligation
+for this simulator, independent of any Raft scenario it later runs);
+`internal/fault/cluster_test.go` and `property_test.go` are where the
+`docs/scenario-corpus.md` §Raft/Replication scenarios and the
+determinism/reproducibility claim in §3.2 are actually exercised.
 
 ## 4. Relationship to the scenario corpus
 
