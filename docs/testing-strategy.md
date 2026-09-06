@@ -33,10 +33,17 @@ constrained SQL frontend (`internal/sql`), including its own real
 three-node cluster distributed evidence — which found and fixed one
 further genuine Phase 5 liveness bug, `internal/node.Node.BeginReadIndex`
 stalling indefinitely immediately after a leader failover with no
-intervening write (§8.1). This document specifies the testing
-architecture future implementation phases must build toward; it does
-not itself assert an aggregate coverage or pass-count claim (see §2's
-guiding principle).
+intervening write (§8.1). Phase 9 adds §9 below: the **Benchmarks**
+and **Soak tests** rows this document's own §1 table named back in
+Phase 0 are now real (benchmarks; soak tests remain explicitly
+deferred, unchanged), plus a new **Observability tests** category
+proving metrics/status move on real events and are race-safe — see
+`docs/benchmarks.md` and `docs/observability.md` for the full account,
+including one genuine performance bug (WAL replay's O(n²) I/O pattern)
+this phase's profiling found and fixed. This document specifies the
+testing architecture future implementation phases must build toward;
+it does not itself assert an aggregate coverage or pass-count claim
+(see §2's guiding principle).
 
 Testing targets **correctness properties** (the invariants in
 [`docs/invariants.md`](invariants.md)), not coverage percentage.
@@ -634,3 +641,82 @@ every key they actually check, computed dynamically, rather than
 asserting one hardcoded absolute index — a test-robustness fix, not a
 further production-code change, re-verified green under `-race` across
 repeated runs of the full `internal/node` suite.
+
+## 9. Phase 9: benchmarks and observability testing
+
+Phase 9's brief is explicit that benchmarks "must still validate
+enough behavior to ensure they are not benchmarking a no-op" and that
+observability must be proven, not assumed. This section is the
+`docs/scenario-corpus.md`-style honest accounting for that work; see
+[`docs/benchmarks.md`](benchmarks.md) and
+[`docs/observability.md`](observability.md) for the full methodology
+and results this section summarizes the testing evidence for.
+
+### 9.1 Benchmark correctness
+
+Every microbenchmark and end-to-end benchmark added this phase
+verifies real progress inside its timed loop where that check is cheap
+relative to the operation being measured (never inside a loop
+specifically isolating a cheap operation's own cost, e.g. `internal/mvcc`'s
+no-I/O benchmarks) — a committed outcome's `Status`, a replayed
+entry's count matching what was written, a `SELECT`'s row count
+matching what was inserted, a snapshot's decoded key count, or (for the
+Raft proposal/replication benchmark, `internal/fault`) the leader's own
+`CommitIndex` actually advancing past its pre-proposal value. Setup
+that would otherwise pollute a timed measurement (building a fixture
+WAL/cluster/table, seeding rows before a scan/delete benchmark) always
+runs before `b.ResetTimer()`, per this phase's brief's "use setup/
+teardown correctly."
+
+### 9.2 Observability tests
+
+`internal/metrics/metrics_test.go`, `internal/txn/metrics_test.go`,
+`internal/node/metrics_test.go`, and
+`cmd/chronicledb-node/control_test.go` together prove, against real
+clusters/managers (never a mock): role/term/commit-index/applied-index/
+snapshot-boundary values are readable and correct (`Node.Status()`,
+unchanged since Phase 5, re-verified here via the new `/metrics`
+endpoint); elections and leader changes increment their counters on a
+real 3-node election; proposals increment the correct one of
+committed/aborted/rejected/duplicate counters for a real committed
+write, a real conflict, a real not-leader rejection, and a real
+`RequestID` retry, respectively (not vacuously for every call);
+snapshot-created/installed counters move on a real create-then-install
+cycle (mirroring `TestSN1`/`TestSN5`'s own scenario shape); and every
+metrics/status read is race-safe under `-race` while concurrent real
+proposal traffic is in flight. Restart-reset semantics (counters reset
+to zero; `Status()` fields do not) are documented in
+`docs/observability.md` §7, not separately asserted by a dedicated
+restart test — the underlying fact (metrics are plain in-memory
+`sync/atomic` fields with no recovery-path wiring at all) is
+structurally guaranteed by the implementation's own absence of any
+metrics-related code in `internal/node.Open`'s recovery sequence,
+inspectable directly rather than needing a test to prove a negative.
+
+### 9.3 Benchmark/observability CI smoke
+
+Per this phase's brief ("do not run long performance benchmark suites
+on every push... provide explicit local commands for full benchmark
+runs"), `.github/workflows/ci.yml` runs a fast benchmark **compilation
+and single-iteration smoke** step (`go test ./... -run '^$' -bench . -benchtime=1x`)
+on every push — proving every benchmark still compiles and its first
+iteration's own internal correctness checks (§9.1) still pass, without
+paying for a full statistically-meaningful benchmark run in ordinary
+CI. The observability tests in §9.2 run as part of the ordinary
+`go test ./...`/`-race` jobs already in CI (they are ordinary Go tests,
+not benchmarks) — no separate CI job was needed for them. A full,
+representative benchmark run (the numbers actually published in
+`docs/benchmarks.md`) is a documented manual/local command
+(`docs/benchmarks.md` §5), matching how Phase 7's large chaos-seed runs
+are handled (§6.5-6.6 above): fast/representative in CI, larger runs
+available on demand, never silently expected to happen automatically.
+
+### 9.4 What Phase 9 did not test
+
+This phase did not add: a soak/long-duration test (still deferred, per
+§1's table, to a later phase); a multi-machine network-latency
+benchmark (every "real network" benchmark here is real TCP on
+`127.0.0.1`, per `docs/benchmarks.md` §1); or a concurrent-multi-client
+throughput benchmark (every benchmark added is single-client,
+sequential). These are documented limitations, not silently assumed
+coverage — see `docs/benchmarks.md` §1's complete "not measured" list.

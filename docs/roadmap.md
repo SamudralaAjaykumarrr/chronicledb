@@ -1,13 +1,15 @@
 # Roadmap and Maturity Model
 
 Status: this document defines the phase sequence and the evidence
-gates that govern when a maturity claim is allowed. Phases 1-8 are
+gates that govern when a maturity claim is allowed. Phases 1-9 are
 complete (each at its own documented scope — see that phase's own
 section below for exactly what it does and does not claim); current
-maturity is still `STRONG DISTRIBUTED V1` (§Maturity Model below) —
-Phase 8 alone does not advance it, since `PORTFOLIO READY` requires
-Phases 8 **and** 9 together, and Phase 9 (benchmarks/observability) has
-not begun.
+maturity is `PORTFOLIO READY` (§Maturity Model below) — Phases 8 and 9
+together satisfy that gate, with the Authentication/TLS gap
+(`docs/non-goals.md` §Authentication and TLS) explicitly, prominently
+documented as a deployment prerequisite rather than resolved (the
+gate's own "resolved or explicitly, prominently documented" wording
+permits either).
 
 ## Phase sequence
 
@@ -244,14 +246,97 @@ CLI — the roadmap did not place a CLI requirement in this phase, so
 `internal/sql` remains a library, consumed directly by tests, not a
 client-facing tool.
 
-### Phase 9 — Benchmarks + observability + performance engineering
+### Phase 9 — Benchmarks + observability + performance engineering — COMPLETE (at this phase's own scope)
 
-Diagnostic state (§Observability below) and benchmark targets
-(§Performance Targets below) are implemented and measured for real.
-Performance work in this phase must never weaken a correctness
-invariant from [`docs/invariants.md`](invariants.md) — any
-optimization that would requires its own ADR justifying the trade-off
-explicitly, and none is currently anticipated as necessary.
+Diagnostic state (§Observability below, fully implemented in
+[`docs/observability.md`](observability.md)) and benchmark targets
+(§Performance Targets below, fully measured in
+[`docs/benchmarks.md`](benchmarks.md)) are implemented and measured for
+real, on real hardware, against real durable/replicated code paths —
+never a mocked-persistence or fsync-disabled variant.
+
+Microbenchmarks were added beside every layer named in this phase's
+brief: `internal/wal` (append with/without the fsync durability
+boundary, sequential append, replay at 100/1,000/10,000 entries),
+`internal/mvcc` (point read at varying version-chain depth, write,
+conflict check — no I/O), `internal/fsm` (deterministic `Apply` for
+single-key/multi-key/duplicate-`RequestID` commands, command
+encode/decode), `internal/txn` (the real, WAL-backed standalone commit
+path, including the conflict path), `internal/snapshot` (encode/decode
+at 100/1,000/10,000 keys), `internal/sql` (lexer/parser and
+binding/planning cost kept explicitly separate from execution, per
+this phase's own brief; every DML statement executed end-to-end
+against a real standalone engine; a predicate-less full-table scan at
+three row counts), and `internal/fault` (the Raft proposal/replication
+path in the deterministic simulator, isolated from real I/O).
+End-to-end/macro benchmarks were added in `internal/node`: a
+single-node durable write, a three-node quorum-committed replicated
+write (with a `internal/benchutil` p50/p95/p99/max latency-distribution
+variant), a `ReadIndex`-backed primary-key read, an explicitly named
+80% read / 20% write mixed workload, and node restart-recovery time
+both from the full log and from a snapshot plus a retained log suffix.
+A dedicated `TestSnapshotLatencyImpact` scripted experiment (not a
+`-bench` benchmark, since it needs exact control over exactly when the
+snapshot threshold is crossed) measured the documented Phase 6
+synchronous-fsync-in-the-event-loop limitation directly: a real,
+measured latency spike (baseline p99 ≈2.3ms vs. the snapshot-crossing
+operation's max ≈6.4ms on the measurement machine) — reported honestly,
+not hidden, and not "fixed" (the underlying design is unchanged;
+`docs/snapshots.md`'s documented V1 limitation stands).
+
+CPU/memory profiling (`go tool pprof`) of the SQL INSERT and
+three-node replicated write paths found one genuine, evidence-backed
+hotspot: `internal/wal.readFrame` read every remaining byte in a
+segment (bounded only by the 64 MiB max record size, not by the actual
+next frame's size) before decoding a single record, making every
+segment scan — `Open`'s recovery scan, `Replay`, and `Truncate`'s
+`locateLogIndex` — cost O(remaining bytes) per record, O(n²) total for
+n records. At 10,000 128-byte entries this measured as ~1.4 seconds and
+~7.3 GB allocated to replay ~1.3 MB of actual data. The fix (read the
+fixed-size header first, then exactly the declared frame length,
+falling back to the original behavior for any oversized/corrupt/torn
+case) is a bounded, evidence-driven, non-semantic-changing change:
+every torn-tail/corruption decision `decodeFrameBytes` makes is
+byte-for-byte unchanged, verified by the complete pre-existing
+`internal/wal` test suite (crash, corruption, truncation, and
+`FuzzDecodeFrameBytes`) passing unchanged, plus the full repository
+suite (`go test ./...`, `-race`, `-tags=integration`). Measured
+improvement at 10,000 entries: ~273x latency, ~2,180x allocation — see
+[`docs/benchmarks.md`](benchmarks.md) §8.1 for the full before/after
+evidence. A second profiling pass (fsync's share of CPU time on both
+the standalone SQL and replicated write paths) found no further
+code-level hotspot — the dominant cost is the fsync durability boundary
+itself, a correctness requirement, not a bug — and this phase
+correctly did not force an optimization where profiling evidence did
+not justify one (`docs/benchmarks.md` §8.2).
+
+Observability (`internal/metrics`, `internal/node/metrics.go`,
+`internal/txn`'s `Manager.Metrics`) adds counters for elections, leader
+changes, Raft messages sent/received, proposals by outcome
+(total/rejected/committed/aborted/unknown), `RequestID` duplicates,
+and snapshots created/installed — every counter proven to move on a
+real event (not a no-op) and race-safe under `-race`, and never
+consulted by any correctness decision. `cmd/chronicledb-node` gained
+`/metrics` (Prometheus text exposition format) and `/health` (JSON) —
+the latter deliberately omits a cluster-wide "quorum available"
+boolean, since a Follower/Candidate cannot reliably know that and a
+Leader only knows it as of its own last heartbeat round; publishing a
+heuristic disguised as a fact was rejected per this phase's own brief.
+See [`docs/observability.md`](observability.md) for the complete
+metric catalog, health/status API, restart-reset semantics, and test
+evidence.
+
+No optimization in this phase weakened any invariant in
+[`docs/invariants.md`](invariants.md); the one optimization made
+(§WAL replay, above) changed only I/O access pattern, not any
+durability, ordering, or corruption-detection semantics, and needed no
+new ADR since it reconsiders no documented trade-off — it closes an
+unintentional performance gap in an existing one.
+`cmd/chronicledb-bench` was not built: every benchmark this phase
+needed was expressible as a standard Go benchmark or a small scripted
+test against existing test infrastructure (see
+[`docs/benchmarks.md`](benchmarks.md) §9 for the explicit reasoning and
+the concrete trigger for revisiting that decision).
 
 ### Phase 10 — Deep adversarial correctness pass
 
@@ -311,7 +396,7 @@ interpretation guidance, not exhaustive:
 | `TRANSACTIONAL ENGINE` | Phases 2-3 complete: §Transactions and §Idempotency (immediate/after-restart) scenarios pass. |
 | `REPLICATED PROTOTYPE` | Phases 4-5 complete: §Raft/Replication scenarios pass in the deterministic simulator and in a real multi-process three-node deployment. See [`docs/scenario-corpus.md`](scenario-corpus.md)'s Phase 5 note for the specific per-scenario accounting: RF-1, RF-3 (log-catch-up leg), RF-4, RF-5, RF-6, RF-9 through RF-13 are proven against real disk/network/processes; RF-2, RF-7, RF-8, RF-14, and RF-15 remain proven only in the deterministic simulator, by deliberate, documented scope decisions ([`docs/raft.md`](raft.md) §10.2), not gaps in the wiring this gate is actually about. |
 | `STRONG DISTRIBUTED V1` | Phases 6-7 complete: §Snapshots scenarios pass; chaos/combined fault schedules run for a meaningful duration without an invariant violation. **This repository's current state** — see [`docs/scenario-corpus.md`](scenario-corpus.md)'s Phase 7 note and [`docs/testing-strategy.md`](testing-strategy.md) §6-7 for the specific evidence: seeded randomized chaos suites at `internal/fault` (raft-core layer, tens of thousands of seeds run clean locally during this phase), real-disk/real-TCP chaos at `internal/node`, and genuine real-process SIGKILL chaos at `cmd/chronicledb-node`, plus the two genuine bugs and one data race this work found and fixed, each with a deterministic regression test. |
-| `PORTFOLIO READY` | Phase 8-9 substantially complete: constrained SQL works end-to-end on the real engine; observability surfaces exist; auth/TLS gap from [`docs/non-goals.md`](non-goals.md) is resolved or explicitly, prominently documented as a deployment prerequisite. |
+| `PORTFOLIO READY` | Phase 8-9 substantially complete: constrained SQL works end-to-end on the real engine; observability surfaces exist; auth/TLS gap from [`docs/non-goals.md`](non-goals.md) is resolved or explicitly, prominently documented as a deployment prerequisite. **This repository's current state** — Phase 8's real-cluster SQL evidence plus Phase 9's real, measured benchmarks ([`docs/benchmarks.md`](benchmarks.md)) and implemented/tested observability surfaces ([`docs/observability.md`](observability.md)); the Authentication/TLS gap remains explicitly, prominently documented ([`docs/non-goals.md`](non-goals.md) §Authentication and TLS) rather than resolved — this phase did not implement auth/TLS, which is out of Phase 9's own scope. |
 | `OPEN-SOURCE READY` | Phase 11 packaging complete on top of `PORTFOLIO READY`: license, contribution docs, versioned release, no known unresolved correctness gaps. |
 | `EXTERNAL-REVIEW READY` | `OPEN-SOURCE READY` plus a specific, documented invitation/process for Phase 12 review is in place. |
 | `STAFF/PRINCIPAL DISCUSSION READY` | Phase 12 has actually occurred and its actual findings (not a prediction of findings) are documented and, where applicable, resolved. |
@@ -320,44 +405,78 @@ Advancing a maturity claim without its evidence gate is itself a
 documentation defect and must be corrected on discovery — see
 [`docs/vision.md`](vision.md) §Guiding principle.
 
-## Observability (future work, specified now)
+## Observability (implemented in Phase 9)
 
-Not built in Phase 0-8. Diagnostic state ChronicleDB should expose,
-once built (Phase 9), for operational visibility — never as a
-correctness dependency (a correct decision must never depend on
-whether a metric was successfully recorded):
+Implemented — see [`docs/observability.md`](observability.md) for the
+complete, current catalog. Diagnostic state ChronicleDB exposes for
+operational visibility is never a correctness dependency (a correct
+decision never depends on whether a metric was successfully recorded)
+— summary of what Phase 9 actually built, against this section's
+original (Phase 0) list:
 
-- Node ID, role (follower/candidate/leader), current term, known
-  leader.
-- `commitIndex`, `appliedIndex`, durable log range (first/last index
-  on disk), WAL size, most recent snapshot index.
-- Active transaction count, transaction conflict count/rate.
-- `RequestID` retry count, duplicate-request count.
-- Replication lag per follower (`matchIndex` vs. leader's log length).
-- Election count/rate, leader-change history.
-- Commit latency (observed, not targeted — see §Performance Targets).
+- Node ID, role, current term, known leader — `Node.Status()`
+  (unchanged since Phase 5), now also exposed via `/metrics` as gauges.
+- `commitIndex`, `appliedIndex`, most recent snapshot index —
+  `Node.Status()`. Durable log range: `LastIndex`/`SnapshotIndex`
+  together give the retained entry count; exact on-disk WAL byte
+  totals are not exposed (documented, deliberate — see
+  `docs/observability.md` §2.1).
+- Transaction conflict count — `Node.Metrics().ProposalsAbortedTotal`
+  (replicated) / `txn.Manager.Metrics.TxnConflictsTotal` (standalone).
+  Active transaction count is not exposed: ChronicleDB has no
+  server-side open-transaction registry to count from (a `Txn`/SQL
+  `Session` is owned entirely by its caller) — not built speculatively.
+- `RequestID` duplicate-request count —
+  `Node.Metrics().RequestIDDuplicatesTotal` /
+  `txn.Manager.Metrics.RequestIDDuplicatesTotal`.
+- Replication lag per follower — deferred; see
+  `docs/observability.md` §2.1 for why and the concrete follow-up hook
+  already available (`raft.Core.MatchIndexOf`) if a future phase needs
+  it.
+- Election count, leader-change history —
+  `Node.Metrics().ElectionsTotal`/`LeaderChangesTotal`.
+- Commit latency (observed) — `docs/benchmarks.md` §7's real, measured
+  end-to-end latency distributions (p50/p95/p99/max), not a live
+  per-request histogram in the running process (this phase judged a
+  bounded histogram unnecessary beyond what benchmark-time measurement
+  already provides at V1's scale — see `docs/observability.md` §9).
 
-## Performance Targets (future work; no numbers invented now)
+## Performance Targets (measured in Phase 9)
 
-Not measured in Phase 0-8. ChronicleDB does not invent benchmark
-numbers, latency figures, throughput figures, or scale claims in this
-architecture phase. The following are the categories Phase 9 will
-measure and report actual numbers for, once real:
+Measured — see [`docs/benchmarks.md`](benchmarks.md) for every actual
+number, environment, and reproduction command. Summary against this
+section's original (Phase 0) list:
 
-- Standalone writes/sec.
-- Replicated writes/sec (quorum-committed).
-- Read latency (leader-local strong read, per
-  [`docs/replication.md`](replication.md) §4).
-- Write/transaction-commit latency, standalone and replicated.
-- WAL throughput and WAL sync latency.
-- Recovery time (as a function of log length since last snapshot).
-- Snapshot creation time and snapshot installation time.
-- Leader failover time (election-to-service-restored).
-- Scaling behavior with record count and with concurrent transaction
-  count.
-- CPU and allocation profiles for the hot commit path.
+- Standalone/replicated write latency, and the gap between them —
+  `docs/benchmarks.md` §7.
+- Read latency (leader-local strong read via `ReadIndex`) —
+  `docs/benchmarks.md` §7.
+- WAL append latency with and without the fsync durability boundary —
+  `docs/benchmarks.md` §6.1.
+- Recovery time as a function of log length, and from a snapshot plus
+  retained suffix — `docs/benchmarks.md` §7, including the honest
+  finding that the snapshot-plus-suffix path was not meaningfully
+  faster than full-log replay at the measured (1,000-entry) scale.
+- Snapshot creation/installation cost — `docs/benchmarks.md` §6.5
+  (encode/decode) and §7 (`TestSnapshotLatencyImpact`'s measured
+  latency-spike evidence for the documented synchronous-fsync
+  limitation).
+- CPU and allocation profiles for the hot commit path —
+  `docs/benchmarks.md` §8, including the one genuine hotspot found and
+  fixed (WAL replay, §8.1) and the profiling pass that correctly found
+  no further code-level optimization justified (§8.2).
+- **Not measured, honestly**: throughput under sustained concurrent
+  multi-client load, and leader-failover-time-specifically-as-a-latency-
+  number (Phase 7's chaos suites prove failover *works*; Phase 9 did
+  not add a dedicated timer on top of that) — see
+  `docs/benchmarks.md` §1 for the complete "not measured" list, each
+  with its reason.
 
 Any performance optimization proposed in or after Phase 9 must be
 checked against [`docs/invariants.md`](invariants.md) before adoption;
 an optimization that weakens a documented invariant requires a new ADR
-explicitly reconsidering that invariant, not a silent trade-off.
+explicitly reconsidering that invariant, not a silent trade-off. Phase
+9's one optimization (WAL replay's I/O access pattern,
+`docs/benchmarks.md` §8.1) needed no such ADR, since it changes no
+durability/ordering/corruption-detection semantics — only how many
+bytes are read from disk before an unchanged decode decision runs.

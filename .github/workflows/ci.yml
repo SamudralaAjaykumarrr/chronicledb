@@ -69,3 +69,13 @@ jobs:
         run: |
           go test ./internal/sql/... -fuzz FuzzDecodeSchema -fuzztime 15s
           go test ./internal/sql/... -fuzz FuzzDecodeRow -fuzztime 15s
+      - name: benchmark compile + single-iteration smoke
+        # Phase 9 (docs/testing-strategy.md §9.3): every benchmark added
+        # this phase must keep compiling and its own internal
+        # correctness checks (docs/roadmap.md §Benchmark correctness)
+        # must keep passing, without paying for a full,
+        # statistically-meaningful benchmark run on every push. A full
+        # representative run (the numbers actually published in
+        # docs/benchmarks.md) is a documented manual/local command —
+        # see docs/benchmarks.md §5.
+        run: go test ./... -run '^$' -bench . -benchtime=1x -timeout 180s

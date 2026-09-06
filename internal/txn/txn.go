@@ -21,9 +21,27 @@ import (
 	"sync"
 
 	"github.com/SamudralaAjaykumarrr/chronicledb/internal/fsm"
+	"github.com/SamudralaAjaykumarrr/chronicledb/internal/metrics"
 	"github.com/SamudralaAjaykumarrr/chronicledb/internal/mvcc"
 	"github.com/SamudralaAjaykumarrr/chronicledb/internal/wal"
 )
+
+// Metrics is a Manager's diagnostic counters (docs/roadmap.md Phase 9
+// §Observability). Zero-valued and ready to use as soon as a Manager
+// is constructed; reading it never affects, and is never affected by,
+// any correctness decision (docs/roadmap.md: "a correct decision must
+// never depend on whether a metric was recorded"). Counters are
+// in-memory only and reset to zero on every process restart — they do
+// not participate in recovery (see docs/observability.md).
+type Metrics struct {
+	// TxnConflictsTotal counts every commit attempt that resolved to
+	// StatusAborted via the write-write conflict rule (docs/mvcc.md §4).
+	TxnConflictsTotal metrics.Counter
+	// RequestIDDuplicatesTotal counts every commit attempt whose
+	// RequestID was already known (a retry resolved by Precheck without
+	// a fresh WAL append), per docs/transactions.md §6.
+	RequestIDDuplicatesTotal metrics.Counter
+}
 
 // TxnID identifies one in-progress, client-visible transaction session
 // (docs/architecture.md §3). It is ephemeral: assigned in-memory at
@@ -87,6 +105,10 @@ type Manager struct {
 	mu        sync.Mutex
 	lastSeq   uint64
 	nextTxnID uint64
+
+	// Metrics holds this Manager's diagnostic counters (docs/roadmap.md
+	// Phase 9). Safe to read from any goroutine at any time.
+	Metrics Metrics
 }
 
 // NewManager wires a Manager to an already-open WAL and MVCC store, and
@@ -245,6 +267,7 @@ func (m *Manager) commit(id TxnID, requestID fsm.RequestID, startSeq uint64, mut
 		// Returning its recorded outcome directly, without touching
 		// the WAL again, is what makes retrying a completed RequestID
 		// not grow the log — see TestRetryDoesNotAppendToWAL.
+		m.Metrics.RequestIDDuplicatesTotal.Inc()
 	case errors.Is(err, fsm.ErrRequestIDUnknown):
 		payload := fsm.EncodeCommitTxn(cmd)
 		idx, aerr := m.walog.AppendLogEntry(payload)
@@ -261,6 +284,9 @@ func (m *Manager) commit(id TxnID, requestID fsm.RequestID, startSeq uint64, mut
 		outcome, err = m.fsm.Apply(idx, cmd)
 		if err != nil {
 			return fsm.Outcome{}, fmt.Errorf("txn: txn %d internal apply failure: %w", id, err)
+		}
+		if outcome.Status == fsm.StatusAborted {
+			m.Metrics.TxnConflictsTotal.Inc()
 		}
 		m.lastSeq = idx
 	default:

@@ -11,7 +11,7 @@ store, or a wrapper around an existing finished database or consensus
 library. See [`docs/vision.md`](docs/vision.md) for the full statement
 of intent and explicit non-goals.
 
-Current maturity: **STRONG DISTRIBUTED V1**
+Current maturity: **PORTFOLIO READY**
 
 Phase 1 — durable append-only segment storage (`internal/storage`) and
 a checksummed, replayable write-ahead log with crash recovery
@@ -199,11 +199,47 @@ newly elected leader with no proposal yet in its own term could stall
 explicit compatibility boundaries (no joins, no predicates beyond
 primary-key equality, no CLI, no wire-protocol compatibility).
 
+Phase 9 — benchmarks, profiling, and observability
+(`internal/metrics`, `internal/benchutil`, plus additions to
+`internal/node`, `internal/txn`, and `cmd/chronicledb-node`) — is now
+also implemented: real, measured Go benchmarks for every layer named in
+this phase's brief (WAL append with/without the fsync durability
+boundary, MVCC, the deterministic FSM boundary, the real standalone
+transaction commit path, snapshot encode/decode, the Raft
+proposal/replication path, SQL parsing/binding/execution, and
+end-to-end single-node/three-node/mixed-workload/recovery-time
+benchmarks in `internal/node`), documented with exact commands,
+environment, and honest "what is not measured" boundaries in
+[`docs/benchmarks.md`](docs/benchmarks.md). CPU/memory profiling found
+one genuine hotspot — `internal/wal.readFrame` read every remaining
+byte in a segment before decoding a single record, making log replay
+O(n²) in the number of entries — fixed with a bounded,
+semantics-preserving change (read the frame header first, then exactly
+its declared length) proven byte-for-byte identical on every
+correctness/corruption/fuzz test, measuring ~273x faster and ~2,180x
+less memory at 10,000 entries; a second profiling pass correctly found
+no further code-level optimization justified (fsync dominates commit-
+path CPU time by design). A dedicated snapshot-latency experiment
+measured, and honestly reported rather than hid, Phase 6's already-
+documented synchronous-fsync-in-the-event-loop latency spike. New
+counters (elections, leader changes, Raft messages, proposals by
+outcome, `RequestID` duplicates, snapshots created/installed — every
+one proven to move on a real event and race-safe under `-race`, never
+a correctness dependency) and a `/metrics`
+(Prometheus text)/`/health` HTTP endpoint pair are documented in full,
+including exact restart-reset semantics and the deliberate omission of
+a fabricated cluster-quorum signal, in
+[`docs/observability.md`](docs/observability.md).
+
 Per [`docs/roadmap.md`](docs/roadmap.md) §Maturity Model,
-`PORTFOLIO READY` requires Phases 8 **and** 9 together; Phase 9
-(benchmarks/observability) has not begun, so this repository's current
-maturity claim remains `STRONG DISTRIBUTED V1` above — Phase 8 alone
-does not advance it. See [`docs/roadmap.md`](docs/roadmap.md)
+`PORTFOLIO READY` requires Phases 8 **and** 9 together; both are now
+complete and evidenced, which is this repository's current maturity
+claim above. The Authentication/TLS gap
+([`docs/non-goals.md`](docs/non-goals.md) §Authentication and TLS)
+remains explicitly, prominently documented as a deployment prerequisite
+rather than resolved — implementing it was out of Phase 9's own scope,
+and the maturity gate's own wording permits either resolving it or
+documenting it this way. See [`docs/roadmap.md`](docs/roadmap.md)
 §Maturity Model for the evidence-based gates that govern every future
 maturity claim, and [`docs/architecture.md`](docs/architecture.md) for
 the system design itself.
@@ -222,4 +258,8 @@ Key documents:
   model.
 - [`docs/sql.md`](docs/sql.md) — the constrained SQL frontend (Phase 8):
   grammar, data model, execution semantics, compatibility boundaries.
+- [`docs/benchmarks.md`](docs/benchmarks.md) — Phase 9 benchmark
+  methodology, exact commands, environment, and measured results.
+- [`docs/observability.md`](docs/observability.md) — Phase 9 metrics,
+  node status/health API, and logging.
 - [`docs/adr/`](docs/adr/) — Architecture Decision Records.

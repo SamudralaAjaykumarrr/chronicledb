@@ -7,6 +7,7 @@
 package wal
 
 import (
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"sync"
@@ -698,12 +699,83 @@ func (w *WAL) Close() error {
 // more to read), (nil, 0, errTornTail) if the bytes present are
 // insufficient to form a complete frame, or (rec, frameLen, nil) on
 // success. Any other error is an unconditional corruption failure.
+//
+// Performance note (docs/roadmap.md Phase 9 §Profiling): an earlier
+// version always read every byte remaining in the segment (bounded
+// only by MaxRecordPayloadSize) before decoding a single frame, so
+// scanning a segment record-by-record (Open's recovery scan, Replay,
+// locateLogIndex) cost O(remaining bytes) per record — O(n^2) total for
+// n records — confirmed by BenchmarkWALReplay
+// (docs/benchmarks.md §WAL: ~1.4s and ~7GB allocated per replay of
+// 10,000 128-byte entries before this fix). The fast path below reads
+// only the fixed-size header first to learn the frame's declared
+// length, then reads exactly that many more bytes — O(1) work per
+// record in the common case — and falls back to the original
+// read-everything-remaining behavior whenever the header alone cannot
+// prove the frame is safely, fully present (an oversized or corrupt
+// declared length, or a torn tail), so every corruption/torn-tail
+// decision decodeFrameBytes makes is byte-for-byte unchanged; only how
+// many bytes readFrame fetches from disk before calling it differs.
 func readFrame(seg *storage.Segment, offset int64) (*Record, int, error) {
 	size := seg.Size()
 	if offset >= size {
 		return nil, 0, nil
 	}
 	avail := size - offset
+
+	headerWant := avail
+	if headerWant > int64(headerSize) {
+		headerWant = int64(headerSize)
+	}
+	hdrBuf := make([]byte, headerWant)
+	n, err := seg.ReadAt(hdrBuf, offset)
+	if err != nil && !errors.Is(err, storage.ErrShortRead) {
+		return nil, 0, err
+	}
+	hdrBuf = hdrBuf[:n]
+	if len(hdrBuf) < headerSize {
+		// Identical to decodeFrameBytes's own first check — not enough
+		// bytes for even a fixed header is unconditionally a torn tail.
+		return nil, 0, errTornTail
+	}
+
+	length := binary.BigEndian.Uint32(hdrBuf[headerLengthOff:])
+	frameLen := int64(headerSize) + int64(length) + int64(checksumSize)
+	if length > MaxRecordPayloadSize || frameLen > avail {
+		// Either a declared length decodeFrameBytes will reject outright
+		// (but only once it can prove enough bytes are actually present
+		// to distinguish "corrupt/oversized" from "torn tail" — see its
+		// own doc comment) or a frame that is not fully present yet
+		// (torn tail, or genuinely corrupt). Either way, this is exactly
+		// the rare/adversarial case the original implementation handled
+		// by reading everything remaining (bounded by
+		// MaxRecordPayloadSize) — fall back to that unchanged so
+		// decodeFrameBytes's decision is untouched.
+		return readFrameFull(seg, offset, avail)
+	}
+
+	buf := make([]byte, frameLen)
+	n2, err := seg.ReadAt(buf, offset)
+	if err != nil && !errors.Is(err, storage.ErrShortRead) {
+		return nil, 0, err
+	}
+	buf = buf[:n2]
+
+	rec, decodedLen, derr := decodeFrameBytes(buf)
+	if derr != nil {
+		return nil, 0, derr
+	}
+	return rec, decodedLen, nil
+}
+
+// readFrameFull is the original, always-correct (if not always fast)
+// implementation: read everything remaining in the segment, bounded
+// only by the largest frame internal/wal will ever trust, and let
+// decodeFrameBytes make every torn-tail/corruption decision from that.
+// readFrame's fast path above falls back to this exact behavior
+// whenever the frame header alone cannot prove a fast, exact-sized read
+// is safe.
+func readFrameFull(seg *storage.Segment, offset, avail int64) (*Record, int, error) {
 	maxRead := int64(headerSize) + int64(MaxRecordPayloadSize) + int64(checksumSize)
 	want := avail
 	if want > maxRead {

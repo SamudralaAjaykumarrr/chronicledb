@@ -198,6 +198,19 @@ internal/sql                Phase 8: a small, constrained SQL frontend
                           — never touches internal/mvcc or
                           internal/storage directly. See
                           docs/sql.md.
+
+internal/metrics            Phase 9: two dependency-free diagnostic
+                          primitives, Counter and Gauge (sync/atomic-
+                          backed). Depends on nothing beyond the
+                          standard library, so any package may import
+                          it without creating a new dependency
+                          direction; never imported the other way
+                          (metrics never call back into the systems
+                          they instrument). See docs/observability.md.
+
+internal/benchutil           Phase 9: a latency-percentile recorder
+                          used only by benchmarks/tests (docs/
+                          benchmarks.md), never by production code.
 ```
 
 Dependency rules (enforced by review, and mechanically once packages

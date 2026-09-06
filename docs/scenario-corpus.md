@@ -877,6 +877,7 @@ covered above.
 | 6 | SN-1 .. SN-6, ID-4 (after snapshot+compaction), RF-3's snapshot-catch-up leg |
 | 7 | Chaos/combined variants of RF-11, RF-13, RF-15 and SN-3/SN-5 under randomized fault schedules, plus RequestID/transaction chaos and genuine real-process SIGKILL evidence not tied to a single numbered scenario (see the Phase 7 note above and [`docs/testing-strategy.md`](testing-strategy.md) §6-7) |
 | 8 | SQ-1 .. SQ-9 |
+| 9 | No new numbered scenarios: Phase 9 (benchmarks/observability) adds no new correctness invariant or scenario — per `docs/testing-strategy.md` §2's guiding principle, this corpus targets correctness properties, not performance/benchmark evidence. Its own testing evidence (benchmark correctness checks, observability tests) is itemized in [`docs/testing-strategy.md`](testing-strategy.md) §9 and [`docs/benchmarks.md`](benchmarks.md)/[`docs/observability.md`](observability.md), mirroring how Phase 7's non-scenario-mapped evidence is handled below. |
 
 Scenarios with an explicit **Status: passing** line above currently
 pass at the stated scope — LD-1 through LD-6, TX-1 through TX-8, ID-1

@@ -241,6 +241,13 @@ type Node struct {
 	statusMu sync.Mutex
 	status   Status
 
+	// metrics holds this node's diagnostic counters (docs/roadmap.md
+	// Phase 9, see metrics.go). Every field is itself concurrency-safe
+	// (sync/atomic-backed), so metrics is read via Metrics() from any
+	// goroutine with no additional locking, while every increment site
+	// below runs only on run's own event-loop goroutine.
+	metrics Metrics
+
 	fatalMu sync.Mutex
 	fatal   error
 }
@@ -459,6 +466,7 @@ func (n *Node) majority() int { return len(n.cfg.Peers)/2 + 1 }
 // stopped).
 func (n *Node) Propose(ctx context.Context, cmd fsm.CommitTxnCommand) (fsm.Outcome, error) {
 	if outcome, err := n.fsmachine.Load().Precheck(cmd); err == nil {
+		n.metrics.RequestIDDuplicatesTotal.Inc()
 		return outcome, nil
 	} else if !errors.Is(err, fsm.ErrRequestIDUnknown) {
 		return fsm.Outcome{}, err
@@ -524,6 +532,7 @@ func (n *Node) run() {
 		case <-ticker.C:
 			n.tick()
 		case msg := <-n.tr.Recv():
+			n.metrics.RaftMessagesReceivedTotal.Inc()
 			if msg.Type == raft.MsgInstallSnapshotRequest {
 				n.handleInstallSnapshot(msg)
 			} else {
@@ -542,6 +551,7 @@ func (n *Node) run() {
 
 func (n *Node) shutdown() {
 	for idx, w := range n.waiters {
+		n.metrics.ProposalsUnknownTotal.Inc()
 		w.resultCh <- proposeResult{err: ErrNodeStopped}
 		delete(n.waiters, idx)
 	}
@@ -583,6 +593,13 @@ func (n *Node) step(in raft.Input) {
 		n.ackCounter++
 		n.lastAck[in.Message.From] = n.ackCounter
 	}
+	// raft.Core.handleElectionTimeout no-ops for an already-Leader node
+	// (docs/raft.md), so counting only the calls that can actually start
+	// a new election avoids a vacuous counter that just tracks the
+	// heartbeat/tick rate on a stable leader.
+	if in.Kind == raft.InputElectionTimeout && n.core.Role() != raft.Leader {
+		n.metrics.ElectionsTotal.Inc()
+	}
 	out := n.core.Step(in)
 	n.processOutput(out)
 }
@@ -592,14 +609,17 @@ func (n *Node) step(in raft.Input) {
 // client's request, validated it is current leader").
 func (n *Node) handlePropose(req proposeReq) {
 	if n.core.Role() != raft.Leader {
+		n.metrics.ProposalsRejectedTotal.Inc()
 		req.resultCh <- proposeResult{err: &NotLeaderError{Leader: n.core.LeaderID()}}
 		return
 	}
 	out := n.core.Step(raft.Input{Kind: raft.InputPropose, ProposeData: req.payload})
 	if out.ProposalRejected {
+		n.metrics.ProposalsRejectedTotal.Inc()
 		req.resultCh <- proposeResult{err: &NotLeaderError{Leader: out.LeaderHint}}
 		return
 	}
+	n.metrics.ProposalsTotal.Inc()
 	if out.PersistRequest == nil || len(out.PersistRequest.Entries) != 1 {
 		// Defensive: a leader-accepted InputPropose always produces
 		// exactly this shape (raft.Core.handlePropose). Treat any other
@@ -700,6 +720,7 @@ func (n *Node) processOutput(out raft.Output) {
 			m.SnapshotData = data
 		}
 		n.tr.Send(m)
+		n.metrics.RaftMessagesSentTotal.Inc()
 	}
 
 	if out.PersistRequest != nil {
@@ -715,11 +736,13 @@ func (n *Node) processOutput(out raft.Output) {
 
 	if out.SteppedDown {
 		for idx, w := range n.waiters {
+			n.metrics.ProposalsUnknownTotal.Inc()
 			w.resultCh <- proposeResult{err: ErrLeadershipLost}
 			delete(n.waiters, idx)
 		}
 	}
 	if out.BecameLeader {
+		n.metrics.LeaderChangesTotal.Inc()
 		n.logf("node %s became leader for term %d", n.cfg.ID, n.core.CurrentTerm())
 		n.proposeElectionNoOp()
 	}
@@ -800,8 +823,15 @@ func (n *Node) applyCommitted(entries []raft.Entry) {
 		if w, ok := n.waiters[e.Index]; ok {
 			delete(n.waiters, e.Index)
 			if w.requestID == cmd.RequestID {
+				switch outcome.Status {
+				case fsm.StatusCommitted:
+					n.metrics.ProposalsCommittedTotal.Inc()
+				case fsm.StatusAborted:
+					n.metrics.ProposalsAbortedTotal.Inc()
+				}
 				w.resultCh <- proposeResult{outcome: outcome}
 			} else {
+				n.metrics.ProposalsUnknownTotal.Inc()
 				w.resultCh <- proposeResult{err: ErrProposalSuperseded}
 			}
 		}
@@ -851,6 +881,7 @@ func (n *Node) maybeSnapshot() {
 		n.fail(fmt.Errorf("node: compacting log before index %d: %w", meta.LastIncludedIndex, err))
 		return
 	}
+	n.metrics.SnapshotsCreatedTotal.Inc()
 	n.logf("node %s: created snapshot at index %d, compacted log", n.cfg.ID, meta.LastIncludedIndex)
 }
 
@@ -906,6 +937,7 @@ func (n *Node) handleInstallSnapshot(msg raft.Message) {
 		}
 		n.fsmachine.Store(snap.FSM)
 		n.appliedIndex = snap.Meta.LastIncludedIndex
+		n.metrics.SnapshotsInstalledTotal.Inc()
 		// Any waiter for an index this install just superseded is never
 		// resolved from here (applyCommitted no longer replays it) — it
 		// will time out via its own context/ErrLeadershipLost path if the
