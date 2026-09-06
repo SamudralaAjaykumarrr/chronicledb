@@ -11,7 +11,32 @@ store, or a wrapper around an existing finished database or consensus
 library. See [`docs/vision.md`](docs/vision.md) for the full statement
 of intent and explicit non-goals.
 
-Current maturity: **PORTFOLIO READY**
+Current maturity: **PORTFOLIO READY**. Phase 11 (open-source
+packaging: license, contribution docs, release automation) is
+complete, but no version has actually been tagged/released yet, so the
+maturity claim does not yet advance to `OPEN-SOURCE READY` — see
+[`docs/roadmap.md`](docs/roadmap.md) §Maturity Model for exactly why
+that specific distinction matters here.
+
+## Quickstart
+
+```bash
+git clone https://github.com/SamudralaAjaykumarrr/chronicledb.git
+cd chronicledb
+go build ./...
+go test ./...
+./scripts/demo-local-cluster.sh   # real 3-node cluster, one command
+```
+
+Every command in [`docs/quickstart.md`](docs/quickstart.md) was
+actually run against this repository to produce the output shown
+there — including starting a node, checking `/health`/`/metrics`, and
+exercising the SQL surface via
+[`examples/sql-basics`](examples/sql-basics). See
+[`docs/configuration.md`](docs/configuration.md) for every
+`chronicledb-node` flag.
+
+## What ChronicleDB implements, phase by phase
 
 Phase 1 — durable append-only segment storage (`internal/storage`) and
 a checksummed, replayable write-ahead log with crash recovery
@@ -265,11 +290,80 @@ documenting it this way. See [`docs/roadmap.md`](docs/roadmap.md)
 maturity claim, and [`docs/architecture.md`](docs/architecture.md) for
 the system design itself.
 
+Phase 11 — open-source packaging (license, contribution docs,
+versioning policy, a tag-triggered release workflow, reproducible
+release builds, and this quickstart) — is now also complete, adding no
+product functionality on top of the unchanged Phases 1-10 engine. See
+[`docs/roadmap.md`](docs/roadmap.md)'s Phase 11 section for the
+complete account of what was added, and why the maturity claim above
+deliberately stays `PORTFOLIO READY` rather than advancing to the
+roadmap's own predefined `OPEN-SOURCE READY` gate: that gate requires
+an actual versioned release, and none has been tagged yet — this phase
+prepared the release process (`docs/releasing.md`,
+`.github/workflows/release.yml`) without executing it.
+
+## Testing philosophy
+
+Every correctness claim above is gated on a passing test against a
+specific documented scenario or invariant — never on code existing or
+"looking right" (see [`docs/roadmap.md`](docs/roadmap.md) §Maturity
+Model's binding interpretation guidance). Testing runs at several
+layers: unit tests, `-race` concurrency tests, real subprocess
+crash/`SIGKILL` tests against genuine disk and OS processes, a
+deterministic in-memory distributed simulator (`internal/fault`) for
+fast large-seed-count chaos runs, seeded property-based chaos/
+adversarial suites checked against an independent reference model
+(`internal/oracle`), and fuzz targets for every untrusted-input
+boundary (SQL parser, WAL frame decoder, snapshot decoder). See
+[`docs/testing-strategy.md`](docs/testing-strategy.md) and
+[`docs/adversarial-testing.md`](docs/adversarial-testing.md) for the
+complete account, including exactly which bugs this testing found and
+fixed (five genuine ones across Phases 7-9) and what remains
+untested.
+
+## Known limitations
+
+- **No authentication or TLS** on the Raft transport or the HTTP
+  control plane — see [`SECURITY.md`](SECURITY.md) and
+  [`docs/non-goals.md`](docs/non-goals.md) §Authentication and TLS. Do
+  not deploy ChronicleDB outside a trusted network.
+- **Snapshot Isolation, not Serializable** — see
+  [`docs/mvcc.md`](docs/mvcc.md) §1.1.
+- **No joins, subqueries, secondary indexes, or PostgreSQL wire
+  compatibility** in the SQL frontend — see [`docs/sql.md`](docs/sql.md)
+  §8.
+- **Single static shard** — no sharding, no dynamic membership, no
+  cross-region replication — see [`docs/non-goals.md`](docs/non-goals.md).
+- **No external security audit or Staff/Principal-level review** has
+  occurred — see [`docs/non-goals.md`](docs/non-goals.md) §Staff/
+  Principal validation and equivalence claims.
+- Only Linux amd64 is actually developed/tested against — see
+  [`docs/support-matrix.md`](docs/support-matrix.md) for what other
+  release archives are (cross-compiled, unverified) vs. are not
+  (supported at all).
+
+This project does not claim to be production-ready, enterprise-ready,
+a PostgreSQL replacement, or hardened for internet-facing deployment —
+see [`docs/non-goals.md`](docs/non-goals.md) for the complete,
+reasoned list of deliberate scope boundaries.
+
+## License, contributing, security
+
+ChronicleDB is licensed under [Apache-2.0](LICENSE). Contributions are
+welcome — see [`CONTRIBUTING.md`](CONTRIBUTING.md) for development
+setup, required tests, and how correctness claims are held to account.
+This project follows the [Contributor Covenant](CODE_OF_CONDUCT.md).
+To report a security vulnerability, see [`SECURITY.md`](SECURITY.md)
+(private reporting via GitHub Security Advisories — please do not open
+a public issue for a suspected vulnerability).
+
 ## Documentation
 
-Start at [`docs/README.md`](docs/README.md) for the full reading order.
-Key documents:
+Start at [`docs/README.md`](docs/README.md) for the full, topic-grouped
+documentation map. Key documents:
 
+- [`docs/quickstart.md`](docs/quickstart.md) — build, test, run a
+  cluster, exercise SQL: every command actually executed.
 - [`docs/vision.md`](docs/vision.md) — what ChronicleDB is and is not.
 - [`docs/architecture.md`](docs/architecture.md) — system boundaries
   and binding terminology.
@@ -287,4 +381,9 @@ Key documents:
   10 adversarial correctness verification: reference model, model-based
   history suites, exact seed counts/commands, and correctness
   boundaries.
+- [`docs/configuration.md`](docs/configuration.md) — the complete
+  `chronicledb-node` flag reference.
+- [`docs/versioning.md`](docs/versioning.md) /
+  [`docs/releasing.md`](docs/releasing.md) — Phase 11's versioning
+  policy and release checklist.
 - [`docs/adr/`](docs/adr/) — Architecture Decision Records.

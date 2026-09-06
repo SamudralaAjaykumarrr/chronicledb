@@ -389,12 +389,94 @@ Per §Maturity Model below, no new named maturity level is defined for
 Phase 10 — it strengthens the evidence behind the existing
 `PORTFOLIO READY` claim rather than advancing to a new gate.
 
-### Phase 11 — Open-source / portfolio packaging + releases
+### Phase 11 — Open-source / portfolio packaging + releases — COMPLETE (at this phase's own scope)
 
-Packaging, documentation polish for external readers, versioned
-releases, and (if pursued) the deployment infrastructure explicitly
-deferred in [`docs/non-goals.md`](non-goals.md) (Kubernetes operator,
-etc.) — pursued only after correctness phases are complete.
+No product functionality was added — per this phase's own brief,
+Phase 11 is packaging, documentation polish for external readers, and
+release infrastructure on top of the unchanged Phases 1-10 engine,
+not new database mechanism. The deployment infrastructure
+[`docs/non-goals.md`](non-goals.md) explicitly defers (Kubernetes
+operator, etc.) was not pursued — nothing in this phase's brief
+required it, and it remains deferred per that document's own trigger
+condition.
+
+Added: [`LICENSE`](../LICENSE) (Apache-2.0),
+[`CONTRIBUTING.md`](../CONTRIBUTING.md),
+[`SECURITY.md`](../SECURITY.md) (GitHub private vulnerability
+reporting, documented deployment assumptions — no auth/TLS, matching
+[`docs/non-goals.md`](non-goals.md) §Authentication and TLS),
+[`CODE_OF_CONDUCT.md`](../CODE_OF_CONDUCT.md) (Contributor Covenant
+2.1), GitHub issue templates (bug report, correctness/safety bug,
+feature request) and a pull request template
+(`.github/ISSUE_TEMPLATE/`, `.github/pull_request_template.md`), and
+[`.github/dependabot.yml`](../.github/dependabot.yml) (`gomod` and
+`github-actions` ecosystems — see
+[`docs/dependencies.md`](dependencies.md) for why `gomod` currently has
+nothing to update).
+
+A small `internal/version` package plus a `-version` flag on
+`chronicledb-node` (`cmd/chronicledb-node/main.go`) report a
+build-time-injected semantic version/commit/date, defaulting to
+`dev`/`none`/`unknown` for a plain `go build` so a locally-built binary
+is never mistaken for a tagged release — read by nothing on the
+correctness path, per [`docs/observability.md`](observability.md)'s
+existing rule that diagnostic state is never a correctness dependency.
+`scripts/build-release.sh` reproduces the exact cross-compiled,
+checksummed release archives
+(`docs/support-matrix.md`'s five build targets: linux/amd64,
+linux/arm64, darwin/amd64, darwin/arm64, windows/amd64) that
+`.github/workflows/release.yml` builds — a workflow triggered
+**only** by pushing a tag matching `v*.*.*` (never a branch push or
+pull request), which re-runs the full quality-gate suite against the
+exact tagged commit, then publishes a GitHub Release via the `gh` CLI
+already present on GitHub-hosted runners (no third-party release
+action). `scripts/demo-local-cluster.sh` starts a real local
+three-node cluster (three genuine OS processes, real TCP, real disk)
+end to end and was actually run to confirm leader election, a
+replicated write, and cross-node status all work, printing cleanup
+instructions rather than deleting anything itself. Two runnable
+examples (`examples/basic-transaction`, `examples/sql-basics`) exercise
+the real transaction engine and the real SQL frontend respectively,
+standalone (no Raft) — both were actually run to produce the exact
+output shown in [`docs/quickstart.md`](quickstart.md).
+
+New reference documentation: [`docs/quickstart.md`](quickstart.md)
+(every command actually executed against this repository),
+[`docs/configuration.md`](configuration.md) (the complete
+`chronicledb-node` flag reference — there is no config-file format,
+deliberately, per [`docs/dependencies.md`](dependencies.md)),
+[`docs/versioning.md`](versioning.md) (SemVer policy, what pre-1.0
+compatibility means here, what counts as a breaking change),
+[`docs/releasing.md`](releasing.md) (the release checklist),
+[`docs/support-matrix.md`](support-matrix.md) (developed/tested vs.
+cross-compiled-only platforms — Linux amd64 is the only platform
+actually tested), and [`docs/dependencies.md`](dependencies.md) (the
+zero-external-Go-dependency policy). [`docs/README.md`](README.md) was
+reorganized into a topic-grouped map (previously a single flat reading
+order last updated at Phase 0) and its stale "Architecture Foundation"
+status line corrected. `README.md`'s own maturity statement and
+[`.github/workflows/ci.yml`](../.github/workflows/ci.yml)'s
+`actions/checkout`/`actions/setup-go` versions were updated to their
+current stable majors (`v7`, verified via the GitHub API at the time,
+not guessed) with module caching explicitly disabled (there is no
+`go.sum` to key it on).
+
+Per §Maturity Model below, `OPEN-SOURCE READY` requires "license,
+contribution docs, versioned release, no known unresolved correctness
+gaps." The first three items this phase's own scope can satisfy
+(license, contribution docs, and the *capability* to cut a versioned
+release) are done; the fourth is unaffected by packaging work either
+way. **This phase deliberately did not create or push a release
+tag** — packaging infrastructure existing is not the same evidence as
+an actual published release existing (this document's own
+"a benchmark command existing does not prove performance" principle
+applies identically here: a release *workflow* existing does not prove
+a release). The maturity claim therefore remains `PORTFOLIO READY`
+until a maintainer actually completes
+[`docs/releasing.md`](releasing.md)'s checklist and publishes the
+first tag (`v0.1.0` per [`docs/versioning.md`](versioning.md)), at
+which point `OPEN-SOURCE READY` is warranted without further Phase 11
+work.
 
 ### Phase 12 — External review / "Break ChronicleDB" challenge
 

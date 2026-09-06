@@ -1,0 +1,30 @@
+name: Feature request
+description: Propose new functionality or an enhancement.
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Please check [`docs/non-goals.md`](https://github.com/SamudralaAjaykumarrr/chronicledb/blob/main/docs/non-goals.md) and [`docs/roadmap.md`](https://github.com/SamudralaAjaykumarrr/chronicledb/blob/main/docs/roadmap.md) first — many things (joins, sharding, auth/TLS, a config-file format, a SQL CLI, etc.) are deliberate, documented scope decisions with a stated trigger for revisiting them, not oversights. A request that reopens one of those is welcome, but should engage with the stated reasoning rather than assume it was never considered.
+  - type: textarea
+    id: problem
+    attributes:
+      label: What problem does this solve?
+      description: A concrete use case, not just "it would be nice to have."
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed solution
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+  - type: textarea
+    id: correctness-impact
+    attributes:
+      label: Correctness/architecture impact
+      description: Does this touch durability, MVCC, Raft, replication, or the SQL boundary (docs/invariants.md, docs/architecture.md)? If so, it likely needs its own ADR (see docs/adr/) rather than a direct implementation.

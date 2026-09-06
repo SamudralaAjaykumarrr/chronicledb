@@ -1,0 +1,74 @@
+name: Correctness / safety bug
+description: You suspect a violation of a documented invariant — data loss, a durability violation, an incorrect commit/read result, a Raft safety violation, or similar.
+labels: ["bug", "correctness"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        ChronicleDB's correctness claims are documented in [`docs/invariants.md`](https://github.com/SamudralaAjaykumarrr/chronicledb/blob/main/docs/invariants.md) and its explicit non-claims in [`docs/non-goals.md`](https://github.com/SamudralaAjaykumarrr/chronicledb/blob/main/docs/non-goals.md) (e.g. only Snapshot Isolation is claimed, never Serializable — see `docs/mvcc.md` §1.1). This template asks for the specific evidence needed to reproduce and fix a real correctness bug — please fill in as much as you can, and leave a field blank rather than guess if you genuinely don't know.
+
+        If this might be a security vulnerability specifically (not just a correctness bug), please use [`SECURITY.md`](https://github.com/SamudralaAjaykumarrr/chronicledb/blob/main/SECURITY.md)'s private reporting process instead of a public issue.
+  - type: input
+    id: commit
+    attributes:
+      label: Commit or version
+      description: Output of `chronicledb-node -version`, or the exact git commit hash.
+    validations:
+      required: true
+  - type: dropdown
+    id: category
+    attributes:
+      label: What kind of violation do you suspect?
+      multiple: true
+      options:
+        - Data loss (a committed write disappeared)
+        - Durability violation (an acknowledged write did not survive a crash/restart)
+        - Incorrect read (visibility/isolation violation)
+        - Safety violation (e.g. two leaders in the same term, divergent committed log)
+        - Liveness violation (cluster/operation stuck, no progress)
+        - RequestID idempotency violation (a retry produced a different or duplicate outcome)
+        - Not sure / other
+    validations:
+      required: true
+  - type: textarea
+    id: expected-vs-actual
+    attributes:
+      label: Expected vs. actual behavior
+      description: Precisely what you expected (ideally citing the specific invariant/section in docs/invariants.md, docs/mvcc.md, docs/raft.md, docs/replication.md, or docs/transactions.md) vs. what actually happened.
+    validations:
+      required: true
+  - type: textarea
+    id: repro
+    attributes:
+      label: Reproduction steps
+      description: Exact commands, flags, SQL statements, and timing/ordering, in order. If this involves a fault (crash, partition, disk fault), describe exactly when it was injected relative to other operations.
+    validations:
+      required: true
+  - type: input
+    id: seed
+    attributes:
+      label: Seed (if found via a chaos/fuzz/adversarial run)
+      description: If this came from internal/fault's chaos suites, internal/oracle's model-based suites, or a fuzz target, the exact seed and command (see docs/testing-strategy.md §6.5 / docs/adversarial-testing.md) that reproduces it.
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs / output
+      description: Include node logs, /status or /metrics output, or test failure output as applicable.
+      render: shell
+  - type: dropdown
+    id: cluster-mode
+    attributes:
+      label: Deployment
+      options:
+        - Standalone (internal/txn.Manager, no Raft)
+        - Single node with Raft (cmd/chronicledb-node, cluster size 1)
+        - Replicated cluster (cmd/chronicledb-node, multiple nodes)
+        - internal/fault deterministic simulator
+        - Not sure
+    validations:
+      required: true
+  - type: textarea
+    id: environment
+    attributes:
+      label: Environment
+      description: OS/arch, Go version, filesystem (see docs/support-matrix.md for what is actually tested).

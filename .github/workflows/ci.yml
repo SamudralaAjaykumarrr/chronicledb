@@ -8,10 +8,15 @@ jobs:
   test:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
         with:
           go-version: "1.26"
+          # ChronicleDB has zero external Go module dependencies (no
+          # go.sum, see docs/dependencies.md) — module caching keyed on
+          # go.sum would have nothing to cache, so disable it explicitly
+          # rather than let it warn about a missing go.sum every run.
+          cache: false
       - name: gofmt
         run: |
           fmt_out="$(gofmt -l .)"

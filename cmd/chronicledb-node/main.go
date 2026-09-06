@@ -34,6 +34,7 @@ import (
 	"github.com/SamudralaAjaykumarrr/chronicledb/internal/mvcc"
 	"github.com/SamudralaAjaykumarrr/chronicledb/internal/node"
 	"github.com/SamudralaAjaykumarrr/chronicledb/internal/raft"
+	"github.com/SamudralaAjaykumarrr/chronicledb/internal/version"
 )
 
 func main() {
@@ -45,8 +46,14 @@ func main() {
 		allFlag           = flag.String("cluster", "", "comma-separated id list of every cluster member, including this one")
 		dataDir           = flag.String("datadir", "", "durable log directory")
 		snapshotThreshold = flag.Uint64("snapshot-threshold", 0, "log entries since last snapshot before compacting (0 = package default); tests use a small value to force snapshot/compaction chaos quickly")
+		showVersion       = flag.Bool("version", false, "print version information and exit")
 	)
 	flag.Parse()
+
+	if *showVersion {
+		fmt.Println(version.String())
+		return
+	}
 
 	if *id == "" || *listenAddr == "" || *httpAddr == "" || *dataDir == "" || *allFlag == "" {
 		fmt.Fprintln(os.Stderr, "usage: chronicledb-node -id=ID -listen=HOST:PORT -http=HOST:PORT -datadir=DIR -cluster=id1,id2,id3 -peers=id2=host:port,id3=host:port")
@@ -70,6 +77,7 @@ func main() {
 	}
 
 	logger := log.New(os.Stderr, fmt.Sprintf("[%s] ", *id), log.LstdFlags|log.Lmicroseconds)
+	logger.Printf("starting %s", version.String())
 
 	cfg := node.Config{
 		ID:                         raft.NodeID(*id),

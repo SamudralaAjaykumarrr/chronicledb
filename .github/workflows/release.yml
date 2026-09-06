@@ -1,0 +1,66 @@
+name: Release
+
+# Triggered ONLY by pushing a version tag matching v*.*.* — never by a
+# push to a branch or a pull request. This is deliberate: pushing to
+# main/any branch, or opening/updating a PR, must never publish a
+# release. See docs/releasing.md for the full checklist a maintainer
+# follows before ever creating that tag.
+on:
+  push:
+    tags:
+      - "v*.*.*"
+
+# Only the permission this workflow actually needs, and nothing else:
+# creating a GitHub Release requires write access to repository
+# contents. No other token permission is requested.
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-go@v7
+        with:
+          go-version: "1.26"
+          cache: false
+
+      - name: Quality gates
+        # The same correctness gates CI runs on every push, re-run
+        # against the exact tagged commit before anything is published
+        # — a green `main` run earlier is not sufficient evidence for
+        # this specific commit (docs/releasing.md checklist item 2/8).
+        run: |
+          fmt_out="$(gofmt -l .)"
+          if [ -n "$fmt_out" ]; then
+            echo "$fmt_out"
+            exit 1
+          fi
+          go vet ./...
+          go build ./...
+          go build -tags integration ./...
+          go test ./...
+          go test -race ./...
+          go test -tags=integration ./cmd/chronicledb-node/... -race -count=1
+
+      - name: Build release artifacts
+        run: ./scripts/build-release.sh "${GITHUB_REF_NAME}"
+
+      - name: Create GitHub Release
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        # Uses the `gh` CLI already preinstalled on GitHub-hosted
+        # runners, authenticated via the built-in GITHUB_TOKEN — no
+        # third-party release action, so no additional supply-chain
+        # dependency for this step (docs/dependencies.md).
+        run: |
+          gh release create "${GITHUB_REF_NAME}" \
+            --verify-tag \
+            --title "ChronicleDB ${GITHUB_REF_NAME}" \
+            --notes "See CHANGELOG.md for what changed in this release, README.md for current maturity (docs/roadmap.md §Maturity Model), and docs/support-matrix.md for which of the attached platform archives are actually tested vs. cross-compiled only." \
+            --generate-notes \
+            dist/*.tar.gz dist/*.zip dist/checksums.txt

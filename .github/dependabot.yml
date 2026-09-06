@@ -1,0 +1,19 @@
+version: 2
+updates:
+  # ChronicleDB currently has zero external Go module dependencies
+  # (docs/dependencies.md) — this entry exists so that the moment a
+  # first one is added, its updates (including security advisories)
+  # start surfacing automatically, rather than someone remembering to
+  # add this later.
+  - package-ecosystem: "gomod"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+
+  # Keeps .github/workflows/*.yml action versions (actions/checkout,
+  # actions/setup-go, etc.) current — see docs/dependencies.md
+  # §GitHub Actions dependencies.
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
