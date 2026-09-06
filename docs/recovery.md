@@ -1,10 +1,11 @@
 # Recovery Model
 
-Status: Phase 1 (`internal/wal.Open`, §1 steps 1, 5-8) and Phase 2
+Status: Phase 1 (`internal/wal.Open`, §1 steps 1, 5-8), Phase 2
 (`internal/txn.Manager.recover`, §1 step 11 for `CommitTxn` commands in
-standalone mode) are implemented. Steps 2-4, 9-10, and 12-14 remain
-Phase 3+ scope (`RequestID` outcome restoration, Raft hard state,
-snapshots) and are not implemented yet.
+standalone mode), and Phase 3 (§1 step 12, `RequestID` outcome
+restoration via `internal/fsm.Apply` replay) are implemented. Steps
+2-4, 9-10, and 13-14 remain Raft/snapshot scope (Phase 4+) and are not
+implemented yet.
 
 This document defines the exact restart/recovery sequence a
 ChronicleDB node follows, so that a durable-but-uncommitted suffix,
@@ -150,7 +151,7 @@ install + log catch-up, see [`docs/snapshots.md`](snapshots.md)).
 Automating this procedure is a plausible future enhancement, not a
 V1 correctness requirement — see [`docs/roadmap.md`](roadmap.md).
 
-## 5. Recovery and idempotency
+## 5. Recovery and idempotency (implemented, Phase 3)
 
 Because `RequestID` outcomes are part of the deterministic state
 produced by `Apply` (see [`docs/transactions.md`](transactions.md)
@@ -161,38 +162,70 @@ answer it would have gotten from the node that originally applied the
 command — this is what `REQUEST-OUTCOME-STABILITY` (see
 [`docs/invariants.md`](invariants.md)) requires across restarts, not
 just across retries against a single continuously-running process.
-`RequestID` outcome restoration itself is Phase 3 scope (no such table
-exists yet); this section's principle — replay reconstructs the same
-answer a live node would give — is what Phase 2 already proves for
-transaction outcomes themselves (§6 below).
 
-## 6. Phase 2: standalone transactional recovery (implemented)
+`internal/txn.Manager.recover` (§6 below) decodes every durable
+`CommitTxn` command — Phase 3 durably appends one for every fresh
+`RequestID`'s first submission, whether it ultimately commits or
+conflicts (see [`docs/transactions.md`](transactions.md) §10) — and
+calls `internal/fsm.Apply` for it, in order, into a freshly constructed
+`internal/fsm.FSM`. Because `Apply` is deterministic, this reconstructs
+both the MVCC version chains and the `RequestID` outcome table
+(including each command's fingerprint, needed to detect a mismatched
+`RequestID` reuse post-restart) exactly as they stood before the
+restart — no separate durability mechanism for the outcome table
+exists or is needed (`CONSISTENT-LOG-RESPONSIBILITY`,
+[`docs/invariants.md`](invariants.md)): it is derived state, rebuilt
+the same way MVCC state itself is. A `RequestID` that was never
+submitted remains unknown after recovery (`GetRequestOutcome` returns
+`fsm.ErrRequestIDUnknown`) — recovery only ever repopulates outcomes
+for commands that actually exist in the durable log, never invents
+one (`RECOVERY-NON-INVENTION`). See
+`TestID2_DuplicateRequestIDAfterRestart`,
+`TestConflictOutcomeSurvivesRestartAndRetryRemainsConflict`,
+`TestMismatchedRequestIDReuseRejectedAfterRestart`, and
+`TestRecoveryNeverInventsRequestIDOutcomes` (`internal/txn`).
+
+## 6. Standalone transactional recovery (Phase 2, extended in Phase 3)
 
 `internal/txn.Manager.recover` implements this document's §1 step 11
 for `CommitTxn` commands, in standalone mode: it calls
-`internal/wal.WAL.Replay(1)`, decodes each `RecordTypeLogEntry` payload,
-and runs the exact same conflict-check-then-apply sequence
-`Manager.commit` runs for a live commit (docs/transactions.md §9), in
-order, into a freshly constructed, empty `internal/mvcc.Store`.
+`internal/wal.WAL.Replay(1)`, decodes each `RecordTypeLogEntry` payload
+as an `internal/fsm.CommitTxnCommand`, and calls `internal/fsm.Apply`
+for it — the identical function `Manager.commit` calls for a live
+commit — in order, into a freshly constructed `internal/fsm.FSM` over
+an empty `internal/mvcc.Store`.
 
-Because Phase 2's live commit path only ever durably appends a
-`CommitTxn` record *after* it has already passed its conflict check
-(docs/transactions.md §9), every record recovery finds is guaranteed,
-by construction, to re-apply as `COMMITTED` when replayed in the exact
-same order against the exact same (initially empty) starting state. If
-`recover` ever finds a record that its own deterministic re-evaluation
-says would conflict, that is not treated as "this transaction must have
-aborted" — it is treated as proof that the durable log is not a
-legitimate, deterministically reproducible history (a form of
-corruption `internal/wal`'s checksums cannot detect, since the bytes
-are individually well-formed), and recovery fails closed
-(`RECOVERY-NON-INVENTION`) rather than guessing.
+Phase 2's version of this section described every replayed record as
+guaranteed, by construction, to re-apply as `COMMITTED` — because
+Phase 2's live commit path only ever durably appended a `CommitTxn`
+record *after* it had already passed its conflict check, so a
+conflict found during replay could only mean corruption. **This is no
+longer true as of Phase 3** (see docs/transactions.md §10): the live
+commit path now durably appends a command *before* evaluating its
+conflict outcome, specifically so a command that conflicts still gets
+a durable, replay-reconstructible `RequestID` outcome. Recovery
+therefore does *not* treat a replay-time conflict as corruption — it
+is a normal, expected, deterministic result, identical to what the
+live commit produced, because `Apply` is a pure function of
+(index, command, prior state) and replay reconstructs the identical
+prior state at every index by replaying the identical prior commands
+in the identical order. What recovery *does* still fail closed on is a
+genuine inconsistency `Apply` itself detects: the same `RequestID`
+appearing twice in the durable log with two different command
+fingerprints, reported as `fsm.ErrRequestIDPayloadMismatch` — this
+cannot happen via `internal/txn.Manager`'s own single-writer path
+today (it pre-checks via `fsm.Precheck` before ever appending a fresh
+`RequestID`), but `recover` still propagates it as a startup-refusing
+error rather than guessing which of the two to keep
+(`RECOVERY-NON-INVENTION`).
 
-This gives Phase 2 the properties this document requires without a
-`RequestID` table or Raft's committed-boundary machinery, both still
-absent: standalone mode has no possibility of a durable-but-uncommitted
-suffix from another node's perspective (§2.1), and every `CommitTxn`
-record that exists in the log was, by the live commit path's own
-construction, already a legitimately committed transaction — so replay
+This gives Phase 3 the properties this document requires without
+Raft's committed-boundary machinery, still absent: standalone mode has
+no possibility of a durable-but-uncommitted suffix from another node's
+perspective (§2.1), and every `CommitTxn` record that exists in the
+log was, by the live commit path's own construction, already durably
+decided (either `COMMITTED` or `ABORTED`) before the process that
+appended it could have acknowledged anything about it — so replay
 never needs to distinguish "committed" from "merely present" the way
-Raft-mode recovery eventually will.
+Raft-mode recovery eventually will; it only needs to reproduce the
+same deterministic decision, which `Apply`'s determinism guarantees.

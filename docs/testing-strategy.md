@@ -1,14 +1,19 @@
 # Testing Strategy
 
 Status: Unit, component, property, and fuzz tests exist for Phase 1
-(`internal/wal`, `internal/storage`) and Phase 2 (`internal/mvcc`,
-`internal/txn`) — see `docs/scenario-corpus.md` for exactly which
-scenarios pass. The deterministic distributed simulator (§3) and the
-categories that depend on it (partition tests, chaos tests) remain
-unimplemented target design only, since `internal/raft` does not exist
-until Phase 4. This document specifies the testing architecture future
-implementation phases must build toward; it does not itself assert an
-aggregate coverage or pass-count claim (see §2's guiding principle).
+(`internal/wal`, `internal/storage`), Phase 2 (`internal/mvcc`,
+`internal/txn`), and Phase 3 (`internal/fsm`, plus `internal/txn`'s
+idempotency/recovery integration tests) — see `docs/scenario-corpus.md`
+for exactly which scenarios pass. Phase 3 additionally exercises
+deterministic replay equivalence (two independently constructed
+`internal/fsm.FSM` instances fed the identical command history) as a
+concrete instance of the "Deterministic distributed simulation" row
+below, in miniature and without any networking/Raft — the full
+simulator itself remains unimplemented target design, since
+`internal/raft` does not exist until Phase 4. This document specifies
+the testing architecture future implementation phases must build
+toward; it does not itself assert an aggregate coverage or pass-count
+claim (see §2's guiding principle).
 
 Testing targets **correctness properties** (the invariants in
 [`docs/invariants.md`](invariants.md)), not coverage percentage.

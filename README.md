@@ -11,7 +11,7 @@ store, or a wrapper around an existing finished database or consensus
 library. See [`docs/vision.md`](docs/vision.md) for the full statement
 of intent and explicit non-goals.
 
-Current maturity: **SINGLE-NODE DURABLE ENGINE**
+Current maturity: **TRANSACTIONAL ENGINE**
 
 Phase 1 — durable append-only segment storage (`internal/storage`) and
 a checksummed, replayable write-ahead log with crash recovery
@@ -35,22 +35,30 @@ a real subprocess kill-based crash test. See
 [`docs/transactions.md`](docs/transactions.md) for the implemented
 design.
 
-Per [`docs/roadmap.md`](docs/roadmap.md) §Maturity Model, the next
-maturity level, `TRANSACTIONAL ENGINE`, formally requires Phase 3
-(`RequestID` idempotency, and factoring `internal/fsm` out as its own
-deterministic Apply boundary) in addition to Phase 2 — Phase 3 is not
-implemented, so that maturity level is not yet claimed here even though
-Phase 2 itself is complete and evidenced.
+Phase 3 — the deterministic state-machine boundary (`internal/fsm`)
+and `RequestID` idempotency — is also implemented and tested against
+`docs/scenario-corpus.md` §Idempotency (ID-1 through ID-7; the
+snapshot+compaction leg of ID-4 remains Phase 6 scope). `internal/fsm`
+is now the sole `Apply(index, command) -> outcome` boundary for
+transaction commits, proven deterministic by feeding an identical
+ordered command history into two independently constructed `FSM`
+instances and asserting byte-identical outcomes. The `RequestID`
+outcome table durably survives restart for both `COMMITTED` and
+`ABORTED` (conflicted) outcomes, detects a mismatched-payload reuse of
+the same `RequestID`, and is queryable via `Manager.GetRequestOutcome`
+without resubmitting a mutation payload. See
+[`docs/transactions.md`](docs/transactions.md) §6-7/§10 and
+[`docs/recovery.md`](docs/recovery.md) §5-6 for the implemented
+design.
+
+Per [`docs/roadmap.md`](docs/roadmap.md) §Maturity Model, `TRANSACTIONAL
+ENGINE` is Phases 2-3 together; both are now complete and evidenced.
 
 No replication, Raft, or SQL implementation exists yet. See
 [`docs/roadmap.md`](docs/roadmap.md) §Maturity Model for the
 evidence-based gates that govern every future maturity claim, and
 [`docs/architecture.md`](docs/architecture.md) for the system design
 itself.
-
-The next milestone is **Phase 3 — deterministic state-machine boundary
-+ `RequestID` idempotency** (see
-[`docs/roadmap.md`](docs/roadmap.md)). Implementation has not begun.
 
 ## Documentation
 

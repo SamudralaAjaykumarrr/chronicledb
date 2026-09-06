@@ -5,6 +5,8 @@ import (
 	"fmt"
 	"sync"
 	"testing"
+
+	"github.com/SamudralaAjaykumarrr/chronicledb/internal/fsm"
 )
 
 // TestConcurrentNonConflictingWritersAllCommit runs many goroutines,
@@ -29,7 +31,8 @@ func TestConcurrentNonConflictingWritersAllCommit(t *testing.T) {
 				errs[i] = err
 				return
 			}
-			if _, err := tx.Commit(); err != nil {
+			requestID := fsm.RequestID(fmt.Sprintf("req-%d", i))
+			if _, err := tx.Commit(requestID); err != nil {
 				errs[i] = err
 			}
 		}(i)
@@ -80,7 +83,8 @@ func TestConcurrentConflictingWritersExactlyOneWins(t *testing.T) {
 		wg.Add(1)
 		go func(i int) {
 			defer wg.Done()
-			_, err := txns[i].Commit()
+			requestID := fsm.RequestID(fmt.Sprintf("req-%d", i))
+			_, err := txns[i].Commit(requestID)
 			mu.Lock()
 			defer mu.Unlock()
 			switch {
@@ -120,7 +124,7 @@ func TestConcurrentReadsDuringCommit(t *testing.T) {
 	if err := setup.Write("K", []byte("v0")); err != nil {
 		t.Fatalf("Write: %v", err)
 	}
-	if _, err := setup.Commit(); err != nil {
+	if _, err := setup.Commit("setup"); err != nil {
 		t.Fatalf("Commit: %v", err)
 	}
 
@@ -140,7 +144,8 @@ func TestConcurrentReadsDuringCommit(t *testing.T) {
 			if err := tx.Write(fmt.Sprintf("writer-key-%d", i), []byte("x")); err != nil {
 				return
 			}
-			if _, err := tx.Commit(); err != nil {
+			requestID := fsm.RequestID(fmt.Sprintf("writer-req-%d", i))
+			if _, err := tx.Commit(requestID); err != nil {
 				return
 			}
 		}

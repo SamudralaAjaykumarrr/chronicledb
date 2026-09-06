@@ -21,19 +21,7 @@ var (
 
 	// ErrConflict indicates a write-write conflict under first-committer-
 	// wins (docs/mvcc.md §4): the entire transaction aborts, none of its
-	// mutations are applied.
+	// mutations are applied. See internal/fsm.Outcome's ConflictKey/
+	// ConflictLatestSeq for the deterministic detail.
 	ErrConflict = errors.New("txn: write-write conflict (first-committer-wins)")
-
-	// ErrMalformedRecord indicates a CommitTxn record's bytes could not
-	// be decoded — truncated, or a length/count field inconsistent with
-	// the bytes actually present. Never produced by a panic; decoding
-	// always fails closed with this error instead (docs/failure-model.md
-	// §6).
-	ErrMalformedRecord = errors.New("txn: malformed CommitTxn record")
-
-	// ErrUnsupportedRecordVersion indicates a CommitTxn record's own
-	// format-version byte does not match what this build understands.
-	// Recovery refuses to guess at an unrecognized layout, mirroring
-	// internal/wal's ErrUnsupportedVersion policy (docs/wal.md §6.3).
-	ErrUnsupportedRecordVersion = errors.New("txn: unsupported CommitTxn record version")
 )

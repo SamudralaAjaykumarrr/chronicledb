@@ -1,12 +1,13 @@
 # Transaction Model
 
-Status: Phase 2 implemented (`internal/txn`), except §6-7 (`RequestID`
-idempotency and uncertain-outcome handling), which remain Phase 3
-scope per `docs/roadmap.md` and are not implemented by this phase. §1-5
-below are implemented as specified and tested against
-`docs/scenario-corpus.md` §Transactions. See §9 for implementation-time
-decisions, including where the deterministic-apply role described in §4
-currently lives before `internal/fsm` exists (Phase 3).
+Status: Phase 2 (`internal/txn` §1-5) and Phase 3 (`internal/fsm`,
+§6-7 `RequestID` idempotency and uncertain-outcome handling) are both
+implemented and tested against `docs/scenario-corpus.md` §Transactions
+and §Idempotency (immediate/after-restart cases). See §9 for Phase 2's
+implementation-time decisions and §10 for the Phase 3 decisions that
+supersede one of them (the durable-append condition for a conflicting
+command — §9's last bullet on this point is superseded by §10, not
+still current).
 
 This document defines the transaction lifecycle, idempotency, and
 uncertain-outcome handling. MVCC visibility and conflict rules are
@@ -296,3 +297,77 @@ matters to the caller."
   question, not something `internal/txn` can safely paper over on its
   own, and is recorded as a remaining risk rather than silently
   patched.
+
+## 10. Phase 3 implementation decisions (resolved)
+
+- **`internal/fsm` now exists** as specified by
+  [ADR-0007](adr/0007-deterministic-replicated-state-machine-boundary.md):
+  `internal/fsm.Apply(index, CommitTxnCommand) -> Outcome` is the sole
+  deterministic boundary, owning `internal/mvcc.Store` and the
+  `RequestID` outcome table. `internal/txn.Manager` is now purely an
+  orchestration layer around it: it owns the WAL, decides whether a
+  commit attempt needs a fresh durable append at all (see the next
+  bullet), and calls `Apply` with the exact log index a command
+  occupies — both for a live commit (`Manager.commit`) and for
+  recovery replay (`Manager.recover`), which now simply decodes each
+  record and calls `Apply` for it in order, with no conflict-detection
+  logic of its own left in `internal/txn`. This is the mechanical
+  extraction §9's first bullet anticipated.
+- **Command format version 2 adds `RequestID`**: `internal/fsm`'s
+  `CommitTxnCommand` encoding (`commitTxnCommandVersion = 2`) carries
+  `RequestID`, `TxnID`, `StartSeq`, and `Mutations`. No Phase 1/2
+  production data exists to migrate, so decode rejects version 1
+  outright rather than carrying a compatibility shim.
+- **A fresh conflicting command IS now durably appended — this
+  supersedes §9's "conflict check happens before the durable append"
+  bullet.** §9's Phase 2 collapse (never append a command that would
+  conflict) is not compatible with `REQUEST-OUTCOME-STABILITY`
+  (`docs/invariants.md`) once `RequestID` outcomes must survive
+  restart: if a conflicting command were never durably recorded, its
+  `RequestID`'s `ABORTED` outcome would not exist anywhere on disk, so
+  a retry after restart would have nothing to reconstruct from and
+  could be evaluated fresh — potentially against different state,
+  producing a *different* answer than the original live decision. That
+  is a direct violation of the stability invariant, which draws no
+  distinction between a `COMMITTED` and an `ABORTED` "completed"
+  outcome. `Manager.commit` therefore now appends any command whose
+  `RequestID` is not already known (via `fsm.Precheck`), unconditionally,
+  *before* calling `fsm.Apply` to determine `COMMITTED`/`ABORTED` — this
+  is exactly the two-step form §9 and §4.1 already described as the
+  general, eventually-necessary model, and which §9 said Phase 4/5
+  would "reintroduce." Phase 3 adopts it early, for standalone mode
+  too, specifically because `RequestID` durability requires it; this is
+  not a new mechanism, just this phase's evolution activating a
+  mechanism the architecture already specified. A **retry** of an
+  already-known `RequestID` (§6's optimization) still never appends
+  anything — only a *fresh* `RequestID`'s first submission does, whether
+  it ultimately commits or conflicts. See
+  `TestConflictingCommitAppendsToWALForDurableOutcome` and
+  `TestRetryDoesNotAppendToWAL` (`internal/txn`).
+- **The mismatched-`RequestID`-reuse fingerprint is
+  `(TxnID, StartSeq, Mutations)`, not `Mutations` alone.** A genuine
+  retry is defined as resubmitting the *exact* original request
+  (docs/transactions.md §8: a retry need not come from the original
+  `Txn` session, but it must present the same `TxnID` and `StartSeq`
+  the original commit attempt captured at `BEGIN`, in addition to the
+  same mutation set) — a client is expected to remember and resend
+  these fields unchanged, not re-derive a fresh `StartSeq` via a new
+  `BEGIN`. `internal/txn.Manager.Resubmit` is the entry point for this:
+  it accepts an explicit `(RequestID, TxnID, StartSeq, Mutations)`
+  tuple directly, without requiring the original `Txn` object (which,
+  per §8, may not even exist any more) to still be alive.
+  `Txn.Commit` itself is unchanged — the common "fresh transaction"
+  case — and internally calls the identical `Manager.commit` path.
+- **Read-only commits remain outside the `RequestID` contract
+  entirely, unchanged from §9**: since nothing is ever durably
+  appended for an empty mutation set, there is nothing for a
+  `RequestID` outcome to attach to, and none is recorded — this is the
+  one documented, intentional non-replicated bypass of the
+  `internal/fsm` boundary (an empty-mutation commit trivially returns
+  `Outcome{Status: Committed, CommitSeq: <current watermark>}` without
+  ever calling `Apply`).
+- **`Manager.GetRequestOutcome(RequestID)`** implements this
+  document's §7 conceptual `GetRequestOutcome`: it wraps
+  `internal/fsm.FSM.GetOutcome`, returning the recorded terminal
+  outcome or an error wrapping `fsm.ErrRequestIDUnknown` — never a
+  guess.

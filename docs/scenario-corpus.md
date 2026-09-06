@@ -216,6 +216,7 @@ executable.
   outcome.
 - **Invariants**: `IDEMPOTENCY`.
 - **Phase**: 3.
+- **Status**: passing — `internal/txn/idempotency_test.go::TestID1_DuplicateRequestIDBeforeRestart`, `internal/txn/txn_test.go::TestRetryDoesNotAppendToWAL`.
 
 ### ID-2: Duplicate `RequestID` after restart
 
@@ -225,6 +226,7 @@ executable.
   returns the identical outcome; no re-apply.
 - **Invariants**: `IDEMPOTENCY`, `REQUEST OUTCOME STABILITY`.
 - **Phase**: 3.
+- **Status**: passing — `internal/txn/idempotency_test.go::TestID2_DuplicateRequestIDAfterRestart`. Also proven for the `ABORTED` (conflict) case, which this scenario's wording does not explicitly distinguish but `REQUEST OUTCOME STABILITY` requires identically: `TestConflictOutcomeSurvivesRestartAndRetryRemainsConflict`.
 
 ### ID-3: Committed request + lost response
 
@@ -233,6 +235,7 @@ executable.
 - **Expected state**: outcome query returns `COMMITTED`.
 - **Invariants**: `REQUEST OUTCOME STABILITY`.
 - **Phase**: 3.
+- **Status**: passing — `internal/txn/txn_test.go::TestGetRequestOutcomeCommitted` (and `TestGetRequestOutcomeAborted` for the conflict analogue; `TestGetRequestOutcomeUnknown` for the never-submitted case).
 
 ### ID-4: Same `RequestID` retry
 
@@ -241,6 +244,7 @@ executable.
   cover all three outcome-retention paths.
 - **Invariants**: `IDEMPOTENCY`, `REQUEST OUTCOME STABILITY`.
 - **Phase**: 3 (immediate/after-restart), 6 (after snapshot+compaction).
+- **Status**: immediate/after-restart passing (see ID-1/ID-2 above); after-snapshot+compaction remains Phase 6 scope, not implemented (no `internal/snapshot` exists yet).
 
 ### ID-5: New `RequestID` with same mutations
 
@@ -256,6 +260,37 @@ executable.
 - **Invariants**: `IDEMPOTENCY` (correctly *not* applying cross-request
   deduplication here).
 - **Phase**: 3.
+- **Status**: passing — `internal/fsm/fsm_test.go::TestMultipleRequestIDsSameMutationsAreDistinct`, `internal/txn/idempotency_test.go::TestMultipleRequestIDsSameMutationsSurviveRestartAsDistinct`.
+
+### ID-6: `RequestID` reused with a mismatched payload
+
+- **Action**: `COMMIT` with `RequestID=R` applied; a later request
+  reuses the identical `RequestID=R` but with a **different** `TxnID`,
+  `StartSeq`, or `Mutations` than the original.
+- **Expected state**: the reuse is rejected outright
+  (`fsm.ErrRequestIDPayloadMismatch`); `R`'s originally recorded
+  outcome is completely unchanged, both immediately and after a
+  restart.
+- **Invariants**: `IDEMPOTENCY`, `REQUEST OUTCOME STABILITY` (this is
+  the safe-default policy [`docs/transactions.md`](transactions.md) §6
+  specifies for ambiguous reuse, not a scenario present in the
+  original ADR-0006 proof-obligation list, but required by this
+  phase's brief and consistent with that ADR's identity-only
+  deduplication contract).
+- **Phase**: 3.
+- **Status**: passing — `internal/fsm/fsm_test.go::TestMismatchedRequestIDReuseRejected`, `internal/txn/txn_test.go::TestMismatchedRequestIDReuseRejected`, `internal/txn/idempotency_test.go::TestMismatchedRequestIDReuseRejectedAfterRestart`.
+
+### ID-7: State-machine determinism / replay equivalence
+
+- **Action**: apply an identical ordered `CommitTxn` command history
+  (including a conflicting command and a duplicate `RequestID`) to two
+  independently constructed `internal/fsm.FSM` instances.
+- **Expected state**: byte-for-byte-equivalent `Outcome` values at
+  every step, and equivalent MVCC visibility at every `(key, StartSeq)`
+  pair.
+- **Invariants**: `STATE MACHINE SAFETY`, `DETERMINISM BOUNDARY`.
+- **Phase**: 3.
+- **Status**: passing — `internal/fsm/fsm_test.go::TestDeterministicReplayEquivalence`, `TestReplayEquivalenceRepeatedRuns`, `TestEncodeDeterministicRegardlessOfConstructionPath`.
 
 ---
 

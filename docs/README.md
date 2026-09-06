@@ -60,14 +60,15 @@ terminology every other document depends on.
 ## What this documentation does not claim
 
 Phase 1's durable storage and WAL engine (`internal/storage`,
-`internal/wal`) and Phase 2's MVCC and transaction engine
-(`internal/mvcc`, `internal/txn`) are implemented and tested — see
-[`storage.md`](storage.md), [`wal.md`](wal.md), [`mvcc.md`](mvcc.md),
-and [`transactions.md`](transactions.md) for the design as actually
-built. No document in this directory claims that `RequestID`
-idempotency, a Raft consensus module, a SQL layer, or a CLI currently
-exists or has been tested, and no document claims SERIALIZABLE
-isolation — only Snapshot Isolation is implemented and proven (see
+`internal/wal`), Phase 2's MVCC and transaction engine (`internal/mvcc`,
+`internal/txn`), and Phase 3's deterministic state-machine boundary and
+`RequestID` idempotency (`internal/fsm`) are implemented and tested —
+see [`storage.md`](storage.md), [`wal.md`](wal.md), [`mvcc.md`](mvcc.md),
+[`transactions.md`](transactions.md), and [`recovery.md`](recovery.md)
+for the design as actually built. No document in this directory claims
+that a Raft consensus module, a SQL layer, or a CLI currently exists or
+has been tested, and no document claims SERIALIZABLE isolation — only
+Snapshot Isolation is implemented and proven (see
 [`mvcc.md`](mvcc.md) §1.1). See [`vision.md`](vision.md) and
 [`roadmap.md`](roadmap.md) §Maturity Model for how capability claims
 are gated on implementation evidence.

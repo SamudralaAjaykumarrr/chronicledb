@@ -4,6 +4,7 @@ import (
 	"errors"
 	"testing"
 
+	"github.com/SamudralaAjaykumarrr/chronicledb/internal/fsm"
 	"github.com/SamudralaAjaykumarrr/chronicledb/internal/mvcc"
 	"github.com/SamudralaAjaykumarrr/chronicledb/internal/wal"
 )
@@ -33,7 +34,7 @@ func TestTX1_BeginReadWriteCommit(t *testing.T) {
 	if err := setup.Write("K", []byte("v0")); err != nil {
 		t.Fatalf("Write: %v", err)
 	}
-	if _, err := setup.Commit(); err != nil {
+	if _, err := setup.Commit("setup"); err != nil {
 		t.Fatalf("Commit setup: %v", err)
 	}
 
@@ -45,7 +46,7 @@ func TestTX1_BeginReadWriteCommit(t *testing.T) {
 	if err := tx.Write("K", []byte("v1")); err != nil {
 		t.Fatalf("Write: %v", err)
 	}
-	seq, err := tx.Commit()
+	seq, err := tx.Commit("r1")
 	if err != nil {
 		t.Fatalf("Commit: %v", err)
 	}
@@ -98,7 +99,7 @@ func TestTX3_MultiKeyAtomicCommit(t *testing.T) {
 	if err := tx.Delete("K3"); err != nil {
 		t.Fatalf("Delete K3: %v", err)
 	}
-	seq, err := tx.Commit()
+	seq, err := tx.Commit("r1")
 	if err != nil {
 		t.Fatalf("Commit: %v", err)
 	}
@@ -139,10 +140,10 @@ func TestTX4_ConcurrentNonConflictingTransactions(t *testing.T) {
 	if err := t2.Write("B", []byte("2")); err != nil {
 		t.Fatalf("t2.Write: %v", err)
 	}
-	if _, err := t1.Commit(); err != nil {
+	if _, err := t1.Commit("r1"); err != nil {
 		t.Fatalf("t1.Commit: %v", err)
 	}
-	if _, err := t2.Commit(); err != nil {
+	if _, err := t2.Commit("r2"); err != nil {
 		t.Fatalf("t2.Commit: %v", err)
 	}
 
@@ -169,12 +170,12 @@ func TestTX5_ConcurrentConflictingTransactions(t *testing.T) {
 		t.Fatalf("t2.Write: %v", err)
 	}
 
-	c1, err := t1.Commit()
+	c1, err := t1.Commit("r1")
 	if err != nil {
 		t.Fatalf("t1.Commit: %v", err)
 	}
 
-	_, err = t2.Commit()
+	_, err = t2.Commit("r2")
 	if err == nil {
 		t.Fatal("t2.Commit: expected conflict error, got nil")
 	}
@@ -202,7 +203,7 @@ func TestTX6_ReadSnapshotStable(t *testing.T) {
 	if err := setup.Write("K", []byte("v0")); err != nil {
 		t.Fatalf("Write: %v", err)
 	}
-	if _, err := setup.Commit(); err != nil {
+	if _, err := setup.Commit("setup"); err != nil {
 		t.Fatalf("Commit: %v", err)
 	}
 
@@ -216,7 +217,7 @@ func TestTX6_ReadSnapshotStable(t *testing.T) {
 	if err := t2.Write("K", []byte("v1")); err != nil {
 		t.Fatalf("t2.Write: %v", err)
 	}
-	if _, err := t2.Commit(); err != nil {
+	if _, err := t2.Commit("r2"); err != nil {
 		t.Fatalf("t2.Commit: %v", err)
 	}
 
@@ -233,7 +234,7 @@ func TestTX7_DeleteTombstoneVisibility(t *testing.T) {
 	if err := setup.Write("K", []byte("v0")); err != nil {
 		t.Fatalf("Write: %v", err)
 	}
-	if _, err := setup.Commit(); err != nil {
+	if _, err := setup.Commit("setup"); err != nil {
 		t.Fatalf("Commit: %v", err)
 	}
 
@@ -241,7 +242,7 @@ func TestTX7_DeleteTombstoneVisibility(t *testing.T) {
 	if err := del.Delete("K"); err != nil {
 		t.Fatalf("Delete: %v", err)
 	}
-	if _, err := del.Commit(); err != nil {
+	if _, err := del.Commit("del"); err != nil {
 		t.Fatalf("Commit delete: %v", err)
 	}
 
@@ -270,7 +271,7 @@ func TestTX8_SnapshotIsolationWriteSkew(t *testing.T) {
 	if err := setup.Write("y", []byte("10")); err != nil {
 		t.Fatalf("Write y: %v", err)
 	}
-	if _, err := setup.Commit(); err != nil {
+	if _, err := setup.Commit("setup"); err != nil {
 		t.Fatalf("Commit setup: %v", err)
 	}
 
@@ -309,10 +310,10 @@ func TestTX8_SnapshotIsolationWriteSkew(t *testing.T) {
 		t.Fatalf("t2.Write(y): %v", err)
 	}
 
-	if _, err := t1.Commit(); err != nil {
+	if _, err := t1.Commit("r1"); err != nil {
 		t.Fatalf("t1.Commit: expected COMMITTED (disjoint write sets), got error: %v", err)
 	}
-	if _, err := t2.Commit(); err != nil {
+	if _, err := t2.Commit("r2"); err != nil {
 		t.Fatalf("t2.Commit: expected COMMITTED (disjoint write sets), got error: %v", err)
 	}
 
@@ -334,7 +335,7 @@ func TestLifecycle_WriteAfterCommitRejected(t *testing.T) {
 	if err := tx.Write("K", []byte("v")); err != nil {
 		t.Fatalf("Write: %v", err)
 	}
-	if _, err := tx.Commit(); err != nil {
+	if _, err := tx.Commit("r1"); err != nil {
 		t.Fatalf("Commit: %v", err)
 	}
 	if err := tx.Write("K", []byte("v2")); !errors.Is(err, ErrAlreadyCommitted) {
@@ -357,11 +358,18 @@ func TestLifecycle_CommitTwiceRejected(t *testing.T) {
 	if err := tx.Write("K", []byte("v")); err != nil {
 		t.Fatalf("Write: %v", err)
 	}
-	if _, err := tx.Commit(); err != nil {
+	if _, err := tx.Commit("r1"); err != nil {
 		t.Fatalf("first Commit: %v", err)
 	}
-	if _, err := tx.Commit(); !errors.Is(err, ErrAlreadyCommitted) {
-		t.Fatalf("second Commit: err = %v, want ErrAlreadyCommitted", err)
+	// A second Commit call on the SAME Txn object (whether reusing the
+	// same RequestID or a new one) is rejected at the session-lifecycle
+	// level, before RequestID identity is even consulted: the Txn
+	// itself is already terminal.
+	if _, err := tx.Commit("r1"); !errors.Is(err, ErrAlreadyCommitted) {
+		t.Fatalf("second Commit (same RequestID): err = %v, want ErrAlreadyCommitted", err)
+	}
+	if _, err := tx.Commit("r2"); !errors.Is(err, ErrAlreadyCommitted) {
+		t.Fatalf("second Commit (different RequestID): err = %v, want ErrAlreadyCommitted", err)
 	}
 }
 
@@ -374,7 +382,7 @@ func TestLifecycle_CommitAfterAbortRejected(t *testing.T) {
 	if err := tx.Abort(); err != nil {
 		t.Fatalf("Abort: %v", err)
 	}
-	if _, err := tx.Commit(); !errors.Is(err, ErrAlreadyAborted) {
+	if _, err := tx.Commit("r1"); !errors.Is(err, ErrAlreadyAborted) {
 		t.Fatalf("Commit after abort: err = %v, want ErrAlreadyAborted", err)
 	}
 }
@@ -400,10 +408,10 @@ func TestLifecycle_OperationsAfterConflictAbortRejected(t *testing.T) {
 	if err := t2.Write("K", []byte("b")); err != nil {
 		t.Fatalf("t2.Write: %v", err)
 	}
-	if _, err := t1.Commit(); err != nil {
+	if _, err := t1.Commit("r1"); err != nil {
 		t.Fatalf("t1.Commit: %v", err)
 	}
-	if _, err := t2.Commit(); err == nil {
+	if _, err := t2.Commit("r2"); err == nil {
 		t.Fatal("t2.Commit: expected conflict error")
 	}
 	// t2 is now implicitly terminal (aborted) after a failed commit.
@@ -419,7 +427,7 @@ func TestReadOnlyCommitSucceedsWithoutWALGrowth(t *testing.T) {
 	if _, _, err := tx.Read("nonexistent"); err != nil {
 		t.Fatalf("Read: %v", err)
 	}
-	if _, err := tx.Commit(); err != nil {
+	if _, err := tx.Commit("r1"); err != nil {
 		t.Fatalf("Commit (read-only): %v", err)
 	}
 	after := w.NextIndex()
@@ -428,7 +436,16 @@ func TestReadOnlyCommitSucceedsWithoutWALGrowth(t *testing.T) {
 	}
 }
 
-func TestConflictingCommitDoesNotAppendToWAL(t *testing.T) {
+// TestConflictingCommitAppendsToWALForDurableOutcome: Phase 3 changes
+// this from Phase 2's behavior (see docs/transactions.md §9/§10). A
+// FRESH (never-seen) RequestID that turns out to conflict must still
+// be durably appended: this is what makes the RequestID's ABORTED
+// outcome reconstructable by recovery after a restart
+// (REQUEST-OUTCOME-STABILITY must hold for ABORTED exactly as much as
+// for COMMITTED — docs/invariants.md). See
+// TestRetryDoesNotAppendToWAL for the still-true optimization that a
+// *retry* of an already-known RequestID never appends again.
+func TestConflictingCommitAppendsToWALForDurableOutcome(t *testing.T) {
 	m, w := newTestManager(t)
 	t1 := m.Begin()
 	t2 := m.Begin()
@@ -438,15 +455,159 @@ func TestConflictingCommitDoesNotAppendToWAL(t *testing.T) {
 	if err := t2.Write("K", []byte("b")); err != nil {
 		t.Fatalf("t2.Write: %v", err)
 	}
-	if _, err := t1.Commit(); err != nil {
+	if _, err := t1.Commit("winner"); err != nil {
 		t.Fatalf("t1.Commit: %v", err)
 	}
 	before := w.NextIndex()
-	if _, err := t2.Commit(); err == nil {
+	if _, err := t2.Commit("loser"); err == nil {
 		t.Fatal("t2.Commit: expected conflict")
 	}
 	after := w.NextIndex()
+	if after != before+1 {
+		t.Fatalf("a fresh conflicting commit did not append exactly one WAL record: before=%d after=%d", before, after)
+	}
+}
+
+// TestRetryDoesNotAppendToWAL: retrying an already-known RequestID
+// (whether its original outcome was COMMITTED or ABORTED) never
+// appends to the WAL again (docs/transactions.md §6's documented
+// optimization).
+func TestRetryDoesNotAppendToWAL(t *testing.T) {
+	m, w := newTestManager(t)
+
+	committed := m.Begin()
+	committedTxnID, committedStartSeq := committed.ID(), committed.StartSeq()
+	committedMutations := []mvcc.Mutation{{Key: "A", Value: []byte("v")}}
+	if err := committed.Write("A", []byte("v")); err != nil {
+		t.Fatalf("Write: %v", err)
+	}
+	wantSeq, err := committed.Commit("committed-req")
+	if err != nil {
+		t.Fatalf("Commit: %v", err)
+	}
+
+	winner := m.Begin()
+	loser := m.Begin()
+	loserTxnID, loserStartSeq := loser.ID(), loser.StartSeq()
+	loserMutations := []mvcc.Mutation{{Key: "B", Value: []byte("l")}}
+	if err := winner.Write("B", []byte("w")); err != nil {
+		t.Fatalf("winner.Write: %v", err)
+	}
+	if err := loser.Write("B", []byte("l")); err != nil {
+		t.Fatalf("loser.Write: %v", err)
+	}
+	if _, err := winner.Commit("winner-req"); err != nil {
+		t.Fatalf("winner.Commit: %v", err)
+	}
+	if _, err := loser.Commit("loser-req"); err == nil {
+		t.Fatal("loser.Commit: expected conflict")
+	}
+
+	before := w.NextIndex()
+
+	// Retry both RequestIDs by resubmitting their exact original
+	// request (RequestID identity, not Txn identity, is what makes a
+	// retry idempotent — docs/transactions.md §8).
+	retryOutcome, err := m.Resubmit("committed-req", committedTxnID, committedStartSeq, committedMutations)
+	if err != nil {
+		t.Fatalf("retry Resubmit(committed-req): %v", err)
+	}
+	if retryOutcome.CommitSeq != wantSeq {
+		t.Fatalf("retry CommitSeq = %d, want original %d", retryOutcome.CommitSeq, wantSeq)
+	}
+
+	if _, err := m.Resubmit("loser-req", loserTxnID, loserStartSeq, loserMutations); !errors.Is(err, ErrConflict) {
+		t.Fatalf("retry Resubmit(loser-req): err = %v, want ErrConflict (same original outcome)", err)
+	}
+
+	after := w.NextIndex()
 	if after != before {
-		t.Fatalf("a conflicting commit advanced the WAL index: before=%d after=%d", before, after)
+		t.Fatalf("retrying known RequestIDs advanced the WAL index: before=%d after=%d", before, after)
+	}
+}
+
+// TestMismatchedRequestIDReuseRejected (safe default,
+// docs/transactions.md §6): reusing a RequestID with a materially
+// different mutation set is rejected, and the original RequestID's
+// outcome is unaffected.
+func TestMismatchedRequestIDReuseRejected(t *testing.T) {
+	m, _ := newTestManager(t)
+	first := m.Begin()
+	if err := first.Write("K", []byte("v1")); err != nil {
+		t.Fatalf("Write: %v", err)
+	}
+	wantSeq, err := first.Commit("dup")
+	if err != nil {
+		t.Fatalf("Commit: %v", err)
+	}
+
+	second := m.Begin()
+	if err := second.Write("K", []byte("DIFFERENT")); err != nil {
+		t.Fatalf("Write: %v", err)
+	}
+	if _, err := second.Commit("dup"); !errors.Is(err, fsm.ErrRequestIDPayloadMismatch) {
+		t.Fatalf("Commit with reused RequestID + different payload: err = %v, want ErrRequestIDPayloadMismatch", err)
+	}
+
+	outcome, err := m.GetRequestOutcome("dup")
+	if err != nil || outcome.Status != fsm.StatusCommitted || outcome.CommitSeq != wantSeq {
+		t.Fatalf("GetRequestOutcome(dup) after mismatched reuse = %+v,%v, want unchanged Committed,%d", outcome, err, wantSeq)
+	}
+}
+
+// TestGetRequestOutcomeUnknown: querying a RequestID that was never
+// submitted returns an explicit not-found error, never a guess.
+func TestGetRequestOutcomeUnknown(t *testing.T) {
+	m, _ := newTestManager(t)
+	if _, err := m.GetRequestOutcome("never-submitted"); !errors.Is(err, fsm.ErrRequestIDUnknown) {
+		t.Fatalf("GetRequestOutcome(never-submitted): err = %v, want ErrRequestIDUnknown", err)
+	}
+}
+
+// TestGetRequestOutcomeCommitted (ID-3): a committed RequestID's
+// outcome is queryable without resubmitting anything.
+func TestGetRequestOutcomeCommitted(t *testing.T) {
+	m, _ := newTestManager(t)
+	tx := m.Begin()
+	if err := tx.Write("K", []byte("v")); err != nil {
+		t.Fatalf("Write: %v", err)
+	}
+	seq, err := tx.Commit("r1")
+	if err != nil {
+		t.Fatalf("Commit: %v", err)
+	}
+	outcome, err := m.GetRequestOutcome("r1")
+	if err != nil {
+		t.Fatalf("GetRequestOutcome: %v", err)
+	}
+	if outcome.Status != fsm.StatusCommitted || outcome.CommitSeq != seq {
+		t.Fatalf("outcome = %+v, want Committed CommitSeq=%d", outcome, seq)
+	}
+}
+
+// TestGetRequestOutcomeAborted: an aborted (conflicted) RequestID's
+// outcome is queryable and reports the conflict, not success.
+func TestGetRequestOutcomeAborted(t *testing.T) {
+	m, _ := newTestManager(t)
+	t1 := m.Begin()
+	t2 := m.Begin()
+	if err := t1.Write("K", []byte("a")); err != nil {
+		t.Fatalf("t1.Write: %v", err)
+	}
+	if err := t2.Write("K", []byte("b")); err != nil {
+		t.Fatalf("t2.Write: %v", err)
+	}
+	if _, err := t1.Commit("winner"); err != nil {
+		t.Fatalf("t1.Commit: %v", err)
+	}
+	if _, err := t2.Commit("loser"); err == nil {
+		t.Fatal("t2.Commit: expected conflict")
+	}
+	outcome, err := m.GetRequestOutcome("loser")
+	if err != nil {
+		t.Fatalf("GetRequestOutcome(loser): %v", err)
+	}
+	if outcome.Status != fsm.StatusAborted || outcome.ConflictKey != "K" {
+		t.Fatalf("outcome = %+v, want Aborted ConflictKey=K", outcome)
 	}
 }

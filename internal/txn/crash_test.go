@@ -3,6 +3,7 @@ package txn
 import (
 	"bufio"
 	"bytes"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -10,6 +11,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/SamudralaAjaykumarrr/chronicledb/internal/fsm"
 	"github.com/SamudralaAjaykumarrr/chronicledb/internal/mvcc"
 	"github.com/SamudralaAjaykumarrr/chronicledb/internal/wal"
 )
@@ -51,7 +53,7 @@ func TestRestart_CommittedSingleKeySurvives(t *testing.T) {
 	if err := tx.Write("K", []byte("v1")); err != nil {
 		t.Fatalf("Write: %v", err)
 	}
-	wantSeq, err := tx.Commit()
+	wantSeq, err := tx.Commit("r1")
 	if err != nil {
 		t.Fatalf("Commit: %v", err)
 	}
@@ -97,7 +99,7 @@ func TestRestart_CommittedMultiKeySurvivesAtomically(t *testing.T) {
 	if err := tx.Delete("C"); err != nil {
 		t.Fatalf("Delete C: %v", err)
 	}
-	if _, err := tx.Commit(); err != nil {
+	if _, err := tx.Commit("multi-key"); err != nil {
 		t.Fatalf("Commit: %v", err)
 	}
 	if err := w.Close(); err != nil {
@@ -214,14 +216,14 @@ func TestRestart_TombstoneSurvives(t *testing.T) {
 	if err := setup.Write("K", []byte("v0")); err != nil {
 		t.Fatalf("Write: %v", err)
 	}
-	if _, err := setup.Commit(); err != nil {
+	if _, err := setup.Commit("setup"); err != nil {
 		t.Fatalf("Commit setup: %v", err)
 	}
 	del := m.Begin()
 	if err := del.Delete("K"); err != nil {
 		t.Fatalf("Delete: %v", err)
 	}
-	if _, err := del.Commit(); err != nil {
+	if _, err := del.Commit("del"); err != nil {
 		t.Fatalf("Commit delete: %v", err)
 	}
 	if err := w.Close(); err != nil {
@@ -252,12 +254,12 @@ func TestRestart_VersionOrderingPreserved(t *testing.T) {
 	}
 
 	var seqs []uint64
-	for _, v := range []string{"v1", "v2", "v3"} {
+	for i, v := range []string{"v1", "v2", "v3"} {
 		tx := m.Begin()
 		if err := tx.Write("K", []byte(v)); err != nil {
 			t.Fatalf("Write: %v", err)
 		}
-		seq, err := tx.Commit()
+		seq, err := tx.Commit(fsm.RequestID(fmt.Sprintf("r%d", i)))
 		if err != nil {
 			t.Fatalf("Commit: %v", err)
 		}
@@ -285,7 +287,7 @@ func TestRestart_VersionOrderingPreserved(t *testing.T) {
 // arbitrary StartSeq without going through a full Txn (useful for
 // probing intermediate historical snapshots directly).
 func (m *Manager) readAt(key string, startSeq uint64) ([]byte, bool, error) {
-	v, ok := m.store.Visible(key, startSeq)
+	v, ok := m.fsm.Store().Visible(key, startSeq)
 	return v, ok, nil
 }
 
@@ -350,11 +352,18 @@ func TestDurabilityFailureDuringCommitDoesNotApply(t *testing.T) {
 		t.Fatalf("closing WAL for fault injection: %v", err)
 	}
 
-	if _, err := tx.Commit(); err == nil {
+	if _, err := tx.Commit("r1"); err == nil {
 		t.Fatal("Commit with a closed underlying WAL: expected error, got nil")
 	}
 	if tx.State() != StateAborted {
 		t.Fatalf("State() after a failed commit = %v, want aborted", tx.State())
+	}
+	// A durability failure must never mark the RequestID complete
+	// (docs/failure-model.md §1.8, FAILURE SEMANTICS): its outcome
+	// stays genuinely unknown, not falsely cached as success or
+	// failure.
+	if _, err := m.GetRequestOutcome("r1"); !errors.Is(err, fsm.ErrRequestIDUnknown) {
+		t.Fatalf("GetRequestOutcome(r1) after durability failure: err = %v, want ErrRequestIDUnknown", err)
 	}
 
 	// Reopen a fresh Manager/store over the same (untouched) directory
@@ -464,7 +473,7 @@ func runTxnCrashHelper() {
 		fmt.Fprintln(os.Stderr, "helper Write:", err)
 		os.Exit(1)
 	}
-	if _, err := tx.Commit(); err != nil {
+	if _, err := tx.Commit("acked-request"); err != nil {
 		fmt.Fprintln(os.Stderr, "helper Commit:", err)
 		os.Exit(1)
 	}

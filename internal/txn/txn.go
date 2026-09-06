@@ -1,21 +1,26 @@
 // Package txn implements ChronicleDB's transaction session state
-// (TxnID, StartSeq, local write set), Snapshot Isolation conflict
-// detection, and the commit/recovery integration with internal/wal, as
-// specified in docs/transactions.md and docs/mvcc.md.
+// (TxnID, StartSeq, local write set) and its commit/recovery
+// integration with internal/wal and internal/fsm, as specified in
+// docs/transactions.md and docs/mvcc.md.
 //
-// internal/fsm (the deterministic Apply boundary) does not exist yet —
-// it is factored out in Phase 3, per docs/roadmap.md. Until then, this
-// package plays that role directly for CommitTxn commands: it is the
-// single place that turns a durably appended command into MVCC state,
-// both for a live commit and for recovery replay (see Manager.commit
-// and Manager.recover), so that role can move into internal/fsm later
-// without changing the underlying semantics.
+// The deterministic conflict-check-then-apply decision and the
+// RequestID idempotency table live in internal/fsm (Phase 3,
+// docs/roadmap.md) — internal/txn.Manager is the orchestration layer
+// around it: it owns the durable log, decides for each commit attempt
+// whether internal/fsm even needs to see a fresh command (§6's
+// documented retry-without-reappending optimization), and calls
+// internal/fsm.Apply with the exact durable log index a command
+// occupies, both for a live commit and for recovery replay (see
+// Manager.commit and Manager.recover), so both paths run the identical
+// deterministic decision.
 package txn
 
 import (
+	"errors"
 	"fmt"
 	"sync"
 
+	"github.com/SamudralaAjaykumarrr/chronicledb/internal/fsm"
 	"github.com/SamudralaAjaykumarrr/chronicledb/internal/mvcc"
 	"github.com/SamudralaAjaykumarrr/chronicledb/internal/wal"
 )
@@ -39,8 +44,9 @@ const (
 	StateCommitted
 	// StateAborted is terminal: none of the transaction's mutations were
 	// ever applied. Reached via an explicit Abort, or implicitly when
-	// Commit fails (conflict or a durability error) — either way, the
-	// transaction leaves no trace in committed state.
+	// Commit fails (conflict, a rejected RequestID reuse, or a
+	// durability error) — either way, the transaction leaves no trace
+	// in committed state.
 	StateAborted
 )
 
@@ -57,26 +63,27 @@ func (s State) String() string {
 	}
 }
 
-// Manager owns the durable log, the MVCC store, and the single
-// serialization point through which every commit is decided
-// (docs/mvcc.md §4: the conflict decision is made deterministically, in
-// committed log/apply order — in standalone mode, append order and
-// apply order are the same single-writer sequence, so Manager's mu is
-// that sequence point). Manager is safe for concurrent use by multiple
-// goroutines: Begin and each Txn's Commit/Abort may be called
-// concurrently from different goroutines.
+// Manager owns the durable log, the deterministic internal/fsm Apply
+// boundary, and the single serialization point through which every
+// commit is decided (docs/mvcc.md §4: the conflict decision is made
+// deterministically, in committed log/apply order — in standalone
+// mode, append order and apply order are the same single-writer
+// sequence, so Manager's mu is that sequence point). Manager is safe
+// for concurrent use by multiple goroutines: Begin and each Txn's
+// Commit/Abort may be called concurrently from different goroutines.
 type Manager struct {
 	walog *wal.WAL
-	store *mvcc.Store
+	fsm   *fsm.FSM
 
 	// mu serializes: reading lastSeq for a new Begin, and the entire
-	// check-conflict -> append -> sync -> apply sequence of a commit.
-	// Holding it across the WAL Sync call (docs/storage.md §5) is what
-	// makes standalone-mode commit ordering exactly equal to durable
-	// append order, which is what the deterministic conflict/apply rule
-	// requires (docs/mvcc.md §4.1). It does not serialize reads: Txn.Read
-	// only ever touches the mvcc.Store's own, separate lock, so readers
-	// are never blocked behind an in-flight commit's fsync.
+	// idempotency-precheck -> append -> sync -> apply sequence of a
+	// commit. Holding it across the WAL Sync call (docs/storage.md §5)
+	// is what makes standalone-mode commit ordering exactly equal to
+	// durable append order, which is what the deterministic
+	// conflict/apply rule requires (docs/mvcc.md §4.1). It does not
+	// serialize reads: Txn.Read only ever touches internal/fsm's
+	// mvcc.Store through its own, separate lock, so readers are never
+	// blocked behind an in-flight commit's fsync.
 	mu        sync.Mutex
 	lastSeq   uint64
 	nextTxnID uint64
@@ -84,13 +91,14 @@ type Manager struct {
 
 // NewManager wires a Manager to an already-open WAL and MVCC store, and
 // runs recovery (docs/recovery.md) before returning: every durably
-// committed CommitTxn record in w's log is deterministically re-applied
-// to store, in order, exactly as a live commit would apply it (see
-// Manager.recover). A non-nil error means recovery detected a
-// durable-history inconsistency it refuses to guess a resolution for
-// (RECOVERY-NON-INVENTION) — the caller must not treat store as usable.
+// appended CommitTxn command in w's log is deterministically re-applied
+// to a fresh internal/fsm.FSM over store, in order, exactly as a live
+// commit would apply it (see Manager.recover). A non-nil error means
+// recovery detected a durable-history inconsistency it refuses to guess
+// a resolution for (RECOVERY-NON-INVENTION) — the caller must not treat
+// store as usable.
 func NewManager(w *wal.WAL, store *mvcc.Store) (*Manager, error) {
-	m := &Manager{walog: w, store: store}
+	m := &Manager{walog: w, fsm: fsm.New(store)}
 	if err := m.recover(); err != nil {
 		return nil, err
 	}
@@ -98,21 +106,22 @@ func NewManager(w *wal.WAL, store *mvcc.Store) (*Manager, error) {
 }
 
 // recover replays every RecordTypeLogEntry record in the WAL from index
-// 1 forward, decodes each as a CommitTxn command, and runs the same
-// deterministic conflict-check-then-apply step commit uses for a live
-// commit (docs/recovery.md §11: "running internal/fsm.Apply for each,
-// in order, exactly as if being applied for the first time").
-//
-// Every record recover() finds was, by construction of the live commit
-// path, only ever durably appended after passing its conflict check
-// with no other commit able to interleave (Manager.mu held throughout).
-// Replaying from an empty store, in the identical order, must therefore
-// deterministically reproduce "no conflict" for every record. If it
-// ever does not, the durable log is not a legitimate, deterministically
-// reproducible history — a form of corruption distinct from what
-// internal/wal itself checksums for — and recovery fails closed rather
-// than inventing a resolution, per RECOVERY-NON-INVENTION
-// (docs/invariants.md).
+// 1 forward, decodes each as a CommitTxn command, and calls
+// internal/fsm.Apply for it — the identical function a live commit
+// calls (docs/recovery.md §11: "running internal/fsm.Apply for each, in
+// order, exactly as if being applied for the first time"). Apply is
+// deterministic, so replaying the exact same command sequence,
+// in order, into a fresh FSM reproduces the exact same
+// COMMITTED/ABORTED decisions — including for a command that
+// legitimately conflicted live (its ABORTED outcome, and its
+// RequestID's terminal record, are reconstructed identically, not
+// treated as corruption; see docs/transactions.md §9/§10). Apply
+// itself still fails closed (RECOVERY-NON-INVENTION) if it ever
+// detects a genuine inconsistency — e.g. the same RequestID appearing
+// twice in the durable log with two different command fingerprints,
+// which internal/fsm.Apply reports as
+// fsm.ErrRequestIDPayloadMismatch — which recover propagates as a
+// startup-refusing error rather than guessing which one to keep.
 func (m *Manager) recover() error {
 	it, err := m.walog.Replay(1)
 	if err != nil {
@@ -128,15 +137,11 @@ func (m *Manager) recover() error {
 		if !ok {
 			break
 		}
-		cmd, err := decodeCommitTxn(rec.Payload)
+		cmd, err := fsm.DecodeCommitTxn(rec.Payload)
 		if err != nil {
 			return fmt.Errorf("txn: recovery: decoding record at index %d: %w", rec.Index, err)
 		}
-		if key, latest, conflict := m.store.CheckConflicts(cmd.startSeq, cmd.mutations); conflict {
-			return fmt.Errorf("txn: recovery: record at index %d unexpectedly conflicts on key %q (latest committed=%d, startSeq=%d): durable history is not deterministically reproducible: %w",
-				rec.Index, key, latest, cmd.startSeq, ErrMalformedRecord)
-		}
-		if err := m.store.ApplyCommit(rec.Index, cmd.mutations); err != nil {
+		if _, err := m.fsm.Apply(rec.Index, cmd); err != nil {
 			return fmt.Errorf("txn: recovery: applying record at index %d: %w", rec.Index, err)
 		}
 		if rec.Index > m.lastSeq {
@@ -168,38 +173,100 @@ func (m *Manager) Begin() *Txn {
 	}
 }
 
-// commit runs the deterministic check-conflict -> append -> sync ->
-// apply sequence for one transaction's mutation set (docs/mvcc.md §4-5,
-// docs/transactions.md §3-5). A read-only transaction (no mutations)
-// commits trivially: nothing is appended, since there is nothing whose
-// durability or conflict status matters (docs/transactions.md §2 — only
-// a submitted mutation set becomes a durable command).
-func (m *Manager) commit(id TxnID, startSeq uint64, mutations []mvcc.Mutation) (uint64, error) {
+// GetRequestOutcome resolves requestID's durable terminal outcome
+// (docs/transactions.md §7's conceptual GetRequestOutcome), without
+// resubmitting any mutation payload. A nil error means outcome is the
+// stable, terminal COMMITTED or ABORTED result. A non-nil error
+// wrapping fsm.ErrRequestIDUnknown means requestID has never completed
+// — an explicit client-knowledge-only "unknown" (docs/transactions.md
+// §7.1), never a guess at success or failure.
+func (m *Manager) GetRequestOutcome(requestID fsm.RequestID) (fsm.Outcome, error) {
+	outcome, ok := m.fsm.GetOutcome(requestID)
+	if !ok {
+		return fsm.Outcome{}, fmt.Errorf("txn: %w: %q", fsm.ErrRequestIDUnknown, requestID)
+	}
+	return outcome, nil
+}
+
+// Resubmit runs the exact same deterministic commit path as Txn.Commit
+// (docs/transactions.md §3-6, §9/§10), for a caller that already has a
+// fully-formed logical CommitTxn request in hand — txnID, startSeq, and
+// mutations exactly as originally submitted — rather than a live Txn
+// session. This is the entry point a genuine retry of an uncertain or
+// completed commit goes through: per docs/transactions.md §8, once a
+// commit has been submitted its outcome is "no longer tied to the
+// original client connection ... or the original in-memory session,"
+// so resolving a retry must not require the original Txn object (which
+// may not even exist any more, e.g. after a process restart) to still
+// be alive — only the original request's own fields, which the client
+// is responsible for remembering and resending unchanged
+// (docs/transactions.md §6). Resubmitting with the identical
+// RequestID and an identical (txnID, startSeq, mutations) tuple is
+// exactly what makes Precheck recognize it as the same logical
+// request; any field that differs from what was originally recorded is
+// a mismatched reuse (fsm.ErrRequestIDPayloadMismatch), never silently
+// accepted.
+func (m *Manager) Resubmit(requestID fsm.RequestID, txnID TxnID, startSeq uint64, mutations []mvcc.Mutation) (fsm.Outcome, error) {
+	return m.commit(txnID, requestID, startSeq, mutations)
+}
+
+// commit runs the deterministic idempotency-precheck -> append -> sync
+// -> apply sequence for one transaction's mutation set
+// (docs/transactions.md §3-6, §9/§10). A read-only transaction (no
+// mutations) commits trivially: nothing is appended and internal/fsm is
+// never consulted, since there is nothing whose durability, conflict
+// status, or RequestID idempotency could matter (docs/transactions.md
+// §2 — only a submitted mutation set becomes a durable command; §9 —
+// this bypass is the one explicitly documented non-replicated path).
+func (m *Manager) commit(id TxnID, requestID fsm.RequestID, startSeq uint64, mutations []mvcc.Mutation) (fsm.Outcome, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
 	if len(mutations) == 0 {
-		return m.lastSeq, nil
+		return fsm.Outcome{RequestID: requestID, Status: fsm.StatusCommitted, CommitSeq: m.lastSeq}, nil
 	}
 
-	if key, latest, conflict := m.store.CheckConflicts(startSeq, mutations); conflict {
-		return 0, fmt.Errorf("txn: txn %d commit conflict on key %q (latest committed=%d > StartSeq=%d): %w",
-			id, key, latest, startSeq, ErrConflict)
+	cmd := fsm.CommitTxnCommand{RequestID: requestID, TxnID: uint64(id), StartSeq: startSeq, Mutations: mutations}
+
+	outcome, err := m.fsm.Precheck(cmd)
+	switch {
+	case err == nil:
+		// Known, matching retry (docs/transactions.md §6): the
+		// original append+Apply already ran for this RequestID.
+		// Returning its recorded outcome directly, without touching
+		// the WAL again, is what makes retrying a completed RequestID
+		// not grow the log — see TestRetryDoesNotAppendToWAL.
+	case errors.Is(err, fsm.ErrRequestIDUnknown):
+		payload := fsm.EncodeCommitTxn(cmd)
+		idx, aerr := m.walog.AppendLogEntry(payload)
+		if aerr != nil {
+			return fsm.Outcome{}, fmt.Errorf("txn: txn %d durable append failed: %w", id, aerr)
+		}
+		if serr := m.walog.Sync(); serr != nil {
+			return fsm.Outcome{}, fmt.Errorf("txn: txn %d durability sync failed: %w", id, serr)
+		}
+		// The command is now durably persisted at idx before Apply
+		// ever runs (docs/failure-model.md §1.8: never treat a failed
+		// Sync as success, and never mark a RequestID complete before
+		// the durability path that backs it has actually succeeded).
+		outcome, err = m.fsm.Apply(idx, cmd)
+		if err != nil {
+			return fsm.Outcome{}, fmt.Errorf("txn: txn %d internal apply failure: %w", id, err)
+		}
+		m.lastSeq = idx
+	default:
+		// A different command was previously recorded under this exact
+		// RequestID: reject outright (docs/transactions.md §6's safe
+		// default). The original RequestID's recorded outcome is
+		// completely untouched.
+		return fsm.Outcome{}, fmt.Errorf("txn: txn %d: %w", id, err)
 	}
 
-	payload := encodeCommitTxn(commitTxnCommand{txnID: uint64(id), startSeq: startSeq, mutations: mutations})
-	seq, err := m.walog.AppendLogEntry(payload)
-	if err != nil {
-		return 0, fmt.Errorf("txn: txn %d durable append failed: %w", id, err)
+	if outcome.Status == fsm.StatusAborted {
+		return outcome, fmt.Errorf("txn: txn %d commit conflict on key %q (latest committed=%d > StartSeq=%d): %w",
+			id, outcome.ConflictKey, outcome.ConflictLatestSeq, startSeq, ErrConflict)
 	}
-	if err := m.walog.Sync(); err != nil {
-		return 0, fmt.Errorf("txn: txn %d durability sync failed: %w", id, err)
-	}
-	if err := m.store.ApplyCommit(seq, mutations); err != nil {
-		return 0, fmt.Errorf("txn: txn %d internal apply failure: %w", id, err)
-	}
-	m.lastSeq = seq
-	return seq, nil
+	return outcome, nil
 }
 
 // Txn is one open transaction session (docs/transactions.md §1). A Txn
@@ -270,7 +337,7 @@ func (t *Txn) Read(key string) (value []byte, found bool, err error) {
 		}
 		return m.Value, true, nil
 	}
-	v, ok := t.mgr.store.Visible(key, t.startSeq)
+	v, ok := t.mgr.fsm.Store().Visible(key, t.startSeq)
 	return v, ok, nil
 }
 
@@ -310,15 +377,33 @@ func (t *Txn) recordWriteLocked(key string, value []byte, tombstone bool) {
 }
 
 // Commit submits the transaction's mutation set as one deterministic
-// CommitTxn command (docs/transactions.md §3). The outcome is
-// deterministic and final: COMMITTED (returns the assigned CommitSeq,
-// nil error) or ABORTED (returns a zero CommitSeq and an error wrapping
-// ErrConflict for a write-write conflict, or wrapping the underlying
-// cause for a durability failure — docs/mvcc.md §5: either the entire
-// mutation set is applied, or none of it is). Either outcome makes the
-// transaction terminal; a second call returns ErrAlreadyCommitted or
-// ErrAlreadyAborted rather than re-evaluating anything.
-func (t *Txn) Commit() (commitSeq uint64, err error) {
+// CommitTxn command carrying the given client-supplied RequestID
+// (docs/transactions.md §3, §6). The outcome is deterministic and
+// final:
+//
+//   - COMMITTED: returns the assigned CommitSeq, nil error.
+//   - ABORTED (write-write conflict): returns a zero CommitSeq and an
+//     error wrapping ErrConflict (docs/mvcc.md §5: either the entire
+//     mutation set is applied, or none of it is).
+//   - Rejected RequestID reuse: requestID was already used to complete
+//     a *different* command; returns a zero CommitSeq and an error
+//     wrapping fsm.ErrRequestIDPayloadMismatch. The RequestID's
+//     original recorded outcome is completely unaffected.
+//   - Durability failure: returns a zero CommitSeq and the underlying
+//     error; requestID remains unresolved (docs/transactions.md §9's
+//     documented Phase 2 risk still applies unchanged in Phase 3).
+//
+// Retrying Commit with the identical requestID and an identical
+// mutation set (whichever of the above outcomes it produced, including
+// after a restart) returns that same outcome again, without
+// re-evaluating or re-applying anything (docs/transactions.md §6).
+//
+// Any outcome makes the transaction terminal; a second call to Commit
+// or Abort on the same Txn returns ErrAlreadyCommitted or
+// ErrAlreadyAborted rather than re-evaluating anything — RequestID
+// identity, not Txn/TxnID identity, is what makes a *resubmitted*
+// commit attempt idempotent.
+func (t *Txn) Commit(requestID fsm.RequestID) (commitSeq uint64, err error) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	if t.state != StateActive {
@@ -330,7 +415,7 @@ func (t *Txn) Commit() (commitSeq uint64, err error) {
 		mutations = append(mutations, t.writes[k])
 	}
 
-	seq, cerr := t.mgr.commit(t.id, t.startSeq, mutations)
+	outcome, cerr := t.mgr.commit(t.id, requestID, t.startSeq, mutations)
 	if cerr != nil {
 		t.state = StateAborted
 		t.writes = nil
@@ -340,14 +425,14 @@ func (t *Txn) Commit() (commitSeq uint64, err error) {
 	t.state = StateCommitted
 	t.writes = nil
 	t.order = nil
-	return seq, nil
+	return outcome.CommitSeq, nil
 }
 
 // Abort discards the transaction's local write set (docs/transactions.md
 // §1). Nothing durable or visible to any other transaction ever
 // existed for an aborted transaction's writes (docs/transactions.md
-// §2), so Abort has no interaction with the WAL or the MVCC store at
-// all — it is purely in-memory bookkeeping.
+// §2), so Abort has no interaction with the WAL, internal/fsm, or any
+// RequestID at all — it is purely in-memory bookkeeping.
 func (t *Txn) Abort() error {
 	t.mu.Lock()
 	defer t.mu.Unlock()

@@ -49,14 +49,22 @@ ENGINE` maturity level formally requires Phase 3 (`RequestID`
 idempotency) as well, which is explicitly out of scope for this phase
 — see the maturity claim in [`README.md`](../README.md).
 
-### Phase 3 — Deterministic state-machine boundary + `RequestID` idempotency
+### Phase 3 — Deterministic state-machine boundary + `RequestID` idempotency — COMPLETE
 
 `internal/fsm` is factored out as the deterministic `Apply` boundary
 described in [`docs/architecture.md`](architecture.md) §5-6, and the
 `RequestID` outcome table ([`docs/transactions.md`](transactions.md)
-§6) is implemented and durable. Tested against
+§6-7, §10) is implemented and durable — including detection of
+mismatched-payload `RequestID` reuse and a `GetRequestOutcome` query,
+both exercised by real disk-backed recovery, not just in-memory
+shortcuts. Tested and passing against
 [`docs/scenario-corpus.md`](scenario-corpus.md) §Idempotency
-(immediate and after-restart cases).
+(ID-1 through ID-7; the snapshot+compaction leg of ID-4 remains Phase 6
+scope), including deterministic-replay tests (two independently
+constructed `internal/fsm.FSM` instances applying the identical
+command history reach byte-identical outcomes) and restart-recovery
+tests proving a conflicted `RequestID`'s `ABORTED` outcome — not just a
+committed one — survives restart and is never re-evaluated on retry.
 
 ### Phase 4 — Raft state machine + deterministic transport/clock simulator
 
@@ -160,8 +168,8 @@ interpretation guidance, not exhaustive:
 |---|---|
 | `INITIALIZED` | Repository scaffolding exists; no architecture, no implementation. |
 | `ARCHITECTURE FOUNDATION` | All documents/ADRs in [`docs/README.md`](README.md) exist, are internally consistent (see the cross-document consistency review performed for this phase), define every system boundary listed in [`docs/architecture.md`](architecture.md), and no database implementation has begun. |
-| `SINGLE-NODE DURABLE ENGINE` | Phase 1 complete: `docs/scenario-corpus.md` §Local Durability scenarios pass, reproducibly, in CI. **This repository's current state.** `internal/storage`/`internal/wal` implement and test LD-1 through LD-6 (see test files under those packages); a GitHub Actions workflow (`.github/workflows/ci.yml`) runs `go test -race ./...` on every push, though this workflow has not yet executed on GitHub's servers since this repository has not yet been pushed there. |
-| `TRANSACTIONAL ENGINE` | Phases 2-3 complete: §Transactions and §Idempotency (immediate/after-restart) scenarios pass. |
+| `SINGLE-NODE DURABLE ENGINE` | Phase 1 complete: `docs/scenario-corpus.md` §Local Durability scenarios pass, reproducibly, in CI. `internal/storage`/`internal/wal` implement and test LD-1 through LD-6 (see test files under those packages); a GitHub Actions workflow (`.github/workflows/ci.yml`) runs `go test -race ./...` on every push. |
+| `TRANSACTIONAL ENGINE` | Phases 2-3 complete: §Transactions and §Idempotency (immediate/after-restart) scenarios pass. **This repository's current state.** |
 | `REPLICATED PROTOTYPE` | Phases 4-5 complete: §Raft/Replication scenarios pass in the deterministic simulator and in a real multi-process three-node deployment. |
 | `STRONG DISTRIBUTED V1` | Phases 6-7 complete: §Snapshots scenarios pass; chaos/combined fault schedules run for a meaningful duration without an invariant violation. |
 | `PORTFOLIO READY` | Phase 8-9 substantially complete: constrained SQL works end-to-end on the real engine; observability surfaces exist; auth/TLS gap from [`docs/non-goals.md`](non-goals.md) is resolved or explicitly, prominently documented as a deployment prerequisite. |
