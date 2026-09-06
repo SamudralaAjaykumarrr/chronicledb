@@ -37,6 +37,24 @@ jobs:
         run: |
           go test ./internal/fault/... -run TestChaos -v -timeout 120s
           go test ./internal/node/... -run TestChaos -v -timeout 120s
+      - name: adversarial model-based suites (Phase 10)
+        # Phase 10's model-based history testing against independent
+        # oracles (internal/oracle, docs/adversarial-testing.md) — a
+        # fast, CI-sized seed count on every push (already included in
+        # the plain "go test ./..." above; this step isolates them for
+        # a clear pass/fail signal and higher log verbosity), mirroring
+        # the Phase 7 "chaos suites" step above. See
+        # docs/adversarial-testing.md's "Reproducing a run" section for
+        # the CHRONICLEDB_ADVERSARIAL_SEEDS environment variable used to
+        # run a much larger seed count locally/nightly, e.g.:
+        #   CHRONICLEDB_ADVERSARIAL_SEEDS=2000 go test ./internal/sql/... -run TestModel -timeout 300s
+        run: |
+          go test ./internal/node/... -run 'TestModel_|TestCrossLayer_' -v -timeout 120s
+          go test ./internal/sql/... -run TestModel_ -v -timeout 60s
+          go test ./internal/txn/... -run 'TestSIHistory|TestModel_' -v -timeout 60s
+          go test ./internal/fault/... -run 'TestChaos_StaleAppendEntriesAfterSnapshotInstall|TestChaos_RepeatedCompactRestartCycle|TestChaos_LeaderChangeImmediatelyAfterSnapshot' -v -timeout 60s
+          go test ./internal/raft/... -run TestStaleAppendEntries -v -timeout 30s
+          go test ./internal/wal/... -run TestRepeatedSnapshotCompactRestartCycle -v -timeout 30s
       - name: real multi-process integration + real-process chaos (cmd/chronicledb-node)
         # Real OS processes, real TCP sockets, real disk, a real SIGKILL,
         # leader election/failover, and a RequestID retry — the Phase 5
@@ -69,6 +87,8 @@ jobs:
         run: |
           go test ./internal/sql/... -fuzz FuzzDecodeSchema -fuzztime 15s
           go test ./internal/sql/... -fuzz FuzzDecodeRow -fuzztime 15s
+      - name: fuzz smoke (snapshot decode)
+        run: go test ./internal/snapshot/... -fuzz FuzzDecode -fuzztime 15s
       - name: benchmark compile + single-iteration smoke
         # Phase 9 (docs/testing-strategy.md §9.3): every benchmark added
         # this phase must keep compiling and its own internal

@@ -17,8 +17,14 @@ SQL frontend, translating into the identical proven transaction path —
 see [`docs/sql.md`](sql.md)) —
 see each scenario's **Status** line below for
 exactly which — have passing,
-reproducible tests. **Every other scenario in this document does not
-currently pass, because it is not implemented yet.** This document
+reproducible tests. As of Phase 10, several of these scenarios
+additionally carry independent-reference-model and repeated-cycle
+adversarial evidence, itemized in full in
+[`docs/adversarial-testing.md`](adversarial-testing.md) rather than as
+new Status lines below (Phase 10 adds no new numbered scenario — see
+the roadmap-phase-index table's Phase 10 row). **Every other scenario
+in this document does not currently pass, because it is not implemented
+yet.** This document
 specifies the deterministic scenarios future test suites (see
 [`docs/testing-strategy.md`](testing-strategy.md)) must implement and
 pass before the corresponding maturity level
@@ -878,6 +884,7 @@ covered above.
 | 7 | Chaos/combined variants of RF-11, RF-13, RF-15 and SN-3/SN-5 under randomized fault schedules, plus RequestID/transaction chaos and genuine real-process SIGKILL evidence not tied to a single numbered scenario (see the Phase 7 note above and [`docs/testing-strategy.md`](testing-strategy.md) §6-7) |
 | 8 | SQ-1 .. SQ-9 |
 | 9 | No new numbered scenarios: Phase 9 (benchmarks/observability) adds no new correctness invariant or scenario — per `docs/testing-strategy.md` §2's guiding principle, this corpus targets correctness properties, not performance/benchmark evidence. Its own testing evidence (benchmark correctness checks, observability tests) is itemized in [`docs/testing-strategy.md`](testing-strategy.md) §9 and [`docs/benchmarks.md`](benchmarks.md)/[`docs/observability.md`](observability.md), mirroring how Phase 7's non-scenario-mapped evidence is handled below. |
+| 10 | No new numbered scenarios: Phase 10 is a verification pass over the invariant catalog and the scenarios already listed above, using an independent reference model and more deeply combined adversarial histories — it deliberately adds no new product functionality to translate into a new scenario shape. Its own evidence (model-based history suites, targeted Raft/WAL/cross-layer adversarial tests, a new snapshot-decoder fuzz target, exact seed counts and commands) is itemized in full in [`docs/adversarial-testing.md`](adversarial-testing.md) and summarized in [`docs/testing-strategy.md`](testing-strategy.md) §10. |
 
 Scenarios with an explicit **Status: passing** line above currently
 pass at the stated scope — LD-1 through LD-6, TX-1 through TX-8, ID-1
@@ -888,7 +895,10 @@ subset of RF-1 through RF-15 listed in the Phase 5 row above, SN-1
 through SN-6 plus RF-3's snapshot-catch-up leg (Phase 6), the
 Phase-7 chaos variants of RF-11, RF-13, RF-15, SN-3, and SN-5 called
 out in each of those entries' own Status lines above, and, as of
-Phase 8, SQ-1 through SQ-9. Every
+Phase 8, SQ-1 through SQ-9. Phase 10 adds no new entries to this list —
+it strengthens the evidence behind several of the scenarios already on
+it (see [`docs/adversarial-testing.md`](adversarial-testing.md)) without
+changing which scenarios are claimed to pass. Every
 other scenario in this document is not claimed to pass. A passing
 Phase-4 (simulator-only) RF-\* status is not by itself a claim that
 scenario's real multi-process (Phase 5) leg passes — check the specific

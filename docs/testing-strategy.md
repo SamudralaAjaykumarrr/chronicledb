@@ -40,10 +40,16 @@ deferred, unchanged), plus a new **Observability tests** category
 proving metrics/status move on real events and are race-safe — see
 `docs/benchmarks.md` and `docs/observability.md` for the full account,
 including one genuine performance bug (WAL replay's O(n²) I/O pattern)
-this phase's profiling found and fixed. This document specifies the
-testing architecture future implementation phases must build toward;
-it does not itself assert an aggregate coverage or pass-count claim
-(see §2's guiding principle).
+this phase's profiling found and fixed. Phase 10 adds §10 below: an
+independent, structurally separate reference-model package
+(`internal/oracle`) and the model-based history-testing suites built on
+it, plus targeted (not broad-random) adversarial scenarios closing
+specific gaps Phase 7's own broad chaos suites did not aim at — see
+`docs/adversarial-testing.md` for the complete, itemized account,
+including the exact seed counts and reproduction commands. This
+document specifies the testing architecture future implementation
+phases must build toward; it does not itself assert an aggregate
+coverage or pass-count claim (see §2's guiding principle).
 
 Testing targets **correctness properties** (the invariants in
 [`docs/invariants.md`](invariants.md)), not coverage percentage.
@@ -720,3 +726,48 @@ benchmark (every "real network" benchmark here is real TCP on
 throughput benchmark (every benchmark added is single-client,
 sequential). These are documented limitations, not silently assumed
 coverage — see `docs/benchmarks.md` §1's complete "not measured" list.
+
+## 10. Phase 10: adversarial correctness / model-based testing
+
+Phase 10's brief (`docs/roadmap.md`) is explicit: this is a
+verification phase, hunting for violations of the invariant catalog
+using the accumulated Phases 1-9 infrastructure at greater adversarial
+intensity — not a phase that adds product functionality, and not a
+phase that should merely re-run Phase 7's own chaos suites under a new
+name. `docs/adversarial-testing.md` is the complete, itemized account
+(reference model design, every suite's exact seed counts and
+reproduction commands, invariant-to-test mapping, the two test-harness
+defects found and fixed during this phase's own development, and the
+explicit correctness boundaries this phase does not claim to have
+proven); this section summarizes where it fits in this document's own
+test-category taxonomy (§1).
+
+The new **model-based history suites**
+(`internal/node/model_test.go`, `internal/sql/model_test.go`,
+`internal/txn/si_history_test.go`) are this document's existing
+**Property tests** category (§1's table: "randomized inputs checked
+against a reference model/invariant, not a fixed expected output"),
+applied for the first time to committed key/value state, `RequestID`
+outcome stability, and SQL-visible state, using a new,
+structurally-independent reference-model package (`internal/oracle`)
+built specifically not to reuse any ChronicleDB implementation code —
+the same discipline Phase 2's own MVCC-visibility property test
+originally established, now generalized and shared across three
+different packages via one common canonicalization function
+(`oracle.CanonicalKVDigest`). The new targeted Raft-core scenarios
+(`internal/fault/adversarial_test.go`, `internal/raft/adversarial_test.go`)
+and the new cross-layer scenario
+(`internal/node/crosslayer_test.go`) are this document's existing
+**Invariant tests** and **Deterministic distributed simulation** /
+**End-to-end tests** categories, applied to specific gaps identified by
+inspecting Phase 7's own suites rather than a new fault-injection
+mechanism. The new WAL test
+(`internal/wal/adversarial_test.go`) is a **Crash/restart test**
+proving a *repeated*, not merely single, compact/restart cycle stays
+correct. The new fuzz target
+(`internal/snapshot/fuzz_test.go`) closes the one previously-unfuzzed
+decoder Phase 10's own brief specifically names.
+
+No new test category was needed beyond §1's existing table — Phase
+10's contribution is depth and independence of oracle, not a new kind
+of test.

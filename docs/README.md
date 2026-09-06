@@ -56,20 +56,29 @@ terminology every other document depends on.
 17. [`sql.md`](sql.md) — the constrained SQL frontend (Phase 8):
     supported grammar, data model, execution semantics, and explicit
     compatibility boundaries.
-18. [`adr/`](adr/) — numbered Architecture Decision Records recording
+18. [`benchmarks.md`](benchmarks.md) / [`observability.md`](observability.md)
+    — Phase 9 measured performance and implemented diagnostic surfaces.
+19. [`adversarial-testing.md`](adversarial-testing.md) — Phase 10's
+    deep adversarial correctness verification: the independent
+    reference model, model-based history-testing suites, exact seed
+    counts/reproduction commands, and explicit correctness boundaries.
+20. [`adr/`](adr/) — numbered Architecture Decision Records recording
     the specific decisions behind the above, including alternatives
     considered and rejected.
 
 ## What this documentation does not claim
 
-Phases 1-8 are implemented and tested: durable storage and the WAL
+Phases 1-10 are implemented and tested: durable storage and the WAL
 (`internal/storage`, `internal/wal`), MVCC and the transaction engine
 (`internal/mvcc`, `internal/txn`), the deterministic state-machine
 boundary and `RequestID` idempotency (`internal/fsm`), Raft and its
 real transport/disk wiring (`internal/raft`, `internal/transport`,
 `internal/node`), snapshots and log compaction (`internal/snapshot`),
-chaos/fault-injection testing (`internal/fault`), and, as of Phase 8, a
-small constrained SQL frontend (`internal/sql`) — see
+chaos/fault-injection testing (`internal/fault`), a small constrained
+SQL frontend as of Phase 8 (`internal/sql`), benchmarks/observability
+as of Phase 9 (`internal/metrics`, `internal/benchutil`), and, as of
+Phase 10, an independent reference-model package used only by tests
+(`internal/oracle`) — see
 [`storage.md`](storage.md), [`wal.md`](wal.md), [`mvcc.md`](mvcc.md),
 [`transactions.md`](transactions.md), [`raft.md`](raft.md),
 [`replication.md`](replication.md), [`recovery.md`](recovery.md),

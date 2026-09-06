@@ -231,10 +231,31 @@ including exact restart-reset semantics and the deliberate omission of
 a fabricated cluster-quorum signal, in
 [`docs/observability.md`](docs/observability.md).
 
+Phase 10 — a deep adversarial correctness verification pass — is now
+also complete: a new, structurally-independent reference-model package
+(`internal/oracle`, never imported by production code) predicts
+committed key/value state and verifies `RequestID` terminal-outcome
+stability without reusing any ChronicleDB implementation logic, backing
+three new model-based history-testing suites against a real three-node
+cluster, a real standalone SQL engine, and real MVCC transactions
+(validated locally at 200-3,000 seeds per suite with `-race`), plus
+targeted Raft/WAL/cross-layer adversarial scenarios closing specific
+gaps Phase 7's own broad chaos suites did not aim at, and a new fuzz
+target for the previously-unfuzzed snapshot decoder. This phase added
+no new product functionality and found zero new ChronicleDB production
+defects (Phases 1-9's own chaos/benchmark work already found and fixed
+five genuine ones) — see
+[`docs/adversarial-testing.md`](docs/adversarial-testing.md) for the
+complete, itemized account, including the explicit correctness
+boundaries this phase does not claim (no SERIALIZABLE claim, no
+broadened linearizability claim, no formal-verification claim).
+
 Per [`docs/roadmap.md`](docs/roadmap.md) §Maturity Model,
-`PORTFOLIO READY` requires Phases 8 **and** 9 together; both are now
+`PORTFOLIO READY` requires Phases 8 **and** 9 together; both are
 complete and evidenced, which is this repository's current maturity
-claim above. The Authentication/TLS gap
+claim above — Phase 10 strengthens the evidence behind that same claim
+rather than advancing to a new named maturity level, since the roadmap
+defines none beyond it for this phase. The Authentication/TLS gap
 ([`docs/non-goals.md`](docs/non-goals.md) §Authentication and TLS)
 remains explicitly, prominently documented as a deployment prerequisite
 rather than resolved — implementing it was out of Phase 9's own scope,
@@ -262,4 +283,8 @@ Key documents:
   methodology, exact commands, environment, and measured results.
 - [`docs/observability.md`](docs/observability.md) — Phase 9 metrics,
   node status/health API, and logging.
+- [`docs/adversarial-testing.md`](docs/adversarial-testing.md) — Phase
+  10 adversarial correctness verification: reference model, model-based
+  history suites, exact seed counts/commands, and correctness
+  boundaries.
 - [`docs/adr/`](docs/adr/) — Architecture Decision Records.

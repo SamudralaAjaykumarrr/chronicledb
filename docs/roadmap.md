@@ -1,7 +1,7 @@
 # Roadmap and Maturity Model
 
 Status: this document defines the phase sequence and the evidence
-gates that govern when a maturity claim is allowed. Phases 1-9 are
+gates that govern when a maturity claim is allowed. Phases 1-10 are
 complete (each at its own documented scope — see that phase's own
 section below for exactly what it does and does not claim); current
 maturity is `PORTFOLIO READY` (§Maturity Model below) — Phases 8 and 9
@@ -9,7 +9,9 @@ together satisfy that gate, with the Authentication/TLS gap
 (`docs/non-goals.md` §Authentication and TLS) explicitly, prominently
 documented as a deployment prerequisite rather than resolved (the
 gate's own "resolved or explicitly, prominently documented" wording
-permits either).
+permits either). Phase 10 adds deeper adversarial correctness evidence
+on top of that same gate — no new named maturity level is defined for
+it in §Maturity Model below, so the claim remains `PORTFOLIO READY`.
 
 ## Phase sequence
 
@@ -338,13 +340,54 @@ test against existing test infrastructure (see
 [`docs/benchmarks.md`](benchmarks.md) §9 for the explicit reasoning and
 the concrete trigger for revisiting that decision).
 
-### Phase 10 — Deep adversarial correctness pass
+### Phase 10 — Deep adversarial correctness pass — COMPLETE (at this phase's own scope)
 
-A dedicated pass specifically hunting for violations of the invariant
-catalog, using the accumulated testing infrastructure from Phases
-1-9 at maximum adversarial intensity (long-running chaos runs,
-targeted fuzzing of every decoder, deliberate attempts to construct a
-counterexample to each invariant).
+A dedicated verification pass specifically hunting for violations of
+the invariant catalog, using the accumulated testing infrastructure
+from Phases 1-9 combined with a new, structurally-independent
+reference-model package (`internal/oracle`) that predicts committed
+key/value state and verifies `RequestID` terminal-outcome stability
+without reusing any ChronicleDB implementation code. No new product
+functionality was added — per this phase's own brief, `internal/oracle`
+is a test-only support package (like `internal/fault`), never imported
+by production code.
+
+Three new model-based history-testing suites drive real ChronicleDB
+components (a real three-node disk/TCP cluster, a real standalone SQL
+engine, real MVCC transactions) through long, deterministic, seeded
+histories and check every outcome against the independent model:
+`internal/node/model_test.go`, `internal/sql/model_test.go`, and
+`internal/txn/si_history_test.go` (the last also adding five named,
+deterministic tests documenting specific histories Snapshot Isolation
+explicitly allows or forbids, extending TX-8 rather than repeating it).
+Three new targeted Raft-core adversarial scenarios
+(`internal/fault/adversarial_test.go`), two direct single-`Core` unit
+tests for a previously-unit-untested-but-already-correct code path
+(`internal/raft/adversarial_test.go`), one new cross-layer scenario not
+covered by any prior phase — a follower catching up via a real snapshot
+install, immediately followed by the leader crashing and that same
+follower participating in the ensuing election
+(`internal/node/crosslayer_test.go`) — a new WAL test proving *repeated*
+(not merely single) snapshot/compact/restart cycles stay correct
+(`internal/wal/adversarial_test.go`), and a new fuzz target for the
+previously-unfuzzed snapshot decoder
+(`internal/snapshot/fuzz_test.go`) round out the phase. Every new
+suite's exact seed counts (validated locally at 200-3,000 seeds per
+suite with `-race`, beyond each suite's smaller CI default) and
+reproduction commands are itemized in
+[`docs/adversarial-testing.md`](adversarial-testing.md), the phase's
+own scenario-corpus-style honest accounting document — including its
+explicit "Correctness boundaries" section (no SERIALIZABLE claim, no
+broadened linearizability claim, no formal-verification claim) and its
+"Bugs found" section, which reports honestly that this phase's testing
+found **zero new ChronicleDB production defects** (Phases 1-9's own
+chaos/benchmark work already found and fixed five genuine ones) while
+finding and fixing two genuine defects in this phase's own new test
+harness, each documented with its root cause and fix.
+
+Per §Maturity Model below, no new named maturity level is defined for
+Phase 10 — it strengthens the evidence behind the existing
+`PORTFOLIO READY` claim rather than advancing to a new gate.
 
 ### Phase 11 — Open-source / portfolio packaging + releases
 
