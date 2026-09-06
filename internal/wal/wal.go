@@ -136,12 +136,17 @@ func Open(dir string, opts Options) (*WAL, *RecoveryReport, error) {
 	}
 
 	var (
-		lastLogIndex      uint64
-		haveMetadata      bool
-		meta              Metadata
-		latestHS          []byte
-		seenAnyLogEntry   bool
-		firstLogIndexSeen uint64
+		haveMetadata bool
+		meta         Metadata
+		latestHS     []byte
+		// logIndices records every physically-encountered LogEntry
+		// record's index, in append order, across every segment.
+		// Contiguity cannot be validated as these are seen (see below):
+		// it depends on the winning Metadata record's
+		// LatestSnapshotIndex, which — being "last one wins"
+		// (docs/wal.md §9) — is only known for certain once the entire
+		// scan below has finished.
+		logIndices []uint64
 	)
 
 	for i, id := range ids {
@@ -178,26 +183,21 @@ func Open(dir string, opts Options) (*WAL, *RecoveryReport, error) {
 
 			switch rec.Type {
 			case RecordTypeLogEntry:
-				if !seenAnyLogEntry {
-					// The very first LogEntry record physically
-					// encountered may legitimately start at any index
-					// (a not-yet-compacted or partially-compacted log
-					// still holds superseded low-index entries; see
-					// CompactBefore) — its absolute starting value is
-					// validated once, after this scan, against the
-					// winning Metadata record's LatestSnapshotIndex
-					// (which may not be known yet at this point in the
-					// scan). Every record after this one still must be
-					// perfectly contiguous, exactly as before: physical
-					// append order never has gaps regardless of
-					// compaction, only a possibly-nonzero starting point.
-					seenAnyLogEntry = true
-					firstLogIndexSeen = rec.Index
-				} else if rec.Index != lastLogIndex+1 {
-					seg.Close()
-					return nil, nil, fmt.Errorf("wal: out-of-order log index: got %d, want %d: %w", rec.Index, lastLogIndex+1, ErrCorrupt)
-				}
-				lastLogIndex = rec.Index
+				// Contiguity is validated in a second pass below, once
+				// the winning Metadata record's LatestSnapshotIndex is
+				// known: a WAL.Truncate forward jump past a gap this
+				// node never physically held entries for (the ordinary
+				// "follower was behind, not diverged" InstallSnapshot
+				// case) never touches physical bytes, and CompactBefore
+				// can never delete the current segment — so a
+				// perfectly legitimate durable log can physically
+				// contain superseded, pre-boundary entries (like this
+				// one might be) followed, later in the same segment, by
+				// the genuinely live suffix starting at the new
+				// boundary. Recording the index now and validating
+				// after the scan is what lets that be told apart from
+				// real corruption.
+				logIndices = append(logIndices, rec.Index)
 			case RecordTypeMetadata:
 				m, derr := decodeMetadata(rec.Payload)
 				if derr != nil {
@@ -235,24 +235,37 @@ func Open(dir string, opts Options) (*WAL, *RecoveryReport, error) {
 	}
 
 	// The winning Metadata record (last one seen, per docs/wal.md §9) is
-	// only fully known now that the whole scan has completed — validate
-	// the first physically-encountered LogEntry's absolute index against
-	// it (see the scan loop's comment above): it must never start
-	// *strictly after* the snapshot boundary (that would mean genuine
-	// missing history the snapshot does not cover — corruption), though
-	// it may legitimately start at or before it (superseded, not-yet- or
-	// only-partially-physically-compacted leftover entries, safe to
-	// ignore — Replay/Entries already filter these by index).
-	if seenAnyLogEntry && firstLogIndexSeen > meta.LatestSnapshotIndex+1 {
-		w.current.Close()
-		return nil, nil, fmt.Errorf("wal: durable log starts at index %d but snapshot pointer only covers up to %d (gap): %w", firstLogIndexSeen, meta.LatestSnapshotIndex, ErrCorrupt)
-	}
-	if !seenAnyLogEntry {
-		// No LogEntry record survives at all — either a genuinely fresh
-		// log (LatestSnapshotIndex == 0) or one fully compacted up to and
-		// including its newest entry with nothing appended since; either
-		// way, "the last known index" is exactly the snapshot boundary.
-		lastLogIndex = meta.LatestSnapshotIndex
+	// only fully known now that the whole scan has completed. Validate
+	// LogEntry contiguity here, boundary-aware: any physically-
+	// encountered index at or before LatestSnapshotIndex is superseded
+	// (never trusted or served — Replay/Entries already filter these out
+	// by index) and imposes no ordering requirement at all, wherever it
+	// physically appears; only the live suffix — indices strictly after
+	// the boundary — must be perfectly contiguous, and must begin
+	// exactly at boundary+1 (a live suffix starting later would mean
+	// genuine missing history the snapshot does not cover — real
+	// corruption).
+	boundary := meta.LatestSnapshotIndex
+	lastLogIndex := boundary
+	haveLiveEntry := false
+	for _, idx := range logIndices {
+		if idx <= boundary {
+			continue
+		}
+		if !haveLiveEntry {
+			if idx != boundary+1 {
+				w.current.Close()
+				return nil, nil, fmt.Errorf("wal: durable log's live entries start at index %d but snapshot pointer only covers up to %d (gap): %w", idx, boundary, ErrCorrupt)
+			}
+			haveLiveEntry = true
+			lastLogIndex = idx
+			continue
+		}
+		if idx != lastLogIndex+1 {
+			w.current.Close()
+			return nil, nil, fmt.Errorf("wal: out-of-order log index: got %d, want %d: %w", idx, lastLogIndex+1, ErrCorrupt)
+		}
+		lastLogIndex = idx
 	}
 
 	w.metadata = meta

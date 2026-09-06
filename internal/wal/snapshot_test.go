@@ -72,6 +72,113 @@ func TestTruncateJumpsNextIndexForwardPastInstalledSnapshotGap(t *testing.T) {
 	}
 }
 
+// TestReopenAfterInstallSnapshotGapWithPreexistingStaleEntry is a
+// deterministic regression for
+// cmd/chronicledb-node's TestRealChaos_SIGKILLDuringSnapshotInstall.
+// Unlike TestTruncateJumpsNextIndexForwardPastInstalledSnapshotGap above,
+// this WAL is NOT brand-new — it already durably holds one real LogEntry
+// (index 1, e.g. a leader-election no-op a follower received before
+// being cut off) before a snapshot install jumps its next-index counter
+// forward past a gap it never physically held anything for. Because
+// WAL.Truncate's forward jump never touches physical bytes, and
+// WAL.CompactBefore can never delete the current (open-for-writing)
+// segment, that stale index-1 record legitimately remains physically
+// resident in the very same segment that later live entries (11, 12,
+// 13) get appended into — producing a durable physical sequence of
+// LogEntry records with a real gap in the middle (1, then 11, 12, 13)
+// that is nonetheless completely valid: index 1 is superseded by the
+// installed snapshot's boundary (10), and the live suffix starting at
+// 11 is perfectly contiguous. Before the fix, Open's recovery scan
+// required every LogEntry record after the first physically-encountered
+// one to be perfectly contiguous with no exception for this case, and
+// refused startup with "wal: out-of-order log index: got 11, want 2".
+func TestReopenAfterInstallSnapshotGapWithPreexistingStaleEntry(t *testing.T) {
+	dir := t.TempDir()
+	w, _ := mustOpen(t, dir, Options{})
+
+	// The stale, soon-to-be-superseded entry: durably present before the
+	// snapshot install ever happens.
+	if _, err := w.AppendLogEntry([]byte("stale")); err != nil {
+		t.Fatalf("AppendLogEntry: %v", err)
+	}
+	if err := w.Sync(); err != nil {
+		t.Fatalf("Sync: %v", err)
+	}
+
+	// A snapshot install covering index 10 arrives: durably record the
+	// boundary, then jump the next-index counter forward past the gap
+	// this node never physically held entries for (mirrors
+	// internal/node.WALStorage.InstallSnapshot's exact sequence).
+	if err := w.AppendMetadataSnapshot(10); err != nil {
+		t.Fatalf("AppendMetadataSnapshot(10): %v", err)
+	}
+	if err := w.Truncate(11); err != nil {
+		t.Fatalf("Truncate(11): %v", err)
+	}
+	if err := w.CompactBefore(10); err != nil {
+		t.Fatalf("CompactBefore(10): %v", err)
+	}
+
+	// Live replication resumes at the new boundary, landing in the same
+	// physical segment right after the stale index-1 record (the
+	// default SegmentMaxSize never rotates for a handful of tiny
+	// records, exactly like the real chaos test's default-configured
+	// node).
+	for i := 0; i < 3; i++ {
+		idx, err := w.AppendLogEntry([]byte("live"))
+		if err != nil {
+			t.Fatalf("AppendLogEntry #%d: %v", i, err)
+		}
+		if want := uint64(11 + i); idx != want {
+			t.Fatalf("AppendLogEntry #%d assigned index %d, want %d", i, idx, want)
+		}
+	}
+	if err := w.Sync(); err != nil {
+		t.Fatalf("Sync: %v", err)
+	}
+	if err := w.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	w2, report := mustOpen(t, dir, Options{})
+	defer w2.Close()
+	if report.FirstLogIndex != 11 {
+		t.Fatalf("report.FirstLogIndex = %d, want 11", report.FirstLogIndex)
+	}
+	if report.LastLogIndex != 13 {
+		t.Fatalf("report.LastLogIndex = %d, want 13", report.LastLogIndex)
+	}
+	if w2.NextIndex() != 14 {
+		t.Fatalf("NextIndex() after reopen = %d, want 14", w2.NextIndex())
+	}
+
+	it, err := w2.Replay(w2.FirstIndex())
+	if err != nil {
+		t.Fatalf("Replay: %v", err)
+	}
+	defer it.Close()
+	var got []uint64
+	for {
+		rec, ok, err := it.Next()
+		if err != nil {
+			t.Fatalf("Next: %v", err)
+		}
+		if !ok {
+			break
+		}
+		got = append(got, rec.Index)
+	}
+	want := []uint64{11, 12, 13}
+	if len(got) != len(want) {
+		t.Fatalf("replayed indices %v, want %v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("replayed indices %v, want %v", got, want)
+		}
+	}
+}
+
 func TestAppendMetadataSnapshotRejectsGoingBackward(t *testing.T) {
 	dir := t.TempDir()
 	w, _ := mustOpen(t, dir, Options{})

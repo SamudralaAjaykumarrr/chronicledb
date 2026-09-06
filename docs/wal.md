@@ -310,10 +310,9 @@ pointer it already tracked since Phase 1 (`internal/snapshot` and
   starting strictly after where the (possibly snapshot-covered)
   recoverable boundary says it should (`docs/recovery.md` §4). `Open`'s
   own two-pass validation independently enforces the same rule at
-  startup: a physically-scanned log's first `LogEntry` record is
-  allowed to start at or before `Metadata.LatestSnapshotIndex + 1`
-  (harmless not-yet-fully-compacted leftovers), never strictly after it
-  (a genuine gap, refused as `ErrCorrupt`).
+  startup — see §13's revision of exactly how, for the case where
+  harmless not-yet-fully-compacted leftovers physically follow, rather
+  than only precede, the live log.
 - All three are exercised by real on-disk tests, including multi-
   segment compaction, a live-process `FirstIndex()` advance with no
   intervening restart, and a restart immediately after compaction
@@ -346,3 +345,45 @@ survives (§11's `AppendMetadataSnapshot`, always called before
 `Truncate` within `InstallSnapshot`, so no additional durable write is
 needed for this fix — the value it needs was already durable). See
 `internal/wal/snapshot_test.go::TestTruncateJumpsNextIndexForwardPastInstalledSnapshotGap`.
+
+## 13. Post-Phase-8 CI fix: `Open`'s contiguity check was stricter than `Truncate`'s own documented behavior (resolved)
+
+`cmd/chronicledb-node`'s real-process
+`TestRealChaos_SIGKILLDuringSnapshotInstall` failed in CI with `wal:
+out-of-order log index: got 11, want 2` — a genuine recovery-scan bug in
+`Open`, not a test-timing issue, exposed (not caused) by Phase 8: a
+follower that already durably held one real `LogEntry` (e.g. the
+election no-op `internal/node.Node.proposeElectionNoOp` now writes,
+`docs/replication.md` §4.3) before falling behind and catching up via
+`InstallSnapshot` ends up with that stale, pre-boundary entry
+physically preceding the live post-snapshot suffix *in the same,
+never-rotated current segment* — exactly the layout §12's `Truncate`
+fix documents as correct and intentional (nothing physical needs
+removing; `CompactBefore` can never delete the current segment either).
+`Open`'s two-pass validation, however, only ever tolerated a
+non-contiguous starting point at the very first physically-encountered
+`LogEntry` record — it required everything after that one to be
+perfectly contiguous, which this legitimate layout is not (physically:
+1, then 11, 12, ...).
+
+The fix generalizes §11's rule from "the first entry" to "the
+transition to the live suffix, wherever it physically falls": any
+`LogEntry` index at or before the winning `Metadata` record's
+`LatestSnapshotIndex` is superseded and imposes no contiguity
+requirement at all, wherever it appears in the physical scan (it is
+never trusted or served — `Replay`/`Entries` already filter these out
+by index); only the live suffix — indices strictly after that
+boundary — must itself be perfectly contiguous, and must begin exactly
+at `boundary + 1`, or `Open` still refuses with `ErrCorrupt` (a live
+suffix starting later, or with any internal gap, is real corruption —
+this is unchanged and un-weakened). Because the winning `Metadata`
+record (last-one-wins, §9) is only fully known once the whole scan
+completes, this is now a genuine two-pass validation: the scan itself
+just records each physically-encountered `LogEntry` index in order,
+and a second pass (after the winning boundary is known) applies the
+rule above. See
+`internal/wal/snapshot_test.go::TestReopenAfterInstallSnapshotGapWithPreexistingStaleEntry`
+for the exact scenario (a pre-existing entry, an `InstallSnapshot`-style
+forward jump, live appends, then a restart) and
+`docs/adr/0012-recovery-and-corruption-policy.md` for why this remains
+a fail-closed check for any layout it does not recognize as legitimate.
