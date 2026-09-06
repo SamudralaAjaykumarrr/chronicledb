@@ -63,3 +63,9 @@ jobs:
         run: go test ./internal/raft/... -fuzz FuzzRequestVoteHandling -fuzztime 15s
       - name: fuzz smoke (transport frame decode)
         run: go test ./internal/transport/... -fuzz FuzzReadFrame -fuzztime 15s
+      - name: fuzz smoke (sql parser)
+        run: go test ./internal/sql/... -fuzz FuzzParse -fuzztime 15s
+      - name: fuzz smoke (sql schema/row decode)
+        run: |
+          go test ./internal/sql/... -fuzz FuzzDecodeSchema -fuzztime 15s
+          go test ./internal/sql/... -fuzz FuzzDecodeRow -fuzztime 15s

@@ -170,11 +170,43 @@ See [`docs/testing-strategy.md`](docs/testing-strategy.md) §6-7 and
 honest accounting of what Phase 7 does and does not claim (untested
 failure classes are documented explicitly, not implied covered).
 
-No SQL implementation exists yet. See
-[`docs/roadmap.md`](docs/roadmap.md) §Maturity Model for the
-evidence-based gates that govern every future maturity claim, and
-[`docs/architecture.md`](docs/architecture.md) for the system design
-itself.
+Phase 8 — a small, constrained SQL frontend (`internal/sql`) over the
+unchanged Phases 1-7 transactional engine — is now also implemented:
+`CREATE TABLE`, `INSERT`, `SELECT`, `UPDATE`, `DELETE`, and explicit
+`BEGIN`/`COMMIT`/`ROLLBACK`, with a single primary key per table, a
+single equality-on-primary-key predicate, and three scalar types
+(`INTEGER`/`TEXT`/`BOOLEAN`) — a hand-written lexer/parser producing an
+explicit typed AST, a binder resolving against a table's real
+committed schema, and execution flowing exclusively through
+`internal/txn.Manager` (standalone) or `internal/node.Node`
+(replicated), never touching `internal/mvcc`/`internal/storage`
+directly (ADR-0013). Tested against
+[`docs/scenario-corpus.md`](docs/scenario-corpus.md) §SQL (SQ-1 through
+SQ-9): every documented error case for each statement kind, parser/
+decoder fuzzing, `RequestID` retry safety, explicit-transaction commit/
+rollback/abort-on-error semantics, a living Snapshot-Isolation
+write-skew demonstration (no accidental SERIALIZABLE claim), restart
+survival, and, against a real three-node cluster over genuine TCP/disk:
+replicated `INSERT`→`SELECT`, `RequestID` retry across a real leader
+failover, and SQL state surviving a real snapshot install and follower
+restart. Building that last real-cluster evidence found and fixed one
+genuine Phase 5 liveness bug in `internal/node.Node.BeginReadIndex` (a
+newly elected leader with no proposal yet in its own term could stall
+`ReadIndex` indefinitely) — see
+[ADR-0014](docs/adr/0014-election-no-op-for-readindex-liveness.md) and
+[`docs/replication.md`](docs/replication.md) §4.3. See
+[`docs/sql.md`](docs/sql.md) for the full grammar, data model, and
+explicit compatibility boundaries (no joins, no predicates beyond
+primary-key equality, no CLI, no wire-protocol compatibility).
+
+Per [`docs/roadmap.md`](docs/roadmap.md) §Maturity Model,
+`PORTFOLIO READY` requires Phases 8 **and** 9 together; Phase 9
+(benchmarks/observability) has not begun, so this repository's current
+maturity claim remains `STRONG DISTRIBUTED V1` above — Phase 8 alone
+does not advance it. See [`docs/roadmap.md`](docs/roadmap.md)
+§Maturity Model for the evidence-based gates that govern every future
+maturity claim, and [`docs/architecture.md`](docs/architecture.md) for
+the system design itself.
 
 ## Documentation
 
@@ -188,4 +220,6 @@ Key documents:
   invariant catalog.
 - [`docs/roadmap.md`](docs/roadmap.md) — phase sequence and maturity
   model.
+- [`docs/sql.md`](docs/sql.md) — the constrained SQL frontend (Phase 8):
+  grammar, data model, execution semantics, compatibility boundaries.
 - [`docs/adr/`](docs/adr/) — Architecture Decision Records.

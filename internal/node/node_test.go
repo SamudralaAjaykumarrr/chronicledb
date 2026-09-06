@@ -836,7 +836,7 @@ func TestClusterRestartRecoversFSMAndRequestIDOutcomes(t *testing.T) {
 // before and after the restart (docs/snapshots.md §8, §3).
 func TestSN1_RestartRestoresFromSnapshotAndCompactsLog(t *testing.T) {
 	const threshold = 3
-	const numKeys = 9 // an exact multiple of threshold: the boundary lands precisely at 9, nothing left in an uncompacted "tail"
+	const numKeys = 9 // a multiple of threshold, so a boundary lands exactly on the last real key once any offset is crossed (see the filler loop below)
 	tc := newTestClusterWithSnapshotThreshold(t, 1, threshold)
 	leaderID := tc.awaitLeader(5 * time.Second)
 	leader := tc.node(leaderID)
@@ -850,24 +850,39 @@ func TestSN1_RestartRestoresFromSnapshotAndCompactsLog(t *testing.T) {
 		}
 		outcomes[i] = outcome
 	}
+	last := outcomes[numKeys-1].CommitSeq
 
-	awaitCondition(t, 3*time.Second, "snapshot boundary reaches index 9", func() bool {
-		return leader.Status().SnapshotIndex == numKeys
+	// Force the snapshot boundary to actually cover every proposed key
+	// before asserting anything about it (see
+	// TestSN5_FollowerCatchesUpViaSnapshotAfterLeaderCompaction's
+	// identical comment): even a single-node cluster's own election win
+	// proposes one leading no-op entry
+	// (internal/node.Node.proposeElectionNoOp, docs/replication.md
+	// §4.3), which can offset where a threshold boundary lands relative
+	// to this test's own numKeys proposals.
+	for i := 0; uint64(leader.Status().SnapshotIndex) < last && i < threshold; i++ {
+		if _, err := propose(t, leader, cmd(fmt.Sprintf("filler-r%d", i), uint64(numKeys+i+1000), 0, fmt.Sprintf("filler-k%d", i), "v"), 3*time.Second); err != nil {
+			t.Fatalf("filler Propose #%d: %v", i, err)
+		}
+	}
+	awaitCondition(t, 3*time.Second, "snapshot boundary reaches past every proposed key", func() bool {
+		return uint64(leader.Status().SnapshotIndex) >= last
 	})
-	if got := leader.walog.FirstIndex(); got != numKeys+1 {
-		t.Fatalf("live FirstIndex() = %d, want %d (log compacted through the snapshot boundary)", got, numKeys+1)
+	snapIndex := uint64(leader.Status().SnapshotIndex)
+	if got := uint64(leader.walog.FirstIndex()); got != snapIndex+1 {
+		t.Fatalf("live FirstIndex() = %d, want %d (log compacted through the snapshot boundary)", got, snapIndex+1)
 	}
 
 	tc.crash(leaderID)
 	restarted := tc.restart(leaderID)
 	tc.awaitLeader(5 * time.Second)
 
-	if got := restarted.walog.FirstIndex(); got != numKeys+1 {
-		t.Fatalf("FirstIndex() after restart = %d, want %d (recovery re-derived the same boundary from durable metadata, not a full replay from 1)", got, numKeys+1)
+	if got := uint64(restarted.walog.FirstIndex()); got != snapIndex+1 {
+		t.Fatalf("FirstIndex() after restart = %d, want %d (recovery re-derived the same boundary from durable metadata, not a full replay from 1)", got, snapIndex+1)
 	}
 	st := restarted.Status()
-	if int(st.SnapshotIndex) != numKeys || uint64(st.AppliedIndex) < uint64(numKeys) {
-		t.Fatalf("Status after restart = %+v, want SnapshotIndex=%d AppliedIndex>=%d", st, numKeys, numKeys)
+	if uint64(st.SnapshotIndex) != snapIndex || uint64(st.AppliedIndex) < snapIndex {
+		t.Fatalf("Status after restart = %+v, want SnapshotIndex=%d AppliedIndex>=%d", st, snapIndex, snapIndex)
 	}
 	for i := 0; i < numKeys; i++ {
 		key := fmt.Sprintf("k%d", i)
@@ -911,22 +926,41 @@ func TestSN5_FollowerCatchesUpViaSnapshotAfterLeaderCompaction(t *testing.T) {
 		}
 		outcomes[i] = outcome
 	}
-	awaitCondition(t, 3*time.Second, "leader compacts its own log while the follower is isolated", func() bool {
-		return leader.Status().SnapshotIndex == numKeys
+	last := outcomes[numKeys-1].CommitSeq
+	// Force the leader's snapshot boundary to actually cover every
+	// proposed key before asserting anything about it. A threshold-
+	// boundary snapshot only fires at multiples of `threshold` entries
+	// since the last one; this test used to rely on numKeys being an
+	// exact multiple of threshold with nothing else ever proposed, so a
+	// snapshot would land at exactly index numKeys. That no longer
+	// holds unconditionally as of Phase 8: this node's own election win
+	// proposes one synthetic no-op entry first
+	// (internal/node.Node.proposeElectionNoOp, docs/replication.md
+	// §4.3), which can shift where a threshold boundary lands. Proposing
+	// up to one full threshold's worth of harmless filler keys is always
+	// enough to cross whatever offset a single election introduced.
+	for i := 0; uint64(leader.Status().SnapshotIndex) < last && i < threshold; i++ {
+		if _, err := propose(t, leader, cmd(fmt.Sprintf("filler-r%d", i), uint64(numKeys+i+1000), 0, fmt.Sprintf("filler-k%d", i), "v"), 3*time.Second); err != nil {
+			t.Fatalf("filler Propose #%d: %v", i, err)
+		}
+	}
+	awaitCondition(t, 3*time.Second, "leader compacts its own log past every proposed key while the follower is isolated", func() bool {
+		return uint64(leader.Status().SnapshotIndex) >= last
 	})
-	if got := leader.walog.FirstIndex(); got != numKeys+1 {
-		t.Fatalf("leader FirstIndex() = %d, want %d before healing the partition", got, numKeys+1)
+	snapIndex := uint64(leader.Status().SnapshotIndex)
+	if got := uint64(leader.walog.FirstIndex()); got != snapIndex+1 {
+		t.Fatalf("leader FirstIndex() = %d, want %d before healing the partition", got, snapIndex+1)
 	}
 
 	tc.heal(follower)
 	awaitCondition(t, 5*time.Second, "isolated follower catches up via an installed snapshot", func() bool {
 		st := tc.node(follower).Status()
-		return int(st.SnapshotIndex) == numKeys && uint64(st.AppliedIndex) >= uint64(numKeys)
+		return uint64(st.SnapshotIndex) == snapIndex && uint64(st.AppliedIndex) >= snapIndex
 	})
 
 	fnode := tc.node(follower)
-	if got := fnode.walog.FirstIndex(); got != numKeys+1 {
-		t.Fatalf("follower FirstIndex() after catch-up = %d, want %d — only a genuine InstallSnapshot install ever moves a follower's own boundary this way", got, numKeys+1)
+	if got := uint64(fnode.walog.FirstIndex()); got != snapIndex+1 {
+		t.Fatalf("follower FirstIndex() after catch-up = %d, want %d — only a genuine InstallSnapshot install ever moves a follower's own boundary this way", got, snapIndex+1)
 	}
 	for i := 0; i < numKeys; i++ {
 		key := fmt.Sprintf("k%d", i)

@@ -173,6 +173,15 @@ func (m *Manager) Begin() *Txn {
 	}
 }
 
+// Store returns the Manager's underlying MVCC store, for read-only
+// access (docs/mvcc.md §3: visibility reads do not go through Apply) by
+// a caller that needs more than a single-key read — e.g. a full-table
+// scan built on top of internal/mvcc.Store.Export (docs/sql.md §5's
+// SELECT-without-predicate path). Mirrors internal/fsm.FSM.Store's
+// identical accessor pattern. Callers must never mutate committed state
+// through this accessor except via a Txn's Commit.
+func (m *Manager) Store() *mvcc.Store { return m.fsm.Store() }
+
 // GetRequestOutcome resolves requestID's durable terminal outcome
 // (docs/transactions.md §7's conceptual GetRequestOutcome), without
 // resubmitting any mutation payload. A nil error means outcome is the
@@ -339,6 +348,28 @@ func (t *Txn) Read(key string) (value []byte, found bool, err error) {
 	}
 	v, ok := t.mgr.fsm.Store().Visible(key, t.startSeq)
 	return v, ok, nil
+}
+
+// LocalWrites returns a snapshot of the transaction's own uncommitted
+// write set, in first-write order (docs/transactions.md §1's local
+// write set) — used by a caller (e.g. the SQL frontend, docs/sql.md
+// §5) that needs to merge this transaction's own pending writes with a
+// committed-data scan for a multi-key read, mirroring the own-write-
+// shadows-committed-data rule Read already applies for a single key
+// (docs/mvcc.md §3 step 1). Read-only: does not affect transaction
+// state. Returns nil once the transaction is terminal (its write set no
+// longer exists — see Commit/Abort).
+func (t *Txn) LocalWrites() []mvcc.Mutation {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if t.state != StateActive {
+		return nil
+	}
+	out := make([]mvcc.Mutation, 0, len(t.order))
+	for _, k := range t.order {
+		out = append(out, t.writes[k])
+	}
+	return out
 }
 
 // Write records key=value in the transaction's local write set

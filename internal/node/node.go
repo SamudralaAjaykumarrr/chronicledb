@@ -721,9 +721,55 @@ func (n *Node) processOutput(out raft.Output) {
 	}
 	if out.BecameLeader {
 		n.logf("node %s became leader for term %d", n.cfg.ID, n.core.CurrentTerm())
+		n.proposeElectionNoOp()
 	}
 
 	n.checkPendingReads()
+}
+
+// proposeElectionNoOp submits a synthetic, empty-mutation CommitTxn
+// command in this node's own new term immediately upon becoming leader
+// (docs/replication.md §4.3). This is a driver-level liveness fix, not
+// a change to internal/raft.Core's own documented election behavior
+// (docs/raft.md's implementation note "no no-op entry is appended on
+// election" still describes Core accurately — Core still never
+// invents one internally): Raft's current-term commit rule
+// (docs/raft.md §4) means a newly elected leader cannot advance its
+// own commitIndex past entries from a *previous* term until it has
+// committed at least one entry in its *own* current term, no matter
+// how many nodes already durably hold those older entries. Without
+// this, BeginReadIndex's target (Node.handleReadIndex's target :=
+// n.core.LastIndex()) could reference an old-term entry that this
+// leader can never independently recognize as committed until some
+// unrelated future write arrives — an indefinite liveness stall, not a
+// safety violation, discovered via Phase 8's real-cluster SQL testing
+// (every SQL statement's Session.Begin calls BeginReadIndex, including
+// for a fresh INSERT — see internal/sql/engine.go).
+//
+// The no-op's RequestID is deliberately built from a NUL byte no real
+// client is expected to send, plus this node's ID and new term, making
+// collision with a genuine client RequestID practically impossible
+// (ChronicleDB V1 already assumes a trusted client/cluster network,
+// docs/non-goals.md §Authentication and TLS) while guaranteeing every
+// election, on every node, proposes a distinct RequestID. A rejected
+// or superseded proposal (this node loses leadership again before the
+// no-op commits) is silently dropped: nothing is waiting on its
+// outcome, and a future election will try again.
+func (n *Node) proposeElectionNoOp() {
+	cmd := fsm.CommitTxnCommand{
+		RequestID: fsm.RequestID(fmt.Sprintf("\x00chronicledb-election-noop\x00%s\x00%d", n.cfg.ID, n.core.CurrentTerm())),
+		TxnID:     uint64(n.core.CurrentTerm()),
+		StartSeq:  0,
+		Mutations: nil,
+	}
+	if _, err := n.fsmachine.Load().Precheck(cmd); err == nil || !errors.Is(err, fsm.ErrRequestIDUnknown) {
+		return // already proposed (or otherwise not fresh) for this exact node+term; never retry indefinitely
+	}
+	out := n.core.Step(raft.Input{Kind: raft.InputPropose, ProposeData: fsm.EncodeCommitTxn(cmd)})
+	if out.ProposalRejected {
+		return
+	}
+	n.processOutput(out)
 }
 
 // applyCommitted runs internal/fsm.Apply for every newly committed

@@ -492,8 +492,26 @@ func TestChaos_SnapshotFollowerCrashDuringCatchupResumesCleanly(t *testing.T) {
 		}
 		last = outcome
 	}
-	awaitCondition(t, 3*time.Second, "leader compacts while follower isolated", func() bool {
-		return leader.Status().SnapshotIndex == numKeys
+	// Force the leader's snapshot boundary to actually cover every key
+	// this test cares about. SnapshotThreshold-boundary alignment means
+	// a snapshot only fires at multiples of threshold entries since the
+	// last one; this test used to rely on numKeys being an exact
+	// multiple of threshold so that a snapshot would exist at exactly
+	// index numKeys with no other entries in the log. That assumption
+	// no longer holds unconditionally as of Phase 8: this node's own
+	// election win proposes one synthetic no-op entry
+	// (internal/node.Node.proposeElectionNoOp, docs/replication.md
+	// §4.3) before this test's own proposals ever run, which can shift
+	// where a threshold boundary lands. Proposing up to one full
+	// threshold's worth of harmless filler keys is always enough to
+	// cross whatever boundary offset a single election introduced.
+	for i := 0; uint64(leader.Status().SnapshotIndex) < last.CommitSeq && i < threshold; i++ {
+		if _, err := propose(t, leader, cmd(fmt.Sprintf("filler-r%d", i), uint64(numKeys+i+1000), 0, fmt.Sprintf("filler-k%d", i), "v"), 3*time.Second); err != nil {
+			t.Fatalf("filler Propose #%d: %v", i, err)
+		}
+	}
+	awaitCondition(t, 3*time.Second, "leader compacts past every test key", func() bool {
+		return uint64(leader.Status().SnapshotIndex) >= last.CommitSeq
 	})
 
 	tc.heal(follower)

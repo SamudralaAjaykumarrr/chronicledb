@@ -1,11 +1,13 @@
 # Roadmap and Maturity Model
 
 Status: this document defines the phase sequence and the evidence
-gates that govern when a maturity claim is allowed. Phases 1-7 are
+gates that govern when a maturity claim is allowed. Phases 1-8 are
 complete (each at its own documented scope — see that phase's own
 section below for exactly what it does and does not claim); current
-maturity is `STRONG DISTRIBUTED V1` (§Maturity Model below). Phase 8
-(Constrained SQL) has not begun.
+maturity is still `STRONG DISTRIBUTED V1` (§Maturity Model below) —
+Phase 8 alone does not advance it, since `PORTFOLIO READY` requires
+Phases 8 **and** 9 together, and Phase 9 (benchmarks/observability) has
+not begun.
 
 ## Phase sequence
 
@@ -190,11 +192,57 @@ untested. See [`docs/scenario-corpus.md`](scenario-corpus.md)'s Phase 7
 note for the precise chaos-variant accounting of RF-11/RF-13/RF-15 and
 the SN-\* scenarios.
 
-### Phase 8 — Constrained SQL using real transaction machinery
+### Phase 8 — Constrained SQL using real transaction machinery — COMPLETE (at this phase's own scope)
 
 The SQL surface defined in [`docs/non-goals.md`](non-goals.md) §SQL
-surface is implemented strictly on top of the Phase 1-7 engine, per
-[ADR-0013](adr/0013-sql-boundary-and-deferred-functionality.md).
+surface (`CREATE TABLE`, `INSERT`, `SELECT`, `UPDATE`, `DELETE`,
+`BEGIN`/`COMMIT`/`ROLLBACK`, one primary key per table, a single
+equality-on-primary-key predicate, three scalar types) is implemented
+in `internal/sql` — a hand-written lexer/parser producing an explicit
+typed AST, a binder that resolves and type-checks against a table's
+real committed schema, and execution that flows exclusively through
+`internal/txn.Manager` (standalone mode) or `internal/node.Node`
+(replicated mode) via a small `Engine`/`Txn` seam
+(`internal/sql/engine.go`) — never touching `internal/mvcc` or
+`internal/storage` directly, per
+[ADR-0013](adr/0013-sql-boundary-and-deferred-functionality.md). See
+[`docs/sql.md`](sql.md) for the full grammar, data model, execution
+semantics, and explicit compatibility boundaries.
+
+Tested against [`docs/scenario-corpus.md`](scenario-corpus.md) §SQL
+(SQ-1 through SQ-9), including: parser/lexer malformed-input and fuzz
+coverage (`FuzzParse`, `FuzzDecodeSchema`, `FuzzDecodeRow`); every
+documented error case for each of the five DML/DDL statements against
+a real `internal/wal`-backed standalone engine; `RequestID` retry
+safety for auto-commit mutations; explicit-transaction commit/rollback/
+abort-on-statement-error semantics; a living Snapshot-Isolation
+write-skew demonstration (no accidental SERIALIZABLE claim,
+`docs/invariants.md` ISOLATION TRUTHFULNESS); schema-and-row survival
+across a real WAL close/reopen restart; and, against a real three-node
+`internal/node` cluster over genuine TCP/disk: SQL `INSERT` → Raft
+commit → replicated state → `SELECT` returning the identical row on
+every node, `RequestID` retry against a newly elected leader after the
+original leader crashes, and SQL-visible state surviving a real
+snapshot-create-and-install/compaction cycle plus a follower
+crash/restart.
+
+Building those real-cluster tests found and fixed one genuine,
+previously-undiscovered Phase 5 liveness bug — not new SQL-layer
+mechanism, but an existing mechanism (`internal/node.Node.BeginReadIndex`)
+this phase's testing happened to newly exercise (every SQL statement
+calls it, including the first one after a failover) — see
+[ADR-0014](adr/0014-election-no-op-for-readindex-liveness.md) and
+[`docs/replication.md`](replication.md) §4.3 for the fix
+(`internal/node.Node.proposeElectionNoOp`) and its regression test.
+
+Not built in this phase, per [`docs/sql.md`](sql.md) §8 and
+[`docs/non-goals.md`](non-goals.md): joins, subqueries, views,
+triggers, foreign keys, any predicate beyond primary-key equality,
+aggregation, `ORDER BY`/`LIMIT`, `NULL`/defaults, secondary indexes, a
+cost-based optimizer, PostgreSQL wire-protocol compatibility, or a SQL
+CLI — the roadmap did not place a CLI requirement in this phase, so
+`internal/sql` remains a library, consumed directly by tests, not a
+client-facing tool.
 
 ### Phase 9 — Benchmarks + observability + performance engineering
 

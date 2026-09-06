@@ -461,11 +461,22 @@ whose doc comment walks through this exact mechanism, and
 `docs/recovery.md`'s Phase 5 implementation note for the recovery-side
 framing of the same fact.
 
-This is not a design gap this phase should close: adding a no-op
-entry on election specifically to shrink this window remains the
-`§9.5`-anticipated future ADR territory ("if a future phase's
-failover-latency goals require it"), not a Phase 5 correctness
-requirement — the property this document's invariants actually
+This was not a design gap Phase 5 needed to close, and adding a no-op
+entry on election specifically to shrink this window was named at the
+time as `§9.5`-anticipated future ADR territory ("if a future phase's
+failover-latency goals require it") rather than a Phase 5 correctness
+requirement. Phase 8 turned out to be exactly that future phase: its
+real-cluster SQL testing hit this window directly (every SQL
+statement's `Session.Begin` calls `BeginReadIndex`, including the first
+one after a failover, with no other write to unstick it), demonstrating
+it is a genuine client-visible liveness defect, not merely a
+theoretical corner this document was flagging in the abstract. See
+[ADR-0014](adr/0014-election-no-op-for-readindex-liveness.md) and
+[`docs/replication.md`](replication.md) §4.3 for the resulting fix
+(`internal/node.Node.proposeElectionNoOp`) — implemented entirely in
+`internal/node`, the driver; `Core.becomeLeader` itself is unchanged,
+so the rest of this paragraph's description of `Core`'s own behavior
+remains accurate. The property this document's invariants actually
 promise (`LEADER-COMPLETENESS`: a committed entry is never lost across
 a leadership change) holds throughout; only the *timing* of when it
 becomes applied-and-client-visible again depends on a subsequent

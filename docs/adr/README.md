@@ -26,3 +26,4 @@ skeleton.
 | [0011](0011-snapshot-and-log-compaction-model.md) | Snapshot and log-compaction model |
 | [0012](0012-recovery-and-corruption-policy.md) | Recovery and corruption policy |
 | [0013](0013-sql-boundary-and-deferred-functionality.md) | SQL boundary and deferred functionality |
+| [0014](0014-election-no-op-for-readindex-liveness.md) | Election no-op entry for `ReadIndex` liveness |

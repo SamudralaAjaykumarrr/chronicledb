@@ -188,6 +188,16 @@ internal/fault              deterministic test-only simulation:
                           in-memory transport, logical clock,
                           controlled disk, fault injection. Test-only;
                           never imported by production code paths.
+
+internal/sql                Phase 8: a small, constrained SQL frontend
+                          (lexer, parser, AST, binder, execution) over
+                          the unchanged transactional engine. Depends
+                          on internal/txn (standalone mode) and
+                          internal/node (replicated mode) only through
+                          a small Engine/Txn seam (internal/sql/engine.go)
+                          — never touches internal/mvcc or
+                          internal/storage directly. See
+                          docs/sql.md.
 ```
 
 Dependency rules (enforced by review, and mechanically once packages
@@ -203,10 +213,14 @@ exist):
   library. It has no knowledge of networking, SQL, or Raft.
 - `internal/wal` **must not** know about SQL syntax, transactions, or
   Raft semantics — it frames and persists opaque byte records.
-- The future SQL layer **must not** bypass `internal/txn`/`internal/fsm`
-  to touch `internal/mvcc` or `internal/storage` directly (see
-  [`docs/non-goals.md`](non-goals.md) and
-  [ADR-0013](adr/0013-sql-boundary-and-deferred-functionality.md)).
+- `internal/sql` (Phase 8, now implemented) **must not** bypass
+  `internal/txn`/`internal/fsm` to touch `internal/mvcc` or
+  `internal/storage` directly — enforced by construction: it only ever
+  calls `internal/txn.Manager`/`internal/node.Node` through its own
+  `Engine`/`Txn` seam (`internal/sql/engine.go`), never anything lower
+  (see [`docs/non-goals.md`](non-goals.md),
+  [ADR-0013](adr/0013-sql-boundary-and-deferred-functionality.md), and
+  [`docs/sql.md`](sql.md)).
 - No package listed above may cyclically depend on another; the
   arrows above are one-directional.
 

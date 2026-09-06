@@ -11,7 +11,10 @@ OS processes), SN-1 through SN-6 plus RF-3's snapshot-catch-up leg
 (Phase 6, `internal/snapshot` + `internal/node` + `internal/wal` +
 `internal/raft`), and, as of Phase 7, the chaos/combined-fault variants
 of RF-11, RF-13, RF-15, SN-3, and SN-5 (`internal/fault/chaos_test.go`,
-`internal/node/chaos_test.go`, `cmd/chronicledb-node/chaos_test.go`) —
+`internal/node/chaos_test.go`, `cmd/chronicledb-node/chaos_test.go`),
+and, as of Phase 8, SQ-1 through SQ-9 (`internal/sql`, the constrained
+SQL frontend, translating into the identical proven transaction path —
+see [`docs/sql.md`](sql.md)) —
 see each scenario's **Status** line below for
 exactly which — have passing,
 reproducible tests. **Every other scenario in this document does not
@@ -714,6 +717,154 @@ executable.
 
 ---
 
+## SQL
+
+Per [ADR-0013](adr/0013-sql-boundary-and-deferred-functionality.md),
+these scenarios were deliberately not added until Phase 8 began — they
+test correct *translation* into the already-proven transaction API
+(`docs/sql.md` §5.1), not durability/MVCC/Raft properties already
+covered above.
+
+### SQ-1: `CREATE TABLE` and duplicate-table rejection
+
+- **Action**: `CREATE TABLE` a new table; `CREATE TABLE` the identical
+  name again.
+- **Expected state**: the first commits (schema durably recorded, real
+  `CommitTxn` path); the second is rejected `ErrDuplicateTable` without
+  mutating anything, checked against real committed state, not a local
+  cache.
+- **Invariants**: `CONSISTENT LOG RESPONSIBILITY` (schema is ordinary
+  committed MVCC state, no second history).
+- **Phase**: 8.
+- **Status**: passing — `internal/sql/exec_test.go::TestExecCreateTable`, `TestExecCreateTableDuplicate`, `TestExecCreateTableInvalidSchema` (missing/multiple primary keys, unsupported types, duplicate columns — `schema_test.go::TestBuildSchema*`).
+
+### SQ-2: `INSERT` `RequestID` retry safety
+
+- **Action**: `INSERT` a row under `RequestID` R; retry the identical
+  statement under the identical R.
+- **Expected state**: the retry returns the original outcome (same
+  `CommitSeq`) without re-evaluating the statement's own semantic
+  guards (duplicate-primary-key check) against state that already
+  reflects the original attempt's own effect — exactly one row exists,
+  never a duplicate, never a false rejection.
+- **Invariants**: `IDEMPOTENCY`, `REQUEST OUTCOME STABILITY`.
+- **Phase**: 8.
+- **Status**: passing — `internal/sql/exec_test.go::TestExecInsertRetrySameRequestID` (standalone); `internal/sql/distributed_test.go::TestDistributedSQLLeaderFailoverRetry` (the identical property against a real cluster, across a genuine leader crash — see SQ-8).
+
+### SQ-3: `INSERT` schema/type/primary-key validation
+
+- **Action**: `INSERT` with a type-mismatched literal; `INSERT` a
+  primary-key value that already has a visible row; `INSERT` naming an
+  unknown table or column.
+- **Expected state**: each rejected explicitly (`ErrTypeMismatch`,
+  `ErrDuplicatePrimaryKey`, `ErrUnknownTable`/`ErrUnknownColumn`)
+  before any write is attempted.
+- **Invariants**: `CONFLICT CORRECTNESS` (the duplicate-key check is a
+  SQL-level guard in front of the identical underlying conflict rule).
+- **Phase**: 8.
+- **Status**: passing — `internal/sql/exec_test.go::TestExecInsertTypeMismatch`, `TestExecInsertDuplicateKey`, `TestExecInsertUnknownTable`, `TestExecInsertColumnList`, `TestExecInsertMissingColumnRejected`.
+
+### SQ-4: `SELECT` — primary-key lookup and full-table scan
+
+- **Action**: `SELECT` with a primary-key equality predicate; `SELECT`
+  with no predicate over a multi-row table; `SELECT` after inserting,
+  updating, and deleting rows in the same explicit transaction, before
+  `COMMIT`.
+- **Expected state**: the point lookup returns exactly the matching row
+  (or none); the full scan returns every currently-visible row,
+  deterministically ordered, in `O(size of the whole store)` — an
+  explicitly documented, un-indexed scan (`docs/sql.md` §5.2), not a
+  claim of query-planner-level performance; a read inside an open
+  explicit transaction sees its own not-yet-committed writes
+  (docs/mvcc.md §3 step 1) merged correctly with committed data.
+- **Invariants**: `MVCC VISIBILITY`.
+- **Phase**: 8.
+- **Status**: passing — `internal/sql/exec_test.go::TestExecSelectPrimaryKeyLookup`, `TestExecSelectMissingRow`, `TestExecSelectProjection`, `TestExecSelectFullScanDeterministic`; `internal/sql/engine_test.go::TestTxnScanPrefixMergesLocalAndCommitted` (own-write-shadowing merge into a full scan); `internal/sql/exec_test.go::TestExecExplicitTransactionCommit` (read-your-own-writes before `COMMIT`).
+
+### SQ-5: `UPDATE`/`DELETE` — missing row, tombstones, re-insert
+
+- **Action**: `UPDATE`/`DELETE` with a predicate matching no visible
+  row; `DELETE` an existing row, then `SELECT` (point and full-scan);
+  `INSERT` the identical primary key again after deleting it.
+- **Expected state**: the missing-row case is an explicit
+  `ErrRowNotFound` (this subset's documented deviation from a silent
+  zero-rows-affected success, `docs/sql.md` §2.5); a deleted row is an
+  ordinary MVCC tombstone, invisible to both lookup shapes; a primary
+  key freed by `DELETE` may be reused by a later `INSERT`.
+- **Invariants**: `MVCC VISIBILITY`, `ABORT SAFETY`'s tombstone
+  handling.
+- **Phase**: 8.
+- **Status**: passing — `internal/sql/exec_test.go::TestExecUpdateMissingRow`, `TestExecDeleteMissingRow`, `TestExecDeleteValid`, `TestExecDeleteTombstoneNotResurrectedByFullScan`, `TestExecDeleteThenReinsertSamePrimaryKey`; type/column/primary-key-immutability guards in `TestExecUpdateInvalidColumn`, `TestExecUpdateTypeMismatch`, `TestExecUpdateCannotModifyPrimaryKey`.
+
+### SQ-6: Explicit `BEGIN`/`COMMIT`/`ROLLBACK` transaction semantics
+
+- **Action**: `BEGIN`; several `INSERT`s; `COMMIT`. Separately: `BEGIN`;
+  an `INSERT`; `ROLLBACK`. Separately: `BEGIN`; a valid `INSERT`; a
+  second `INSERT` that fails (duplicate key); observe the whole
+  transaction's fate.
+- **Expected state**: every statement between `BEGIN` and `COMMIT`
+  accumulates into **one** deterministic `CommitTxn` command
+  (docs/transactions.md §3), submitted only at `COMMIT` — not one
+  command per statement; `ROLLBACK` leaves no trace at all,
+  immediately and after restart; a failing statement aborts the
+  **entire** open transaction, including its otherwise-valid earlier
+  statements, not just the failing one.
+- **Invariants**: `ATOMICITY`, `ABORT SAFETY`.
+- **Phase**: 8.
+- **Status**: passing — `internal/sql/exec_test.go::TestExecExplicitTransactionCommit`, `TestExecExplicitTransactionRollback`, `TestExecExplicitTransactionAbortsWholeTransactionOnStatementError`, `TestExecBeginWhileAlreadyActive`, `TestExecCommitWithoutBegin`, `TestExecRollbackWithoutBegin`; `internal/sql/restart_test.go::TestRestartSurvivesRolledBackAndAbortedWork` (the restart leg).
+
+### SQ-7: Snapshot Isolation write skew through SQL
+
+- **Action**: two explicit SQL transactions each read two rows' values,
+  each write to a *different* one of the two based on what they read,
+  and both `COMMIT`.
+- **Expected state**: both commit successfully (no overlapping write
+  set, so first-committer-wins never fires) even though the resulting
+  state violates an invariant no serial execution could have produced
+  — the textbook SI write-skew example (docs/mvcc.md §1.1), now
+  demonstrated through the SQL frontend as a living counterexample
+  against any accidental SERIALIZABLE claim.
+- **Invariants**: `ISOLATION TRUTHFULNESS`.
+- **Phase**: 8.
+- **Status**: passing — `internal/sql/exec_test.go::TestExecWriteSkewIsPossibleUnderSnapshotIsolation`.
+
+### SQ-8: Distributed SQL — replication and failover retry
+
+- **Action**: `CREATE TABLE`/`INSERT` against a real three-node
+  cluster's leader; confirm every node applies the identical row.
+  Separately: `INSERT` under `RequestID` R against the leader, crash
+  the leader, retry the identical statement under R against the newly
+  elected leader.
+- **Expected state**: every node's own `internal/mvcc.Store` becomes
+  visible-identical for the row, and a `SELECT` against the leader
+  returns it; the post-failover retry returns the identical
+  `CommitSeq` with no duplicate row and no error — the same central
+  Phase 5 acceptance scenario (`docs/roadmap.md`), now exercised
+  through the SQL frontend rather than the raw `CommitTxnCommand` API.
+- **Invariants**: `STATE MACHINE SAFETY`, `IDEMPOTENCY`,
+  `REQUEST OUTCOME STABILITY`.
+- **Phase**: 8.
+- **Status**: passing — `internal/sql/distributed_test.go::TestDistributedSQLInsertReplicates`, `TestDistributedSQLLeaderFailoverRetry`. Building this scenario found and fixed a genuine Phase 5 liveness bug in `internal/node.Node.BeginReadIndex` (a newly elected leader with no proposal yet in its own term could stall `ReadIndex` indefinitely) — see [ADR-0014](adr/0014-election-no-op-for-readindex-liveness.md) and [`docs/testing-strategy.md`](testing-strategy.md) §7.
+
+### SQ-9: SQL state survives restart and snapshot/compaction
+
+- **Action**: create a table and rows via SQL; close and reopen the
+  same on-disk WAL directory (standalone mode). Separately: create
+  enough SQL-driven rows against a real cluster to cross a small
+  `SnapshotThreshold`, crash a follower after it has created its own
+  snapshot, restart it.
+- **Expected state**: schema and every committed row are visible via
+  SQL after the standalone restart, with duplicate-table and
+  type-validation guards still enforced; the restarted follower's
+  local `internal/mvcc.Store`, rebuilt from a real installed snapshot
+  rather than full log replay, has every row a real Raft cluster
+  actually committed.
+- **Invariants**: `SNAPSHOT SAFETY`, `RECOVERY NON-INVENTION`.
+- **Phase**: 8.
+- **Status**: passing — `internal/sql/restart_test.go::TestRestartSurvivesSchemaAndData`; `internal/sql/distributed_test.go::TestDistributedSQLSnapshotCompactionSurvivesRestart`.
+
+---
+
 ## Roadmap-phase index
 
 | Phase | Scenarios first executable |
@@ -725,6 +876,7 @@ executable.
 | 5 | RF-1, RF-3 (log-catch-up leg), RF-4, RF-5, RF-6, RF-9 .. RF-13 in a real multi-process/real-disk deployment (see the Phase 5 note above); RF-2, RF-7, RF-8, RF-14, RF-15 remain simulator-only by deliberate scope (see each entry and [`docs/raft.md`](raft.md) §10.2); ID-4 (immediate/after-restart already from 3) |
 | 6 | SN-1 .. SN-6, ID-4 (after snapshot+compaction), RF-3's snapshot-catch-up leg |
 | 7 | Chaos/combined variants of RF-11, RF-13, RF-15 and SN-3/SN-5 under randomized fault schedules, plus RequestID/transaction chaos and genuine real-process SIGKILL evidence not tied to a single numbered scenario (see the Phase 7 note above and [`docs/testing-strategy.md`](testing-strategy.md) §6-7) |
+| 8 | SQ-1 .. SQ-9 |
 
 Scenarios with an explicit **Status: passing** line above currently
 pass at the stated scope — LD-1 through LD-6, TX-1 through TX-8, ID-1
@@ -732,9 +884,10 @@ through ID-7 (immediate/after-restart and, as of Phase 6, ID-4's
 after-snapshot+compaction leg), the Phase-4 simulator-only subset of
 RF-1 through RF-15, the Phase-5 real-disk/real-network/real-process
 subset of RF-1 through RF-15 listed in the Phase 5 row above, SN-1
-through SN-6 plus RF-3's snapshot-catch-up leg (Phase 6), and the
+through SN-6 plus RF-3's snapshot-catch-up leg (Phase 6), the
 Phase-7 chaos variants of RF-11, RF-13, RF-15, SN-3, and SN-5 called
-out in each of those entries' own Status lines above. Every
+out in each of those entries' own Status lines above, and, as of
+Phase 8, SQ-1 through SQ-9. Every
 other scenario in this document is not claimed to pass. A passing
 Phase-4 (simulator-only) RF-\* status is not by itself a claim that
 scenario's real multi-process (Phase 5) leg passes — check the specific

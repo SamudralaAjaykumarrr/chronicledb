@@ -53,22 +53,32 @@ terminology every other document depends on.
 16. [`roadmap.md`](roadmap.md) — phase sequence, evidence-based
     maturity model, and (as future work, not current claims)
     observability and performance target categories.
-17. [`adr/`](adr/) — numbered Architecture Decision Records recording
+17. [`sql.md`](sql.md) — the constrained SQL frontend (Phase 8):
+    supported grammar, data model, execution semantics, and explicit
+    compatibility boundaries.
+18. [`adr/`](adr/) — numbered Architecture Decision Records recording
     the specific decisions behind the above, including alternatives
     considered and rejected.
 
 ## What this documentation does not claim
 
-Phase 1's durable storage and WAL engine (`internal/storage`,
-`internal/wal`), Phase 2's MVCC and transaction engine (`internal/mvcc`,
-`internal/txn`), and Phase 3's deterministic state-machine boundary and
-`RequestID` idempotency (`internal/fsm`) are implemented and tested —
-see [`storage.md`](storage.md), [`wal.md`](wal.md), [`mvcc.md`](mvcc.md),
-[`transactions.md`](transactions.md), and [`recovery.md`](recovery.md)
-for the design as actually built. No document in this directory claims
-that a Raft consensus module, a SQL layer, or a CLI currently exists or
-has been tested, and no document claims SERIALIZABLE isolation — only
-Snapshot Isolation is implemented and proven (see
-[`mvcc.md`](mvcc.md) §1.1). See [`vision.md`](vision.md) and
-[`roadmap.md`](roadmap.md) §Maturity Model for how capability claims
-are gated on implementation evidence.
+Phases 1-8 are implemented and tested: durable storage and the WAL
+(`internal/storage`, `internal/wal`), MVCC and the transaction engine
+(`internal/mvcc`, `internal/txn`), the deterministic state-machine
+boundary and `RequestID` idempotency (`internal/fsm`), Raft and its
+real transport/disk wiring (`internal/raft`, `internal/transport`,
+`internal/node`), snapshots and log compaction (`internal/snapshot`),
+chaos/fault-injection testing (`internal/fault`), and, as of Phase 8, a
+small constrained SQL frontend (`internal/sql`) — see
+[`storage.md`](storage.md), [`wal.md`](wal.md), [`mvcc.md`](mvcc.md),
+[`transactions.md`](transactions.md), [`raft.md`](raft.md),
+[`replication.md`](replication.md), [`recovery.md`](recovery.md),
+[`snapshots.md`](snapshots.md), and [`sql.md`](sql.md) for the design
+as actually built. No document in this directory claims PostgreSQL
+wire-protocol compatibility, a broad SQL dialect, joins, or a SQL CLI
+exist (see [`sql.md`](sql.md) §8's explicit compatibility boundaries),
+and no document claims SERIALIZABLE isolation — only Snapshot Isolation
+is implemented and proven, including through the SQL frontend (see
+[`mvcc.md`](mvcc.md) §1.1, [`sql.md`](sql.md) §5.3). See
+[`vision.md`](vision.md) and [`roadmap.md`](roadmap.md) §Maturity Model
+for how capability claims are gated on implementation evidence.

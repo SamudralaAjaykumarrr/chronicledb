@@ -26,12 +26,13 @@ what would trigger revisiting it.
 - **Deferred**: joins, a distributed query optimizer, broad SQL
   compatibility, PostgreSQL wire-protocol compatibility, arbitrary
   PostgreSQL on-disk compatibility.
-- **In scope for a later phase (Phase 8), once the transaction
-  machinery is proven**: a small, constrained SQL layer — `CREATE
+- **Delivered in Phase 8** (`internal/sql`), once the transaction
+  machinery was proven: a small, constrained SQL layer — `CREATE
   TABLE`, `INSERT`, `SELECT`, `UPDATE`, `DELETE`, `BEGIN`, `COMMIT`,
   `ROLLBACK`, primary keys, equality predicates, a limited type system,
-  no joins initially. This SQL layer must compile strictly into the
-  real transaction/MVCC machinery:
+  no joins. See [`docs/sql.md`](sql.md) for the grammar, data model,
+  and execution semantics as actually built. This SQL layer compiles
+  strictly into the real transaction/MVCC machinery:
 
   ```
   SQL / request layer
@@ -41,8 +42,8 @@ what would trigger revisiting it.
     -> durable storage (internal/wal, internal/storage)
   ```
 
-  SQL must never bypass durability, transactions, MVCC, or
-  replication — e.g. no direct-to-storage fast path that skips the
+  SQL never bypasses durability, transactions, MVCC, or
+  replication — there is no direct-to-storage fast path that skips the
   transaction manager. See [ADR-0013](adr/0013-sql-boundary-and-deferred-functionality.md).
 - **Why deferred entirely until Phase 8**: correctness of the
   underlying transactional/replicated engine is the hard, interesting
@@ -51,8 +52,13 @@ what would trigger revisiting it.
   indistinguishable from engine-level bugs, or (b) tempt the
   implementation to bypass the engine for convenience, which is
   explicitly disallowed above.
-- **Revisit when**: Phases 1-7 are complete and their scenario corpus
-  passes (see [`docs/roadmap.md`](roadmap.md)).
+- **Revisit when**: Phases 1-7 completing and their scenario corpus
+  passing is what triggered building the delivered subset above (see
+  [`docs/roadmap.md`](roadmap.md)); the features still marked
+  **Deferred** at the top of this entry (joins, a distributed query
+  optimizer, broad SQL/wire-protocol compatibility) have no fixed
+  trigger phase and require a specific, evidenced need plus their own
+  ADR, per this document's general policy.
 
 ## Cross-region / geo-replication
 

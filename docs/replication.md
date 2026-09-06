@@ -141,6 +141,83 @@ first explicitly define and test the clock-skew assumptions they
 depend on (tracked in [`docs/roadmap.md`](roadmap.md); see
 [ADR-0010](adr/0010-read-consistency.md)).
 
+### 4.3 The current-term commit rule can stall `ReadIndex` after a
+    failover, and why `internal/node` proposes a no-op on election
+
+Step 1 above ("prove current authority") is safe by itself, but step 3
+("wait until `appliedIndex >= readIndex`") can, in one specific
+situation, never complete at all: Raft's current-term commit rule
+(`docs/raft.md` §4) forbids a leader from advancing its own
+`commitIndex` past an entry from a **previous** term based on
+`matchIndex` majority alone — it must first commit at least one entry
+in its **own** current term (the classic Raft safety argument: an
+entry replicated to a majority under an old leader could still be
+overwritten by a subsequent leader change before any leader in that
+entry's own term has committed anything, so majority replication alone
+is not sufficient proof of permanence across a term boundary).
+
+Concretely: a leader crashes immediately after a write commits, before
+that fact ever reaches the other nodes via a follow-up heartbeat's
+`leaderCommit` field. The newly elected leader's own log already
+contains that write (Raft's leader-completeness guarantee), but it
+cannot yet independently *recognize* it as committed — and, per the
+rule above, has no way to do so until some entry from its own new term
+commits. If no client ever proposes anything new in that term, this
+never happens on its own: `ReadIndex`'s `target := LastIndex()` at the
+moment of the read already includes that old-term entry, so step 3's
+wait condition can never be satisfied — an indefinite liveness stall,
+not a safety violation, distinguishable in practice only by the caller's
+context timing out.
+
+This was not a hypothetical: Phase 8's real-cluster SQL testing found
+it directly, because every SQL statement's `Session.Begin` calls
+`BeginReadIndex` — including for the very first statement after a
+failover, before any new write has happened in the new leader's term
+(see `docs/sql.md` §10, `internal/sql/distributed_test.go`).
+
+**Fix**: `internal/node.Node`, on `Output.BecameLeader`, immediately
+proposes one synthetic, empty-`Mutations` `CommitTxn` command in its own
+new term (`Node.proposeElectionNoOp`, `internal/node/node.go`). Once
+that no-op commits — an ordinary commit needing nothing but the usual
+majority-match, now unblocked because it *is* a current-term entry —
+the current-term commit rule immediately also recognizes every earlier
+entry as committed too (the standard Raft safety argument for why a
+current-term commit implies the entire prefix is committed), unblocking
+`ReadIndex` with no further client action required.
+
+This is a **driver-level** fix, not a change to `internal/raft.Core`'s
+own election behavior: `docs/raft.md`'s implementation note ("no no-op
+entry is appended on election... this phase does not invent one")
+still accurately describes `Core.becomeLeader` — it still never
+proposes anything itself. `internal/node` is already the layer that
+decides *what* to propose and *when* for every other command in this
+system; deciding to propose a no-op on its own election is the same
+kind of driver policy, not a new Raft-core mechanism. The no-op's
+`RequestID` is built from a leading NUL byte (a byte no real client is
+expected to send) plus this node's ID and new term — deterministic per
+election, and, given ChronicleDB V1's trusted-network assumption
+(`docs/non-goals.md` §Authentication and TLS), practically impossible
+for a genuine client `RequestID` to collide with.
+
+**Regression coverage**: `internal/sql/distributed_test.go`'s
+`TestDistributedSQLLeaderFailoverRetry` (a real three-node cluster,
+real leader crash, `BeginReadIndex` immediately after failover with no
+intervening write) is the deterministic regression test for this fix —
+confirmed to hang before the fix and pass immediately after it. Two
+pre-existing `internal/node` tests
+(`TestSN1_RestartRestoresFromSnapshotAndCompactsLog`,
+`TestSN5_FollowerCatchesUpViaSnapshotAfterLeaderCompaction`) and one
+`internal/node/chaos_test.go` test
+(`TestChaos_SnapshotFollowerCrashDuringCatchupResumesCleanly`) hardcoded
+an exact `SnapshotIndex == numKeys` boundary that assumed no entry ever
+precedes their own proposals; the no-op's extra leading entry can shift
+where a `SnapshotThreshold` boundary lands, so those three tests were
+updated to wait for the snapshot boundary to cover every key they
+actually check (`SnapshotIndex >= last proposed CommitSeq`, proposing a
+few harmless filler keys if needed to force the boundary forward)
+rather than asserting one hardcoded index — a test-robustness fix, not
+a further production-code change.
+
 ## 5. Network partition contract
 
 Concrete scenario, referenced by [`docs/failure-model.md`](failure-model.md)

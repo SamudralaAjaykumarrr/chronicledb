@@ -28,7 +28,12 @@ the deterministic raft-core layer, `internal/node/chaos_test.go`
 against real disk/network, `cmd/chronicledb-node/chaos_test.go` against
 genuine real OS processes with a real `SIGKILL`), which found and fixed
 two genuine bugs and one data race — §7 gives the full, honest account.
-This document specifies the testing
+Phase 8 adds §8 below: the same test categories applied to the
+constrained SQL frontend (`internal/sql`), including its own real
+three-node cluster distributed evidence — which found and fixed one
+further genuine Phase 5 liveness bug, `internal/node.Node.BeginReadIndex`
+stalling indefinitely immediately after a leader failover with no
+intervening write (§8.1). This document specifies the testing
 architecture future implementation phases must build toward; it does
 not itself assert an aggregate coverage or pass-count claim (see §2's
 guiding principle).
@@ -535,3 +540,97 @@ count not yet tried (see `docs/roadmap.md`'s Maturity Model: "advancing
 a maturity claim without its evidence gate is itself a documentation
 defect," and this phase's own "Remaining Risks" accounting in the
 Phase 7 completion report).
+
+## 8. Phase 8: SQL frontend testing
+
+`internal/sql`'s test suite (see [`docs/sql.md`](sql.md) §9 and
+[`docs/scenario-corpus.md`](scenario-corpus.md) §SQL, SQ-1 through
+SQ-9, for the itemized scenario mapping) adds no new test *category*
+beyond §1's table above — it applies unit, component, and (for the
+distributed evidence) real-multi-process tests to the SQL frontend
+specifically, per this phase's own brief that SQL testing "should focus
+on correct translation to the transaction API... not on re-proving
+durability/MVCC/Raft properties already covered by Phases 1-7's
+scenario corpus" (ADR-0013). Concretely:
+
+- Parser/lexer unit tests plus `FuzzParse`/`FuzzDecodeSchema`/
+  `FuzzDecodeRow` (fuzz tests, per §1's table) — the identical
+  never-panics/bounded-decode discipline `internal/fsm.FuzzDecodeCommitTxn`
+  already established, applied to SQL source text and the two new
+  durable record formats (`Schema`, row bytes).
+- Component tests against a real `internal/wal`-backed standalone
+  engine for every documented statement/error case, and a real restart
+  of that same on-disk directory (mirroring `internal/txn`'s own
+  restart-recovery test style, docs/testing-strategy.md §1's "Component
+  tests" row).
+- End-to-end tests against a real three-node `internal/node` cluster
+  over genuine TCP/disk (`internal/sql/distributed_test.go`), built the
+  same way `internal/node/node_test.go`'s own `testCluster` is (fast
+  tick intervals, bounded polling, real `SIGKILL`-equivalent `Node.Stop`)
+  — proving SQL `INSERT` → Raft commit → replicated state → `SELECT`,
+  `RequestID` retry across a real leader failover, and SQL state
+  surviving a real snapshot install and follower restart.
+
+### 8.1 A genuine Phase 5 liveness bug found by Phase 8's real-cluster SQL tests
+
+Building `internal/sql/distributed_test.go`'s failover-retry test
+(SQ-8) found and fixed a real, previously-undiscovered bug in
+`internal/node.Node.BeginReadIndex` — not a defect in `internal/sql`
+itself, but in a Phase 5 mechanism this phase's testing happened to be
+the first to exercise under the specific condition that exposes it.
+
+**Found by**: `internal/sql/distributed_test.go::TestDistributedSQLLeaderFailoverRetry`,
+during this phase's own development — a real three-node cluster, an
+`INSERT` committed via the leader, an immediate real leader crash, and
+a retry of the identical statement/`RequestID` against the newly
+elected leader.
+
+**Symptom**: the retry's own `Session.Begin` → `BeginReadIndex` call
+hung indefinitely (bounded only by the test's own context timeout, not
+by any internal bound) — reproduced directly against the raw
+`internal/node.Node.BeginReadIndex` API with no SQL code involved at
+all, confirming this was not a SQL-layer bug.
+
+**Root cause**: Raft's current-term commit rule (`docs/raft.md` §4)
+forbids a leader from advancing its own `commitIndex` past a
+*previous* term's entries via `matchIndex` majority alone; it must
+first commit an entry in its *own* current term. A newly elected
+leader whose predecessor crashed before that fact ever reached the
+other nodes (no follow-up heartbeat carrying the updated
+`leaderCommit`) therefore cannot recognize an already-durably-
+replicated prior-term entry as committed until *some* new proposal
+lands in its own term — and nothing forces that to happen on its own.
+`docs/raft.md` §9.5/§10.3 had already named this exact liveness window
+as a known, deliberately deferred trade-off ("not a Phase 5 correctness
+requirement... `§9.5`-anticipated future ADR territory"); Phase 8's SQL
+testing is what turned it from a documented theoretical corner into an
+observed, reproducible hang, because every SQL statement's
+`Session.Begin` calls `BeginReadIndex` — including the very first
+statement after a failover, with nothing else to unstick it.
+
+**Fix**: `internal/node/node.go` — `Node.proposeElectionNoOp`, called
+from `processOutput` on `Output.BecameLeader`, immediately proposes one
+synthetic empty-`Mutations` `CommitTxn` command in the node's own new
+term, unblocking the current-term commit rule's backward-scan
+recognition of every earlier entry with no client action required. See
+[ADR-0014](adr/0014-election-no-op-for-readindex-liveness.md) and
+[`docs/replication.md`](replication.md) §4.3 for the full design and
+why this belongs in `internal/node` (the driver) rather than
+`internal/raft.Core`, whose own "no no-op on election" decision is
+unchanged.
+
+**Regression test**: `TestDistributedSQLLeaderFailoverRetry` itself —
+confirmed to hang (verified by temporarily reverting the fix and
+re-running) before the fix, and to pass in well under a second,
+repeatedly, after it. Three pre-existing `internal/node` tests
+(`TestSN1_RestartRestoresFromSnapshotAndCompactsLog`,
+`TestSN5_FollowerCatchesUpViaSnapshotAfterLeaderCompaction`,
+`TestChaos_SnapshotFollowerCrashDuringCatchupResumesCleanly`) had
+hardcoded an exact `SnapshotIndex == numKeys` boundary that implicitly
+assumed no entry ever precedes their own test proposals; the no-op's
+extra leading entry can shift where a `SnapshotThreshold` boundary
+lands, so those three were updated to wait for the boundary to cover
+every key they actually check, computed dynamically, rather than
+asserting one hardcoded absolute index — a test-robustness fix, not a
+further production-code change, re-verified green under `-race` across
+repeated runs of the full `internal/node` suite.
