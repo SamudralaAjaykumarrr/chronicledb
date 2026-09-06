@@ -1,7 +1,13 @@
 # Replication, Durability Contract, and Read Consistency
 
-Status: Architecture Foundation. No replication implementation exists
-yet.
+Status: §1.1 (standalone) has been implemented and tested since Phase
+2-3. §1.2 (replicated mode), §4 (`ReadIndex`), and §5 (the network
+partition contract) are now implemented and tested as of Phase 5 — see
+`internal/node.Node.Propose` for §1.2's exact 8-step sequence,
+`internal/node.Node.BeginReadIndex` for §4, and
+`internal/node/node_test.go`'s `TestRF11`/`TestRF12`/`TestRF13` for §5's
+scenario end-to-end against real disk/network. See
+[`docs/raft.md`](raft.md) §10 for implementation-time notes.
 
 This document defines exactly what ChronicleDB means by "durable" and
 "committed" in both standalone and replicated modes, how strong reads

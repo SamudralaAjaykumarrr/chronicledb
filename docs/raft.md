@@ -2,9 +2,13 @@
 
 Status: Phase 4 (`internal/raft` core + `internal/fault` deterministic
 simulator) is implemented and tested — see §9 for exactly what that
-does and does not yet mean. Production wiring to real transport/disk
-(`internal/transport`, an `internal/wal`-backed `raft.Storage`,
-`internal/node`) remains Phase 5, not yet implemented.
+does and does not yet mean. Phase 5 (production wiring to real
+transport/disk: `internal/transport`, an `internal/wal`-backed
+`raft.Storage` adapter, `internal/node`) is now also implemented — see
+§10 for what it adds and its own implementation-time decisions. The
+`Core` type itself is completely unchanged by Phase 5: every Phase 5
+package is a driver/adapter built against the interfaces this document
+already specified, exactly as §1 and ADR-0009 intended.
 
 ChronicleDB's architecture is designed to implement and expose real
 Raft mechanics as first-class, inspectable architecture, rather than
@@ -337,3 +341,167 @@ handler. `raft.Storage` implementations (including `MemoryStorage`) do
 not store this sentinel; `NewCore` reconstructs it from a gap-free
 `entries` slice starting at index 1 on every construction, including
 restart.
+
+## 10. Phase 5 implementation notes
+
+This section records implementation-time clarifications made while
+wiring the unchanged Phase 4 `Core` to real disk/network in
+`internal/node`. None of it changes an accepted ADR.
+
+### 10.1 Packages and division of responsibility
+
+- `internal/node.WALStorage` is the production `raft.Storage`
+  implementation §9.4 anticipated: it persists `HardState` and log
+  entries through `internal/wal` (the same durable log the rest of
+  ChronicleDB uses — no second, Raft-only physical log,
+  `docs/invariants.md` `CONSISTENT-LOG-RESPONSIBILITY`), and keeps an
+  in-memory mirror (entries/hard state) so `raft.Storage`'s read
+  methods stay cheap without re-reading segment files on every `Step`
+  call. `internal/wal` itself gained exactly the capability §9.4 said
+  it was missing: a crash-safe `Truncate(fromIndex)` (see
+  `docs/wal.md`'s Phase 5 implementation note for the algorithm) plus
+  `AppendHardState`/`LatestHardState` for the `HardState` record type
+  Phase 1 had already reserved but never used. Both internal/wal
+  additions treat their payloads as fully opaque bytes, exactly as
+  before (`docs/architecture.md` §5) — `WALStorage` owns the small
+  encode/decode step turning a `raft.HardState` or a
+  `(raft.Term, data)` pair into the bytes `internal/wal` actually
+  stores, and back.
+- `internal/transport.Transport` is the production transport §1/ADR-0009
+  anticipated: real TCP sockets, one dedicated writer goroutine per
+  peer (see §10.2's note on why this specific design point is
+  load-bearing, not stylistic), explicit length-prefixed framing with a
+  version byte and a bounded maximum message size, `encoding/gob` for
+  the message body, and panic-safe decoding. `internal/raft` does not
+  import it, per §1/`docs/architecture.md` §5.
+- `internal/node.Node` is the process-level driver §1 always
+  anticipated a Phase 5 would provide: a single event-loop goroutine
+  owns every `Core.Step` call, `WALStorage` mutation, and `fsm.FSM`
+  mutation (this is the "controlled event-loop ownership" avoiding
+  lock cycles across raft/wal/fsm/transport that Phase 5's brief
+  calls for) — client calls (`Propose`, `BeginReadIndex`) hand off to
+  this loop via buffered-result channels and never touch `Core`/
+  `WALStorage`/`fsm.FSM` directly from another goroutine, except
+  `fsm.FSM` itself, which is independently safe for concurrent access
+  by design (`docs/transactions.md`) and used directly by `Propose`'s
+  idempotency pre-check for that reason.
+- `cmd/chronicledb-node` is a real OS-process entry point wrapping one
+  `internal/node.Node`, with a minimal local HTTP control plane (not a
+  general client wire protocol — `internal/protocol` remains out of
+  Phase 5 scope) used specifically to drive real multi-process
+  integration tests (`cmd/chronicledb-node/main_test.go`).
+
+### 10.2 Real-transport testing scope: what was and was not re-proven
+
+Phase 4's simulator-only RF-7 (duplicate `AppendEntriesRPC`) and RF-8
+(stale `AppendEntriesRPC`) scenarios exercise `Core`-internal protocol
+logic that is, by construction (§1, ADR-0009), completely independent
+of which `Transport` implementation carries the messages — the
+identical, unmodified `Core` code proven against those scenarios in
+Phase 4 is the exact code Phase 5's `internal/node` drives. Re-running
+those specific message-level edge cases through real sockets would
+prove the same fact about `Core` a second time without saying anything
+new about the Phase 5 wiring itself, so they were not duplicated;
+Phase 5's real-transport tests instead focus on what actually is new in
+this phase — genuine disk persistence, genuine process/network
+failure, and the end-to-end wiring between `Core`, `WALStorage`,
+`internal/transport`, and `internal/fsm`.
+
+RF-2/RF-14 (a follower whose delivery is *delayed but not dropped*)
+remain simulator-only for a different, honest reason: `internal/transport`
+implements `Block`/`Unblock` (outright drop, in both directions, for a
+named peer — sufficient for every partition-shaped scenario this phase
+tests) but does not yet model non-zero, still-eventually-delivered
+network latency. Adding that is a plausible, small future enhancement,
+not attempted in this phase because no RF-\* scenario's *safety*
+argument depends on it (delay-tolerance here is a liveness property,
+already covered in spirit by the fact that `Block` followed by
+`Unblock` proves delivery resumes and catch-up completes — RF-3, RF-13).
+
+### 10.3 A full-cluster restart does not, by itself, re-confirm
+    prior-term history — and why that is correct, not a bug
+
+Combining two already-accepted, already-documented decisions produces
+a real, easy-to-miss consequence worth stating explicitly:
+
+- §9.5: no no-op entry is appended on election, so a newly elected
+  leader can only advance `commitIndex` over a *previous* term's
+  entries by getting a *fresh* proposal in its *own* current term to
+  reach a majority (§4's current-term commit rule).
+- §5.1/ADR-0008: `commitIndex` is never persisted and is always
+  reconstructed at restart, starting from 0.
+
+If **every** node in a cluster crashes and restarts at (roughly) the
+same time — not merely the leader — no surviving node carries live
+knowledge of the pre-crash `commitIndex`, even though a majority may
+already durably hold an entry that genuinely was committed before the
+crash. The newly elected leader's log physically contains that entry
+(restored from disk, per §5.1's `NewCore(cfg, hs, entries)`
+reconstruction), but per the current-term commit rule it cannot
+*declare* that entry committed — and therefore `internal/fsm.Apply`
+never runs for it — until some *new* proposal in the new leader's own
+term reaches a majority. Once that happens, the current-term commit
+rule's backward scan (§4, `advanceLeaderCommit`) correctly and
+automatically re-confirms every earlier entry up to and including the
+new one in the same step, so nothing is lost — it is simply not
+*applied* until that fresh proposal occurs.
+
+This is exactly what a client's own documented retry-by-`RequestID`
+responsibility (`docs/transactions.md` §7) provides for free: a client
+that never received a response before the whole-cluster crash retries
+with the same `RequestID` against whichever node is elected leader
+after everyone restarts, and that retry *is* the fresh proposal that
+unlocks re-confirming the pre-crash history — after which
+`internal/fsm.Apply`'s own idempotency check (§6) ensures the retried
+command resolves to the *original* recorded outcome (from the
+re-applied pre-crash entry, applied moments earlier in the same
+committed batch) rather than a fresh, second evaluation. See
+`internal/node/node_test.go::TestClusterRestartRecoversFSMAndRequestIDOutcomes`,
+whose doc comment walks through this exact mechanism, and
+`docs/recovery.md`'s Phase 5 implementation note for the recovery-side
+framing of the same fact.
+
+This is not a design gap this phase should close: adding a no-op
+entry on election specifically to shrink this window remains the
+`§9.5`-anticipated future ADR territory ("if a future phase's
+failover-latency goals require it"), not a Phase 5 correctness
+requirement — the property this document's invariants actually
+promise (`LEADER-COMPLETENESS`: a committed entry is never lost across
+a leadership change) holds throughout; only the *timing* of when it
+becomes applied-and-client-visible again depends on a subsequent
+proposal.
+
+### 10.4 `BeginReadIndex`'s freshness proof cannot use `matchIndex` directly
+
+`docs/replication.md` §4 / ADR-0010 requires proving current leadership
+via "a fresh round of heartbeats acknowledged by a majority" before
+assigning a read's `StartSeq`. The natural-looking implementation —
+record `target := Core.LastIndex()`, force a heartbeat, and then wait
+until a majority of `Core.MatchIndexOf(peer) >= target` — is **not**
+sufficient and was caught by a dedicated regression test during Phase 5
+development
+(`internal/node/node_test.go::TestBeginReadIndexBlockedAfterIsolationEvenWithStaleReplicatedLog`):
+`matchIndex` only ever increases while a node remains leader in a term
+and is never reset merely because that node becomes partitioned, so a
+leader that fully replicated its log to a majority *before* being
+isolated would pass a `matchIndex`-based check vacuously, using
+entirely stale, pre-partition information, without any live contact
+with a majority at all — precisely the unsafe case ADR-0010 exists to
+prevent (an isolated former leader serving a "strong" read). The
+degenerate case of an entirely empty log (`target == 0`) makes this
+concretely visible immediately (`matchIndex >= 0` is trivially true for
+every peer, including full strangers, from the very first instant),
+but the flaw is general, not limited to that edge case.
+
+`internal/node.Node` instead tracks `lastAck[peer]`, a per-peer counter
+bumped to a fresh, strictly increasing value only when this node, still
+`Leader` in the *unchanged* current term, processes a genuine `Success`
+`AppendEntriesResponse` from that peer (the exact precondition under
+which `Core` itself would honor the reply). A pending `BeginReadIndex`
+snapshots every peer's `lastAck` value at issuance and only succeeds
+once a majority's value has *strictly advanced past its own snapshot*
+— proof that a live round-trip happened no earlier than the read's own
+issuance, independent of `matchIndex`'s absolute value. This is
+implementation detail local to `internal/node` (`Core` itself is
+unmodified), recorded here because the failure mode is subtle enough
+that a future re-implementation should not rediscover it the hard way.

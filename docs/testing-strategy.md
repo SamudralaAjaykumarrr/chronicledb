@@ -11,11 +11,17 @@ exercised deterministic replay equivalence (two independently
 constructed `internal/fsm.FSM` instances fed the identical command
 history) as a concrete instance of the "Deterministic distributed
 simulation" row below, in miniature and without any networking/Raft;
-Phase 4 now implements that row's full target design — real
+Phase 4 implemented that row's full target design — real
 `internal/raft.Core` instances wired through `internal/fault`'s
-in-memory transport and logical clock — though still without
-production transport/disk (see docs/raft.md §9 and the Phase 4/5
-boundary in docs/roadmap.md). This document specifies the testing
+in-memory transport and logical clock — without production
+transport/disk (see docs/raft.md §9). Phase 5 adds the "End-to-end
+tests" row's real-transport/real-disk leg for real: `internal/node`'s
+tests wire the identical `internal/raft.Core` against a real
+`internal/wal`-backed `raft.Storage` and a real TCP `internal/transport`
+(still within one test process, but genuine sockets/files, not the
+simulator), and `cmd/chronicledb-node`'s tests go one step further —
+genuine separate OS processes, real persistent data directories, and a
+real `SIGKILL` — see §5 below. This document specifies the testing
 architecture future implementation phases must build toward; it does
 not itself assert an aggregate coverage or pass-count claim (see §2's
 guiding principle).
@@ -136,7 +142,59 @@ for this simulator, independent of any Raft scenario it later runs);
 `docs/scenario-corpus.md` §Raft/Replication scenarios and the
 determinism/reproducibility claim in §3.2 are actually exercised.
 
-## 4. Relationship to the scenario corpus
+## 4. Real-process/real-network testing layer (Phase 5)
+
+The deterministic simulator (§3) remains the primary vehicle for
+proving Raft- and replication-level *safety* — it stays the layer new
+adversarial schedules and property tests get added to first. Phase 5
+adds a second, complementary layer whose job is specifically to prove
+the *production wiring itself* works, per §3.3's original framing
+("real-time end-to-end tests still have a place for validating the
+production transport/clock adapters themselves, but not for validating
+Raft safety logic"):
+
+- **`internal/node`'s in-process/real-disk/real-network tests**
+  (`internal/node/node_test.go`) wire real, unmodified
+  `internal/raft.Core` instances to a real `internal/wal`-backed
+  `raft.Storage` (temp-dir-backed segment files) and a real TCP
+  `internal/transport` listening on localhost, all within one test
+  process. `internal/transport.Transport.Block`/`Unblock` inject
+  partition-shaped faults (drop, both directions, for a named peer) —
+  the same shape `internal/fault.Transport.IsolateNode`/`HealNode`
+  provide for the simulator, but over genuine sockets. A "crash" in
+  these tests is `Node.Stop`, which is durability-equivalent to an
+  ungraceful kill here: nothing beyond what was already fsynced
+  survives either way (`docs/wal.md` §4), so the two are
+  interchangeable for every scenario these tests check; only a
+  genuinely separate process can prove the *literal* OS-level kill
+  case, which the next layer does.
+- **`cmd/chronicledb-node`'s real-process integration test**
+  (`cmd/chronicledb-node/main_test.go`, gated behind the `integration`
+  build tag so it does not slow down every `go test ./...`, but wired
+  into CI per `.github/workflows/ci.yml`) spawns several genuine OS
+  processes — each with its own persistent data directory and real
+  listening sockets — drives them via a minimal local HTTP control
+  plane, and sends a real `SIGKILL` to simulate a crash. This is the
+  "real multi-process/real-disk proof" `docs/roadmap.md`'s
+  `REPLICATED PROTOTYPE` gate and this phase's own brief require beyond
+  the simulator and beyond `internal/node`'s in-process tests.
+
+Both layers use bounded polling (a deadline loop checking a condition
+every few milliseconds) to observe eventual outcomes — leader election,
+convergence, catch-up — never an arbitrary fixed sleep, per §3.3's
+reasoning about why real-time tests must still avoid guessing how long
+something "probably" takes.
+
+Not every `docs/scenario-corpus.md` §Raft/Replication scenario is
+re-proven at this real layer: message-level protocol edge cases already
+exhaustively proven against the identical, transport-independent
+`internal/raft.Core` in Phase 4 (RF-7, RF-8), and delayed-but-not-
+dropped delivery, which `internal/transport` does not yet model
+(RF-2, RF-14), are deliberately left as simulator-only — see
+`docs/raft.md` §10.2 and each scenario's own Status line in
+`docs/scenario-corpus.md` for the specific, honest accounting.
+
+## 5. Relationship to the scenario corpus
 
 [`docs/scenario-corpus.md`](scenario-corpus.md) enumerates the specific
 scenarios this testing strategy must eventually turn into executable

@@ -61,6 +61,14 @@ type WAL struct {
 	// RecordTypeLogEntry record appended.
 	nextLogIndex uint64
 
+	// latestHardState is the payload of the most recently appended (or,
+	// at Open, most recently replayed) RecordTypeHardState record, or
+	// nil if none has ever been written. internal/wal treats it as
+	// opaque bytes (docs/architecture.md §5: internal/wal must not know
+	// about Raft semantics) — encoding/decoding currentTerm/votedFor is
+	// the Raft storage adapter's job (internal/node, Phase 5).
+	latestHardState []byte
+
 	closed bool
 }
 
@@ -115,6 +123,7 @@ func Open(dir string, opts Options) (*WAL, *RecoveryReport, error) {
 		lastLogIndex uint64
 		haveMetadata bool
 		meta         Metadata
+		latestHS     []byte
 	)
 
 	for i, id := range ids {
@@ -165,7 +174,11 @@ func Open(dir string, opts Options) (*WAL, *RecoveryReport, error) {
 				meta = m
 				haveMetadata = true
 			case RecordTypeHardState:
-				// Opaque to Phase 1; frame integrity already verified.
+				// Opaque to internal/wal; frame integrity already
+				// verified. "Most recent record of this type wins"
+				// (docs/wal.md §2, §9) — a forward, in-order scan means
+				// the last one encountered during recovery is correct.
+				latestHS = append([]byte(nil), rec.Payload...)
 			}
 			offset += int64(frameLen)
 		}
@@ -190,6 +203,7 @@ func Open(dir string, opts Options) (*WAL, *RecoveryReport, error) {
 
 	w.metadata = meta
 	w.nextLogIndex = lastLogIndex + 1
+	w.latestHardState = latestHS
 	report.LastLogIndex = lastLogIndex
 	return w, report, nil
 }
@@ -227,6 +241,166 @@ func (w *WAL) AppendLogEntry(payload []byte) (uint64, error) {
 	}
 	w.nextLogIndex++
 	return idx, nil
+}
+
+// AppendHardState appends payload as a new RecordTypeHardState record.
+// Like AppendLogEntry, this makes it appended, not persisted: a caller
+// requiring the durability guarantee ADR-0008 requires before a vote or
+// an AppendEntries acknowledgement may be released (docs/raft.md §5)
+// must call Sync and wait for it to return successfully first. payload
+// is opaque to internal/wal (docs/architecture.md §5) — encoding
+// currentTerm/votedFor into it is the Raft storage adapter's job.
+func (w *WAL) AppendHardState(payload []byte) error {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if w.closed {
+		return ErrClosed
+	}
+	if err := w.appendLocked(RecordTypeHardState, payload); err != nil {
+		return err
+	}
+	w.latestHardState = append([]byte(nil), payload...)
+	return nil
+}
+
+// LatestHardState returns a copy of the payload of the most recently
+// appended RecordTypeHardState record (whether appended earlier this
+// process's lifetime or recovered from disk at Open), or nil if none
+// has ever been written to this durable log.
+func (w *WAL) LatestHardState() []byte {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return append([]byte(nil), w.latestHardState...)
+}
+
+// Truncate durably discards every RecordTypeLogEntry record with
+// index >= fromIndex, so a subsequent AppendLogEntry resumes exactly at
+// fromIndex (docs/raft.md §3 "divergent suffix repair"; ADR-0008;
+// Phase 5's raft.Storage.Truncate contract). It is a no-op if
+// fromIndex >= the index that would be assigned to the next
+// AppendLogEntry call (i.e. there is nothing at or after fromIndex to
+// remove).
+//
+// Crash safety: Truncate first deletes every segment strictly newer
+// than the one holding fromIndex, highest id first (each deletion is
+// its own fsync'd directory operation), and only as its last step
+// shrinks (and fsyncs) the segment that actually holds fromIndex. This
+// ordering is deliberate and load-bearing — see the package-level
+// truncation note below — because it guarantees that after every
+// individual step, and therefore after a crash at any point during the
+// call, the surviving on-disk segments still form a complete, gap-free,
+// checksum-valid prefix of some legitimate prior state of the log
+// (either the pre-Truncate log, the fully-truncated log, or a state in
+// between where only some of the now-superseded tail has been removed
+// so far). Recovery (Open) never sees a gap, and the operation is
+// safely retryable: if Truncate is interrupted, Raft's own divergent-
+// suffix-repair protocol re-issues an equivalent Truncate the next time
+// this node exchanges AppendEntriesRPCs with a legitimate leader, so no
+// operator action is required. Truncate never removes a segment at or
+// before the one holding fromIndex, so it can never discard committed
+// history: docs/raft.md's Storage.Truncate contract requires callers to
+// never ask for a truncation at or below any index already reported via
+// Output.CommittedEntries in the first place.
+//
+// Truncating the segment that holds fromIndex in place (rather than
+// deleting it outright, even when fromIndex is its very first record)
+// deliberately keeps any HardState/Metadata records physically
+// preceding fromIndex's frame in that same segment intact.
+func (w *WAL) Truncate(fromIndex uint64) error {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if w.closed {
+		return ErrClosed
+	}
+	if fromIndex < 1 {
+		return fmt.Errorf("wal: Truncate: fromIndex must be >= 1, got %d", fromIndex)
+	}
+	if fromIndex >= w.nextLogIndex {
+		return nil // nothing at or after fromIndex exists
+	}
+
+	ids, err := storage.ListSegmentIDs(w.dir)
+	if err != nil {
+		return err
+	}
+
+	targetID, targetOffset, found, err := locateLogIndex(w.dir, ids, fromIndex)
+	if err != nil {
+		return err
+	}
+	if !found {
+		return fmt.Errorf("wal: Truncate: log index %d (< nextLogIndex %d) not found in durable segments: %w", fromIndex, w.nextLogIndex, ErrCorrupt)
+	}
+
+	// Delete every segment strictly newer than targetID, highest id
+	// first, so the remaining segment set is always a valid, gap-free
+	// prefix at every intermediate step.
+	currentID := w.current.ID()
+	for i := len(ids) - 1; i >= 0; i-- {
+		id := ids[i]
+		if id <= targetID {
+			break
+		}
+		if id == currentID {
+			if err := w.current.Close(); err != nil {
+				return err
+			}
+		}
+		if err := storage.RemoveSegment(w.dir, id); err != nil {
+			return err
+		}
+	}
+
+	var target *storage.Segment
+	if targetID == currentID {
+		target = w.current
+	} else {
+		seg, err := storage.OpenSegment(w.dir, targetID)
+		if err != nil {
+			return err
+		}
+		target = seg
+	}
+	if err := target.Truncate(targetOffset); err != nil {
+		return err
+	}
+	w.current = target
+	w.nextLogIndex = fromIndex
+	return nil
+}
+
+// locateLogIndex scans segments (ascending id order, as returned by
+// storage.ListSegmentIDs) for the RecordTypeLogEntry record whose Index
+// equals target, returning the id of the segment holding it and the
+// byte offset at which that record's frame begins (i.e. the offset that
+// segment must be truncated to in order to remove that record and
+// everything after it). ok is false if target is not present as a
+// fully-framed record in any scanned segment.
+func locateLogIndex(dir string, ids []uint64, target uint64) (segID uint64, offset int64, ok bool, err error) {
+	for _, id := range ids {
+		seg, err := storage.OpenSegment(dir, id)
+		if err != nil {
+			return 0, 0, false, err
+		}
+		var off int64
+		for {
+			rec, frameLen, rerr := readFrame(seg, off)
+			if rerr == errTornTail || (rerr == nil && rec == nil) {
+				break // clean end of this segment (or an in-progress tail)
+			}
+			if rerr != nil {
+				seg.Close()
+				return 0, 0, false, rerr
+			}
+			if rec.Type == RecordTypeLogEntry && rec.Index == target {
+				seg.Close()
+				return id, off, true, nil
+			}
+			off += int64(frameLen)
+		}
+		seg.Close()
+	}
+	return 0, 0, false, nil
 }
 
 // appendLocked frames and appends one record to the current segment,

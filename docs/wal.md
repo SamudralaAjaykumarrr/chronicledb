@@ -1,6 +1,10 @@
 # Write-Ahead Log (WAL) / Durable Log Architecture
 
-Status: Architecture Foundation. No WAL implementation exists yet.
+Status: Implemented since Phase 1 (`internal/wal`); see §9 for Phase 1's
+implementation-time decisions and §10 for Phase 5's (suffix truncation,
+`HardState` read/write support) — both sections resolve specific gaps
+this document's earlier drafts left open, without changing anything
+else here.
 
 `internal/wal` is the physical persistence mechanism referenced
 throughout this repository as "the durable log." It is built on top of
@@ -218,3 +222,51 @@ above — it is not a second, parallel metadata store.
   on any other classification of corruption, an out-of-order log index,
   an unsupported per-record or per-metadata format version, or a
   non-empty log with no `Metadata` record at all.
+
+## 10. Phase 5 implementation decisions (resolved)
+
+Phase 4 (`docs/raft.md` §9.4) identified the specific gap blocking a
+real `internal/wal`-backed `raft.Storage`: no suffix-truncation
+capability. Phase 5 closes it with two additions, both keeping
+`internal/wal` exactly as ignorant of Raft/transaction semantics as
+before (§1's dependency rule) — the caller (`internal/node.WALStorage`)
+still owns interpreting what the opaque payload bytes mean.
+
+- **`WAL.Truncate(fromIndex)`** durably discards every `LogEntry`
+  record at or after `fromIndex`, so a following `AppendLogEntry`
+  resumes exactly at `fromIndex`. Crash safety comes from a strict,
+  two-phase ordering: first, every segment strictly newer than the one
+  holding `fromIndex` is deleted outright, highest id first, each
+  deletion its own fsync'd directory operation (`storage.RemoveSegment`
+  already fsyncs the directory per `docs/storage.md`); only once that
+  is fully done is the segment actually holding `fromIndex` itself
+  shrunk (`storage.Segment.Truncate`, which already fsyncs the
+  file) — never the other way around. This ordering is load-bearing: a
+  crash at any point leaves the surviving segments as a complete,
+  gap-free, checksum-valid prefix of some legitimate state (either
+  before, after, or partway through the intended truncation) that
+  `Open` can always recover from cleanly, and an interrupted truncation
+  is always safely re-triggerable (Raft's own divergent-suffix-repair
+  protocol re-issues an equivalent `Truncate` call the next time this
+  node exchanges `AppendEntriesRPC`s with a legitimate leader, so no
+  operator action is ever required — see
+  `internal/wal/truncate_test.go::TestTruncateInterruptedMidwayStillOpensToValidPrefix`
+  for the exact scenario this proves). The reverse ordering (shrinking
+  the target segment first, then deleting newer ones) would instead risk
+  a crash leaving an out-of-order log index gap that `Open` correctly,
+  but unhelpfully, refuses to start from — the chosen order never
+  produces that state at any intermediate step.
+- **`WAL.AppendHardState`/`WAL.LatestHardState`** give the previously
+  reserved-but-unused `RecordTypeHardState` record type (§2) a real
+  read path: `Open`'s recovery scan now also tracks the payload of the
+  most recently encountered `HardState` record (§2/§9's "last one seen
+  wins" rule, already true by construction of a forward, in-order scan)
+  and exposes it via `LatestHardState()`; a live `AppendHardState` call
+  updates the same in-memory value immediately. Both record and payload
+  remain fully opaque to `internal/wal` — encoding/decoding
+  `currentTerm`/`votedFor` is `internal/node.WALStorage`'s job (see
+  `docs/raft.md` §10.1).
+- Both additions are exercised by real on-disk tests, including a
+  multi-segment truncation (forcing whole segment-file deletion, not
+  just an in-place shrink) and the interrupted-truncation crash-safety
+  scenario above — see `internal/wal/truncate_test.go`.

@@ -4,15 +4,19 @@ Status: Phase 1 (`internal/wal.Open`, §1 steps 1, 5-8), Phase 2
 (`internal/txn.Manager.recover`, §1 step 11 for `CommitTxn` commands in
 standalone mode), and Phase 3 (§1 step 12, `RequestID` outcome
 restoration via `internal/fsm.Apply` replay) are implemented. Phase 4
-implements step 9's *logic* — `raft.NewCore` reconstructing
+implemented step 9's *logic* — `raft.NewCore` reconstructing
 currentTerm/votedFor/log from a `raft.Storage`, with commitIndex/
-appliedIndex always starting at 0 per §2 below — and proves it against
-`internal/fault`'s simulated (in-memory) durable store
-(`internal/fault/cluster_test.go::TestVoteSafety_SurvivesRestart`,
-`TestRestartSafety_LogAndCommitmentSurvive`); it does not yet wire this
-against the real `internal/wal` (that remains `internal/node`'s job,
-Phase 5 — see [`docs/raft.md`](raft.md) §9.4). Steps 2-4, 10, and 13-14
-remain Raft/snapshot scope and are not implemented yet.
+appliedIndex always starting at 0 per §2 below — against
+`internal/fault`'s simulated (in-memory) durable store. Phase 5 now
+wires the identical logic against the real `internal/wal`-backed
+`raft.Storage` adapter (`internal/node.WALStorage`, see
+[`docs/raft.md`](raft.md) §10.1) and against `internal/fsm`/
+`internal/mvcc` for step 11's replicated-mode leg (§7 below) — see
+`internal/node/node_test.go` for restart/rejoin/full-cluster-restart
+proof and §7's note on the specific commit-boundary-reconstruction
+nuance a full-cluster restart exposes. Steps 2-4, 10, and 13-14 (state-
+machine *snapshots* specifically) remain Phase 6 scope and are not
+implemented yet; step 10 (Raft log compaction) likewise.
 
 This document defines the exact restart/recovery sequence a
 ChronicleDB node follows, so that a durable-but-uncommitted suffix,
@@ -236,3 +240,50 @@ appended it could have acknowledged anything about it — so replay
 never needs to distinguish "committed" from "merely present" the way
 Raft-mode recovery eventually will; it only needs to reproduce the
 same deterministic decision, which `Apply`'s determinism guarantees.
+
+## 7. Replicated-mode recovery (Phase 5)
+
+`internal/node.Node`'s restart path implements this document's §1 for
+replicated mode, exactly per §2's rule (a durable log entry is never
+itself proof of commitment): `internal/node.OpenWALStorage`
+reconstructs `currentTerm`/`votedFor`/the full log from `internal/wal`
+(step 9), `raft.NewCore` starts `commitIndex`/`appliedIndex` at 0 as
+always (§2), and a brand-new `internal/fsm.FSM` (step 11's replicated-
+mode leg) is populated only as real `Output.CommittedEntries` batches
+actually arrive from `Core.Step` — never by eagerly replaying "every
+`LogEntry` record found on disk," which would be exactly the
+log-presence-implies-committed mistake §2 forbids. This is the same
+rule Phase 4 already implemented in the deterministic simulator; Phase
+5 wires the identical logic against a real, restarted process.
+
+A restarted node re-establishes its committed boundary the same two
+ways §2 always specified — by rejoining as a follower and learning it
+from a legitimate current leader's `AppendEntriesRPC`, or by winning an
+election and re-deriving it via the current-term commit rule (§4 of
+[`docs/raft.md`](raft.md)) — and Phase 5 testing surfaced a specific,
+worth-documenting consequence of combining that rule with §9.5's "no
+no-op entry on election" decision: if **every** node in the cluster
+restarts at once, no survivor carries live knowledge of the pre-crash
+`commitIndex`, so the new leader cannot mark a previous term's already-
+durable, already-majority-persisted entry committed (and therefore
+cannot apply it, restoring its `RequestID` outcome or its MVCC effect)
+until a *fresh* proposal in its own new term reaches a majority. See
+[`docs/raft.md`](raft.md) §10.3 for the full mechanism and why this is
+a correct, already-covered-by-the-invariants consequence rather than a
+gap: `LEADER-COMPLETENESS` guarantees the entry is never *lost*: it is
+simply not yet *applied*, and the client's own documented
+retry-by-`RequestID` responsibility
+([`docs/transactions.md`](transactions.md) §7) is precisely what
+supplies that fresh proposal in ordinary operation. A `RequestID` that
+was genuinely never durably recorded before the crash remains correctly
+unknown after recovery, same as always (`RECOVERY-NON-INVENTION`).
+
+`internal/fsm`'s idempotency check (`docs/transactions.md` §6) is what
+keeps this safe even though the durable log can, after such a retry,
+contain the *same* logical command at two different indices (the
+original pre-crash entry, and the client's retried proposal): both get
+applied in commit order into the fresh post-restart `FSM`, and the
+second occurrence of the `RequestID` is recognized as already resolved
+and returned unchanged rather than re-evaluated — see
+`internal/node/node_test.go::TestClusterRestartRecoversFSMAndRequestIDOutcomes`
+and `TestIdempotencyAcrossFailover`.

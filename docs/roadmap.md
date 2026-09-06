@@ -87,13 +87,36 @@ claim past `TRANSACTIONAL ENGINE` — per §Maturity Model below,
 `REPLICATED PROTOTYPE` requires Phase 5 (a real multi-process
 deployment) as well.
 
-### Phase 5 — Real replicated storage + quorum commit + leader failover
+### Phase 5 — Real replicated storage + quorum commit + leader failover — COMPLETE (at this phase's own scope)
 
-`internal/transport` (production) and `internal/node` wire the Phase
-4 Raft core to Phase 1-3's durable log and state machine in a real
-three-node deployment. Tested against
-[`docs/scenario-corpus.md`](scenario-corpus.md) §Raft/Replication
-(RF-1 through RF-15).
+`internal/transport` (production TCP) and `internal/node` wire the
+unchanged Phase 4 `internal/raft.Core` to a real `internal/wal`-backed
+`raft.Storage` adapter (`internal/node.WALStorage`) and `internal/fsm`
+in a real three-node deployment — both in-process against real
+disk/sockets (`internal/node/node_test.go`) and via genuine separate OS
+processes with real persistent data directories and a real `SIGKILL`
+(`cmd/chronicledb-node`). `internal/wal` gained the suffix-truncation
+capability Phase 4 identified as missing (`docs/wal.md` §10), making
+divergent-suffix repair (`docs/raft.md` §3) durable for real, not just
+in the deterministic simulator. The full client mutation path —
+leader-only acceptance, `Propose` → Raft replication → quorum commit →
+`internal/fsm.Apply` → `RequestID` outcome → response — is implemented
+and proven, including the central Phase 5 acceptance scenario
+(`RequestID` retry against a new leader after the original leader
+crashes resolves to the identical, non-duplicated outcome) and the full
+network-partition contract (`docs/replication.md` §5). `ReadIndex`
+(`docs/replication.md` §4, ADR-0010) is also implemented
+(`internal/node.Node.BeginReadIndex`) and proven safe under partition.
+Tested against [`docs/scenario-corpus.md`](scenario-corpus.md)
+§Raft/Replication (RF-1 through RF-15) — see that document's Phase 5
+note for the precise, honest accounting of which of RF-1 through RF-15
+were re-proven against real disk/network/processes versus remain
+correctly simulator-only (RF-2, RF-7, RF-8, RF-14, RF-15 — deliberate
+scope, not a gap; see [`docs/raft.md`](raft.md) §10.2). This phase does
+**not** implement snapshots, log compaction, follower catch-up via
+snapshot, dynamic membership, or a general client wire protocol
+(`internal/protocol`) — those remain out of scope per the phase
+boundary below and, where applicable, Phase 6.
 
 ### Phase 6 — Snapshots + restart recovery + log compaction
 
@@ -182,8 +205,8 @@ interpretation guidance, not exhaustive:
 | `INITIALIZED` | Repository scaffolding exists; no architecture, no implementation. |
 | `ARCHITECTURE FOUNDATION` | All documents/ADRs in [`docs/README.md`](README.md) exist, are internally consistent (see the cross-document consistency review performed for this phase), define every system boundary listed in [`docs/architecture.md`](architecture.md), and no database implementation has begun. |
 | `SINGLE-NODE DURABLE ENGINE` | Phase 1 complete: `docs/scenario-corpus.md` §Local Durability scenarios pass, reproducibly, in CI. `internal/storage`/`internal/wal` implement and test LD-1 through LD-6 (see test files under those packages); a GitHub Actions workflow (`.github/workflows/ci.yml`) runs `go test -race ./...` on every push. |
-| `TRANSACTIONAL ENGINE` | Phases 2-3 complete: §Transactions and §Idempotency (immediate/after-restart) scenarios pass. **This repository's current state.** |
-| `REPLICATED PROTOTYPE` | Phases 4-5 complete: §Raft/Replication scenarios pass in the deterministic simulator and in a real multi-process three-node deployment. |
+| `TRANSACTIONAL ENGINE` | Phases 2-3 complete: §Transactions and §Idempotency (immediate/after-restart) scenarios pass. |
+| `REPLICATED PROTOTYPE` | Phases 4-5 complete: §Raft/Replication scenarios pass in the deterministic simulator and in a real multi-process three-node deployment. **This repository's current state** — see [`docs/scenario-corpus.md`](scenario-corpus.md)'s Phase 5 note for the specific per-scenario accounting: RF-1, RF-3 (log-catch-up leg), RF-4, RF-5, RF-6, RF-9 through RF-13 are proven against real disk/network/processes; RF-2, RF-7, RF-8, RF-14, and RF-15 remain proven only in the deterministic simulator, by deliberate, documented scope decisions ([`docs/raft.md`](raft.md) §10.2), not gaps in the wiring this gate is actually about. |
 | `STRONG DISTRIBUTED V1` | Phases 6-7 complete: §Snapshots scenarios pass; chaos/combined fault schedules run for a meaningful duration without an invariant violation. |
 | `PORTFOLIO READY` | Phase 8-9 substantially complete: constrained SQL works end-to-end on the real engine; observability surfaces exist; auth/TLS gap from [`docs/non-goals.md`](non-goals.md) is resolved or explicitly, prominently documented as a deployment prerequisite. |
 | `OPEN-SOURCE READY` | Phase 11 packaging complete on top of `PORTFOLIO READY`: license, contribution docs, versioned release, no known unresolved correctness gaps. |

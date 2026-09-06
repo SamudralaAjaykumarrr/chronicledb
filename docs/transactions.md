@@ -7,7 +7,16 @@ and §Idempotency (immediate/after-restart cases). See §9 for Phase 2's
 implementation-time decisions and §10 for the Phase 3 decisions that
 supersede one of them (the durable-append condition for a conflicting
 command — §9's last bullet on this point is superseded by §10, not
-still current).
+still current). Phase 5 (`internal/node.Node.Propose`) now implements
+§4.1's anticipated two-step model for real — a leader-side optimistic
+path is not implemented (not required for correctness, per §4.1), but
+the authoritative decision is made by the identical `internal/fsm.Apply`
+this document already specifies, called from `internal/node`'s
+committed-entry application loop exactly as it is from
+`internal/txn.Manager` in standalone mode — see
+[`docs/raft.md`](raft.md) §10 and [`docs/replication.md`](replication.md)
+for the replicated-mode mechanics this document's transaction rules now
+run inside of.
 
 This document defines the transaction lifecycle, idempotency, and
 uncertain-outcome handling. MVCC visibility and conflict rules are
