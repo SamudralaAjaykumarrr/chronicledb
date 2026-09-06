@@ -4,19 +4,17 @@ All notable changes to ChronicleDB are documented here. Format loosely
 follows [Keep a Changelog](https://keepachangelog.com/); versioning
 follows [`docs/versioning.md`](docs/versioning.md) (SemVer, pre-1.0).
 
-No version has been tagged/released yet — see
-[`docs/releasing.md`](docs/releasing.md) for the checklist that gates
-the first release, and [`docs/roadmap.md`](docs/roadmap.md) §Maturity
-Model for why this repository's maturity claim does not advance to
-`OPEN-SOURCE READY` until that first tag actually exists.
-
 ## [Unreleased]
 
-Everything below reflects `main` as of Phase 11 (open-source
-packaging). See [`docs/roadmap.md`](docs/roadmap.md) for the complete,
-itemized phase-by-phase account this summary draws from — this section
-intentionally does not re-litigate exact evidence/test counts already
-recorded there.
+Nothing yet.
+
+## [0.1.0] - 2026-09-06
+
+First tagged release. Everything below reflects `main` as of Phase 11
+(open-source packaging). See [`docs/roadmap.md`](docs/roadmap.md) for
+the complete, itemized phase-by-phase account this summary draws
+from — this section intentionally does not re-litigate exact
+evidence/test counts already recorded there.
 
 ### Added
 

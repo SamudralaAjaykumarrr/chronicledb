@@ -32,7 +32,11 @@ COMMIT="$(git rev-parse --short=12 HEAD 2>/dev/null || echo none)"
 DATE="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 
 MODULE="github.com/SamudralaAjaykumarrr/chronicledb"
-LDFLAGS="-s -w -X ${MODULE}/internal/version.Version=${VERSION} -X ${MODULE}/internal/version.Commit=${COMMIT} -X ${MODULE}/internal/version.Date=${DATE}"
+# docs/versioning.md: the version reported by `-version` has no
+# leading "v" (tag v0.1.0 -> "chronicledb-node 0.1.0 ..."), even
+# though the tag itself, and every archive filename below, keeps it.
+VERSION_NUM="${VERSION#v}"
+LDFLAGS="-s -w -X ${MODULE}/internal/version.Version=${VERSION_NUM} -X ${MODULE}/internal/version.Commit=${COMMIT} -X ${MODULE}/internal/version.Date=${DATE}"
 
 # GOOS/GOARCH pairs actually declared in docs/support-matrix.md as
 # release targets. Keep this list and that document in sync.
@@ -53,7 +57,11 @@ rm -rf "$OUT_DIR"
 mkdir -p "$OUT_DIR"
 
 WORK_DIR=""
-cleanup_work_dir() { [[ -n "$WORK_DIR" ]] && rm -rf "$WORK_DIR"; }
+cleanup_work_dir() {
+	if [[ -n "$WORK_DIR" ]]; then
+		rm -rf "$WORK_DIR"
+	fi
+}
 trap cleanup_work_dir EXIT
 
 for target in "${TARGETS[@]}"; do

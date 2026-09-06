@@ -12,9 +12,10 @@
 // that diagnostic state is never a correctness dependency.
 package version
 
-// Version is the semantic version of this build (docs/versioning.md),
-// e.g. "v0.1.0". "dev" for any build not produced by
-// scripts/build-release.sh or the release workflow.
+// Version is the semantic version of this build, without the tag's
+// leading "v" (docs/versioning.md), e.g. "0.1.0" for tag v0.1.0. "dev"
+// for any build not produced by scripts/build-release.sh or the
+// release workflow.
 var Version = "dev"
 
 // Commit is the short git commit hash this build was made from.
