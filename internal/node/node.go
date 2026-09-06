@@ -5,12 +5,14 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"path/filepath"
 	"sync"
 	"time"
 
 	"github.com/SamudralaAjaykumarrr/chronicledb/internal/fsm"
 	"github.com/SamudralaAjaykumarrr/chronicledb/internal/mvcc"
 	"github.com/SamudralaAjaykumarrr/chronicledb/internal/raft"
+	"github.com/SamudralaAjaykumarrr/chronicledb/internal/snapshot"
 	"github.com/SamudralaAjaykumarrr/chronicledb/internal/transport"
 	"github.com/SamudralaAjaykumarrr/chronicledb/internal/wal"
 )
@@ -31,11 +33,24 @@ type Config struct {
 	// inbound Raft RPCs from peers.
 	ListenAddr string
 
-	// DataDir is this node's durable log directory (internal/wal).
+	// DataDir is this node's durable log directory (internal/wal). This
+	// node's snapshot directory (internal/snapshot.Manager) lives at
+	// DataDir/snapshot, alongside the WAL's own segment files
+	// (docs/storage.md §4).
 	DataDir string
 	// WALOptions configures the underlying WAL (segment size, etc.).
 	// Zero value uses internal/wal's own defaults.
 	WALOptions wal.Options
+
+	// SnapshotThreshold is how many newly applied log entries since the
+	// last snapshot boundary trigger creation of a fresh one
+	// (docs/snapshots.md §3: "log growth since the last snapshot...
+	// exceeding a configured threshold"). Zero means "use the package
+	// default"; a caller that genuinely wants no snapshotting at all
+	// (e.g. some tests exercising ordinary replication in isolation) is
+	// not a supported configuration in V1 — every long-running node
+	// should compact eventually, so there is no separate "off" value.
+	SnapshotThreshold uint64
 
 	// ElectionTimeoutTicks/ElectionTimeoutJitterTicks/HeartbeatTimeoutTicks
 	// are in units of TickInterval (docs/raft.md §2). Zero means "use
@@ -61,6 +76,7 @@ const (
 	defaultElectionTimeoutJitterTicks = 10
 	defaultHeartbeatTimeoutTicks      = 2
 	defaultTickInterval               = 20 * time.Millisecond
+	defaultSnapshotThreshold          = 4096
 )
 
 func (c *Config) setDefaults() {
@@ -75,6 +91,9 @@ func (c *Config) setDefaults() {
 	}
 	if c.TickInterval <= 0 {
 		c.TickInterval = defaultTickInterval
+	}
+	if c.SnapshotThreshold == 0 {
+		c.SnapshotThreshold = defaultSnapshotThreshold
 	}
 }
 
@@ -101,13 +120,14 @@ func (c Config) validate() error {
 // of a Node's diagnostic state (docs/roadmap.md §Observability). It is
 // never used by Node itself for any correctness decision.
 type Status struct {
-	ID           raft.NodeID
-	Role         raft.Role
-	Term         raft.Term
-	Leader       raft.NodeID
-	CommitIndex  raft.Index
-	AppliedIndex uint64
-	LastIndex    raft.Index
+	ID            raft.NodeID
+	Role          raft.Role
+	Term          raft.Term
+	Leader        raft.NodeID
+	CommitIndex   raft.Index
+	AppliedIndex  uint64
+	LastIndex     raft.Index
+	SnapshotIndex raft.Index
 }
 
 type waiter struct {
@@ -169,6 +189,7 @@ type Node struct {
 	core      *raft.Core
 	walog     *wal.WAL
 	storage   *WALStorage
+	snapMgr   *snapshot.Manager
 	fsmachine *fsm.FSM
 	tr        *transport.Transport
 	logger    *log.Logger
@@ -212,14 +233,15 @@ type Node struct {
 }
 
 // Open opens (or creates) the node's durable log under cfg.DataDir,
-// reconstructs Raft persistent state and the deterministic state
-// machine from it (docs/recovery.md), starts the node's transport and
-// event loop, and returns a running Node. The node starts as a
-// Follower (or, for a genuinely fresh single-node-so-far cluster,
-// immediately eligible to become Candidate/Leader on its first election
-// timeout) — it never assumes it is leader and never applies anything
-// beyond what a legitimate commit boundary re-establishes
-// (docs/raft.md §5.1, ADR-0008).
+// restores any snapshot and reconstructs Raft persistent state and the
+// deterministic state machine from it (docs/recovery.md §1, extended by
+// this phase for steps 2-4/10/13-14: snapshot restore and log
+// compaction), starts the node's transport and event loop, and returns
+// a running Node. The node starts as a Follower (or, for a genuinely
+// fresh single-node-so-far cluster, immediately eligible to become
+// Candidate/Leader on its first election timeout) — it never assumes it
+// is leader and never applies anything beyond what a legitimate commit
+// boundary re-establishes (docs/raft.md §5.1, ADR-0008).
 func Open(cfg Config) (*Node, error) {
 	cfg.setDefaults()
 	if err := cfg.validate(); err != nil {
@@ -229,6 +251,51 @@ func Open(cfg Config) (*Node, error) {
 	w, _, err := wal.Open(cfg.DataDir, cfg.WALOptions)
 	if err != nil {
 		return nil, fmt.Errorf("node: opening durable log: %w", err)
+	}
+
+	snapMgr, err := snapshot.NewManager(filepath.Join(cfg.DataDir, "snapshot"))
+	if err != nil {
+		w.Close()
+		return nil, fmt.Errorf("node: opening snapshot directory: %w", err)
+	}
+
+	// Recovery steps 1-4 (docs/recovery.md §1): locate and validate the
+	// newest snapshot the durable metadata pointer references, falling
+	// back to an older one if it fails validation, or to "no snapshot"
+	// (baseIndex 0) if none validate — internal/snapshot.Manager.Load
+	// already implements exactly this search.
+	meta := w.Metadata()
+	snap, haveSnapshot, err := snapMgr.Load(meta.LatestSnapshotIndex)
+	if err != nil {
+		w.Close()
+		return nil, fmt.Errorf("node: loading snapshot: %w", err)
+	}
+
+	var (
+		baseIndex uint64
+		baseTerm  uint64
+		fsmachine *fsm.FSM
+	)
+	if haveSnapshot {
+		baseIndex = snap.Meta.LastIncludedIndex
+		baseTerm = snap.Meta.LastIncludedTerm
+		fsmachine = snap.FSM
+	} else {
+		fsmachine = fsm.New(mvcc.NewStore())
+	}
+
+	// docs/recovery.md §4: "the log does not cover full history from
+	// index 1" (no snapshot) — or, generalized, does not cover full
+	// history from baseIndex+1 (a validated snapshot exists, but the
+	// durable log's own oldest surviving entry starts strictly after
+	// where that snapshot leaves off, e.g. the pointer named a snapshot
+	// that turned out corrupt and Load fell back to an older one whose
+	// boundary the log was already compacted past). Either way there is
+	// no safe local starting point; refuse startup rather than silently
+	// skip the missing range (RECOVERY-NON-INVENTION).
+	if w.FirstIndex() > baseIndex+1 {
+		w.Close()
+		return nil, fmt.Errorf("node: durable log begins at index %d but recoverable state only covers up to %d — gap requires operator intervention (docs/recovery.md §4): %w", w.FirstIndex(), baseIndex, ErrRecoveryGap)
 	}
 
 	st, err := OpenWALStorage(w)
@@ -247,7 +314,12 @@ func Open(cfg Config) (*Node, error) {
 		w.Close()
 		return nil, err
 	}
-	entries, err := st.Entries(1, last+1)
+	// Entries strictly after baseIndex only — st's own mirror may still
+	// hold a few not-yet-physically-compacted leftover entries at or
+	// before baseIndex (harmless; see WALStorage.Compact/InstallSnapshot),
+	// which raft.NewCoreFromSnapshot must never see (it requires its
+	// entries argument to start exactly at baseIndex+1).
+	entries, err := st.Entries(raft.Index(baseIndex)+1, last+1)
 	if err != nil {
 		w.Close()
 		return nil, err
@@ -261,7 +333,7 @@ func Open(cfg Config) (*Node, error) {
 		HeartbeatTimeoutTicks:      cfg.HeartbeatTimeoutTicks,
 		Rand:                       newSysRand(),
 	}
-	core, err := raft.NewCore(rcfg, hs, entries)
+	core, err := raft.NewCoreFromSnapshot(rcfg, hs, raft.Index(baseIndex), raft.Term(baseTerm), entries)
 	if err != nil {
 		w.Close()
 		return nil, fmt.Errorf("node: constructing raft core: %w", err)
@@ -274,19 +346,21 @@ func Open(cfg Config) (*Node, error) {
 	}
 
 	n := &Node{
-		cfg:         cfg,
-		core:        core,
-		walog:       w,
-		storage:     st,
-		fsmachine:   fsm.New(mvcc.NewStore()),
-		tr:          tr,
-		logger:      cfg.Logger,
-		waiters:     make(map[raft.Index]waiter),
-		lastAck:     make(map[raft.NodeID]uint64, len(cfg.Peers)),
-		proposeCh:   make(chan proposeReq),
-		readIndexCh: make(chan readIndexReq),
-		stopCh:      make(chan struct{}),
-		doneCh:      make(chan struct{}),
+		cfg:          cfg,
+		core:         core,
+		walog:        w,
+		storage:      st,
+		snapMgr:      snapMgr,
+		fsmachine:    fsmachine,
+		tr:           tr,
+		logger:       cfg.Logger,
+		appliedIndex: baseIndex,
+		waiters:      make(map[raft.Index]waiter),
+		lastAck:      make(map[raft.NodeID]uint64, len(cfg.Peers)),
+		proposeCh:    make(chan proposeReq),
+		readIndexCh:  make(chan readIndexReq),
+		stopCh:       make(chan struct{}),
+		doneCh:       make(chan struct{}),
 	}
 	n.electionArmed = true
 	n.electionTicksLeft = core.NewElectionTimeout()
@@ -325,13 +399,14 @@ func (n *Node) Status() Status {
 func (n *Node) refreshStatusLocked() {
 	n.statusMu.Lock()
 	n.status = Status{
-		ID:           n.cfg.ID,
-		Role:         n.core.Role(),
-		Term:         n.core.CurrentTerm(),
-		Leader:       n.core.LeaderID(),
-		CommitIndex:  n.core.CommitIndex(),
-		AppliedIndex: n.appliedIndex,
-		LastIndex:    n.core.LastIndex(),
+		ID:            n.cfg.ID,
+		Role:          n.core.Role(),
+		Term:          n.core.CurrentTerm(),
+		Leader:        n.core.LeaderID(),
+		CommitIndex:   n.core.CommitIndex(),
+		AppliedIndex:  n.appliedIndex,
+		LastIndex:     n.core.LastIndex(),
+		SnapshotIndex: n.core.SnapshotIndex(),
 	}
 	n.statusMu.Unlock()
 }
@@ -436,7 +511,11 @@ func (n *Node) run() {
 		case <-ticker.C:
 			n.tick()
 		case msg := <-n.tr.Recv():
-			n.step(raft.Input{Kind: raft.InputMessage, Message: msg})
+			if msg.Type == raft.MsgInstallSnapshotRequest {
+				n.handleInstallSnapshot(msg)
+			} else {
+				n.step(raft.Input{Kind: raft.InputMessage, Message: msg})
+			}
 		case req := <-n.proposeCh:
 			n.handlePropose(req)
 		case req := <-n.readIndexCh:
@@ -595,6 +674,18 @@ func (n *Node) processOutput(out raft.Output) {
 	}
 
 	for _, m := range out.Messages {
+		if m.Type == raft.MsgInstallSnapshotRequest && len(m.SnapshotData) == 0 {
+			// Core never carries snapshot bytes itself (docs/snapshots.md
+			// §7 step 1, raft.MsgInstallSnapshotRequest's doc comment) —
+			// fill them in from this node's own retained snapshot before
+			// the message ever reaches the wire.
+			data, ok, err := n.snapMgr.Bytes(uint64(m.LastIncludedIndex))
+			if err != nil || !ok {
+				n.logf("node %s: cannot serve snapshot %d to %s (ok=%v err=%v); skipping this round, leader will retry", n.cfg.ID, m.LastIncludedIndex, m.To, ok, err)
+				continue
+			}
+			m.SnapshotData = data
+		}
 		n.tr.Send(m)
 	}
 
@@ -656,6 +747,114 @@ func (n *Node) applyCommitted(entries []raft.Entry) {
 			}
 		}
 	}
+	n.maybeSnapshot()
+}
+
+// maybeSnapshot creates a fresh local snapshot and compacts this node's
+// own log against it once durable log growth since the last snapshot
+// boundary reaches cfg.SnapshotThreshold (docs/snapshots.md §3's
+// trigger). It is checked after every batch of newly applied entries —
+// a function of actual applied state, never a wall-clock timer.
+//
+// The write order matches docs/snapshots.md §3/§8 exactly: the snapshot
+// file itself is created and confirmed durable (Manager.Create's own
+// temp-file/fsync/atomic-rename/dir-fsync sequence) before the WAL's
+// restart-discovery pointer is ever updated (AppendMetadataSnapshot),
+// which in turn happens before HardState is re-affirmed into the
+// current segment and old segments are physically deleted
+// (CompactBefore) — "snapshot durable before truncation"
+// (LOG-COMPACTION-SAFETY). raft.Core's own in-memory log is compacted
+// only after every durable step above has already succeeded, so a
+// crash at any point leaves Core's log a superset of what durable state
+// actually needs, never a subset.
+func (n *Node) maybeSnapshot() {
+	snapIdx := uint64(n.core.SnapshotIndex())
+	if n.appliedIndex-snapIdx < n.cfg.SnapshotThreshold {
+		return
+	}
+
+	meta := snapshot.Meta{LastIncludedIndex: n.appliedIndex, LastIncludedTerm: uint64(n.termAtApplied())}
+	if _, err := n.snapMgr.Create(meta, n.fsmachine); err != nil {
+		n.fail(fmt.Errorf("node: creating snapshot at index %d: %w", meta.LastIncludedIndex, err))
+		return
+	}
+	if err := n.walog.AppendMetadataSnapshot(meta.LastIncludedIndex); err != nil {
+		n.fail(fmt.Errorf("node: recording snapshot pointer at index %d: %w", meta.LastIncludedIndex, err))
+		return
+	}
+	n.core.Compact(raft.Index(meta.LastIncludedIndex))
+	n.storage.Compact(raft.Index(meta.LastIncludedIndex))
+	if err := n.storage.Reaffirm(); err != nil {
+		n.fail(fmt.Errorf("node: reaffirming hard state before compaction: %w", err))
+		return
+	}
+	if err := n.walog.CompactBefore(meta.LastIncludedIndex); err != nil {
+		n.fail(fmt.Errorf("node: compacting log before index %d: %w", meta.LastIncludedIndex, err))
+		return
+	}
+	n.logf("node %s: created snapshot at index %d, compacted log", n.cfg.ID, meta.LastIncludedIndex)
+}
+
+// termAtApplied returns the Raft term of the log entry at n.appliedIndex
+// — needed to fill in Meta.LastIncludedTerm when creating a snapshot at
+// the current applied boundary (docs/snapshots.md §2).
+func (n *Node) termAtApplied() raft.Term {
+	idx := raft.Index(n.appliedIndex)
+	if idx == n.core.SnapshotIndex() {
+		return n.core.SnapshotTerm()
+	}
+	e, ok := n.core.EntryAt(idx)
+	if !ok {
+		return 0
+	}
+	return e.Term
+}
+
+// handleInstallSnapshot is the driver-side entry point for a received
+// MsgInstallSnapshotRequest (docs/snapshots.md §7 steps 2-4): it
+// validates and durably installs msg.SnapshotData via
+// internal/snapshot.Manager.Install and, if the snapshot actually
+// advances this node's state, atomically replaces this node's
+// fsmachine/durable log to match — all strictly BEFORE ever handing
+// msg to raft.Core.Step, per that message's documented driver contract
+// (see raft.MsgInstallSnapshotRequest's doc comment). Only after that
+// (successful or not) does msg reach Core.Step, which is what actually
+// determines and sends the MsgInstallSnapshotResponse.
+//
+// Whether this snapshot actually advances anything is decided by
+// mirroring the exact condition under which Core.Step itself will
+// advance c.snapshotIndex (msg.Term >= c.currentTerm and
+// msg.LastIncludedIndex > c.snapshotIndex) — computed here from
+// Core's own read-only accessors, without calling Step — so the driver
+// never durably installs snapshot state that Core.Step would then go on
+// to reject as stale, which would otherwise desynchronize this
+// WALStorage's mirror from Core's own view of the log.
+func (n *Node) handleInstallSnapshot(msg raft.Message) {
+	snap, err := n.snapMgr.Install(msg.SnapshotData)
+	if err != nil {
+		n.tr.Send(raft.Message{
+			Type: raft.MsgInstallSnapshotResponse, From: n.cfg.ID, To: msg.From,
+			Term: n.core.CurrentTerm(), Success: false,
+		})
+		return
+	}
+
+	willAdvance := msg.Term >= n.core.CurrentTerm() && raft.Index(snap.Meta.LastIncludedIndex) > n.core.SnapshotIndex()
+	if willAdvance {
+		if err := n.storage.InstallSnapshot(raft.Index(snap.Meta.LastIncludedIndex)); err != nil {
+			n.fail(fmt.Errorf("node: installing snapshot at index %d: %w", snap.Meta.LastIncludedIndex, err))
+			return
+		}
+		n.fsmachine = snap.FSM
+		n.appliedIndex = snap.Meta.LastIncludedIndex
+		// Any waiter for an index this install just superseded is never
+		// resolved from here (applyCommitted no longer replays it) — it
+		// will time out via its own context/ErrLeadershipLost path if the
+		// caller is still waiting, exactly as any other superseded
+		// proposal is handled.
+	}
+
+	n.step(raft.Input{Kind: raft.InputMessage, Message: msg})
 }
 
 // fail records a fatal local error (e.g. a disk write failure) and

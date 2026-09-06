@@ -41,6 +41,10 @@ type RecoveryReport struct {
 	// TruncatedBytes is the number of bytes removed from the final
 	// segment to repair a torn tail, or 0 if none was found.
 	TruncatedBytes int64
+	// FirstLogIndex is the oldest LogEntry index this WAL can still
+	// serve (Metadata.LatestSnapshotIndex + 1) — 1 for a node that has
+	// never compacted its log (docs/snapshots.md §8, docs/wal.md §7).
+	FirstLogIndex uint64
 }
 
 // WAL is ChronicleDB's durable ordered log. A WAL serializes all Append,
@@ -60,6 +64,16 @@ type WAL struct {
 	// nextLogIndex is the index that will be assigned to the next
 	// RecordTypeLogEntry record appended.
 	nextLogIndex uint64
+
+	// firstLogIndex is the oldest LogEntry index this WAL can still
+	// serve: metadata.LatestSnapshotIndex + 1 (docs/snapshots.md §8). A
+	// fresh WAL with no snapshot yet has firstLogIndex == 1. Log entries
+	// that may still be physically present at or before this boundary
+	// (a compaction that ran partway, or hasn't run yet since the
+	// pointer was last updated — see CompactBefore's doc comment) are
+	// logically superseded and are skipped by Replay/Entries callers
+	// exactly as if they were already physically gone.
+	firstLogIndex uint64
 
 	// latestHardState is the payload of the most recently appended (or,
 	// at Open, most recently replayed) RecordTypeHardState record, or
@@ -115,15 +129,19 @@ func Open(dir string, opts Options) (*WAL, *RecoveryReport, error) {
 			return nil, nil, err
 		}
 		w.metadata = meta
+		w.firstLogIndex = 1
 		report.SegmentsScanned = 1
+		report.FirstLogIndex = 1
 		return w, report, nil
 	}
 
 	var (
-		lastLogIndex uint64
-		haveMetadata bool
-		meta         Metadata
-		latestHS     []byte
+		lastLogIndex      uint64
+		haveMetadata      bool
+		meta              Metadata
+		latestHS          []byte
+		seenAnyLogEntry   bool
+		firstLogIndexSeen uint64
 	)
 
 	for i, id := range ids {
@@ -160,7 +178,22 @@ func Open(dir string, opts Options) (*WAL, *RecoveryReport, error) {
 
 			switch rec.Type {
 			case RecordTypeLogEntry:
-				if rec.Index != lastLogIndex+1 {
+				if !seenAnyLogEntry {
+					// The very first LogEntry record physically
+					// encountered may legitimately start at any index
+					// (a not-yet-compacted or partially-compacted log
+					// still holds superseded low-index entries; see
+					// CompactBefore) — its absolute starting value is
+					// validated once, after this scan, against the
+					// winning Metadata record's LatestSnapshotIndex
+					// (which may not be known yet at this point in the
+					// scan). Every record after this one still must be
+					// perfectly contiguous, exactly as before: physical
+					// append order never has gaps regardless of
+					// compaction, only a possibly-nonzero starting point.
+					seenAnyLogEntry = true
+					firstLogIndexSeen = rec.Index
+				} else if rec.Index != lastLogIndex+1 {
 					seg.Close()
 					return nil, nil, fmt.Errorf("wal: out-of-order log index: got %d, want %d: %w", rec.Index, lastLogIndex+1, ErrCorrupt)
 				}
@@ -201,10 +234,33 @@ func Open(dir string, opts Options) (*WAL, *RecoveryReport, error) {
 		return nil, nil, fmt.Errorf("wal: %w: metadata format version %d, expected %d", ErrUnsupportedVersion, meta.FormatVersion, FormatVersion)
 	}
 
+	// The winning Metadata record (last one seen, per docs/wal.md §9) is
+	// only fully known now that the whole scan has completed — validate
+	// the first physically-encountered LogEntry's absolute index against
+	// it (see the scan loop's comment above): it must never start
+	// *strictly after* the snapshot boundary (that would mean genuine
+	// missing history the snapshot does not cover — corruption), though
+	// it may legitimately start at or before it (superseded, not-yet- or
+	// only-partially-physically-compacted leftover entries, safe to
+	// ignore — Replay/Entries already filter these by index).
+	if seenAnyLogEntry && firstLogIndexSeen > meta.LatestSnapshotIndex+1 {
+		w.current.Close()
+		return nil, nil, fmt.Errorf("wal: durable log starts at index %d but snapshot pointer only covers up to %d (gap): %w", firstLogIndexSeen, meta.LatestSnapshotIndex, ErrCorrupt)
+	}
+	if !seenAnyLogEntry {
+		// No LogEntry record survives at all — either a genuinely fresh
+		// log (LatestSnapshotIndex == 0) or one fully compacted up to and
+		// including its newest entry with nothing appended since; either
+		// way, "the last known index" is exactly the snapshot boundary.
+		lastLogIndex = meta.LatestSnapshotIndex
+	}
+
 	w.metadata = meta
 	w.nextLogIndex = lastLogIndex + 1
+	w.firstLogIndex = meta.LatestSnapshotIndex + 1
 	w.latestHardState = latestHS
 	report.LastLogIndex = lastLogIndex
+	report.FirstLogIndex = w.firstLogIndex
 	return w, report, nil
 }
 
@@ -221,6 +277,20 @@ func (w *WAL) NextIndex() uint64 {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	return w.nextLogIndex
+}
+
+// FirstIndex returns the oldest LogEntry index this WAL can still serve
+// (docs/snapshots.md §8): 1 for a node that has never compacted its
+// log, or metadata.LatestSnapshotIndex+1 once it has. Replay/Entries
+// callers never need to consult this directly — they already only ever
+// see indices at or after it — but recovery (internal/node.Open) uses
+// it to detect the one case that must refuse startup rather than
+// silently starting from an incomplete history: FirstIndex() > 1 with
+// no valid snapshot available to cover the gap (docs/recovery.md §4).
+func (w *WAL) FirstIndex() uint64 {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.firstLogIndex
 }
 
 // AppendLogEntry appends payload as a new RecordTypeLogEntry record and
@@ -366,6 +436,118 @@ func (w *WAL) Truncate(fromIndex uint64) error {
 	}
 	w.current = target
 	w.nextLogIndex = fromIndex
+	return nil
+}
+
+// AppendMetadataSnapshot durably records that a valid, fully-persisted
+// state-machine snapshot now covers history up to and including
+// uptoIndex (docs/wal.md §8, docs/snapshots.md §3's restart-discovery
+// pointer): it appends a fresh Metadata record (last-one-wins,
+// docs/wal.md §9) — with the same NodeID/FormatVersion, an updated
+// LatestSnapshotIndex — to the WAL's *current* segment, and syncs it.
+//
+// This must be called only after the snapshot file itself is already
+// fully durable (fsynced and atomically renamed to its final name), and
+// must be called before CompactBefore(uptoIndex) — ADR-0011's "snapshot
+// durable before truncation" ordering requires the pointer recovery
+// will trust to itself be durable before any segment it depends on is
+// ever deleted. Writing this record to the *current* (never-deleted-by-
+// compaction) segment is also what guarantees a compaction immediately
+// following this call can never delete the only copy of it — see
+// CompactBefore's doc comment for why this same reasoning additionally
+// requires re-affirming HardState (internal/node.WALStorage.Reaffirm)
+// before compacting.
+//
+// It also advances firstLogIndex/FirstIndex() to uptoIndex+1 in this
+// live process, not only on a future restart's re-derivation from
+// Metadata (Open's own w.firstLogIndex assignment) — a live caller that
+// needs "the oldest index this WAL still logically serves" (e.g.
+// internal/node.WALStorage discarding its own superseded log entries
+// immediately after installing a peer's snapshot, without an
+// intervening restart) must see this boundary move the moment it is
+// durably adopted, exactly as a restart would compute it.
+func (w *WAL) AppendMetadataSnapshot(uptoIndex uint64) error {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if w.closed {
+		return ErrClosed
+	}
+	if uptoIndex < w.metadata.LatestSnapshotIndex {
+		return fmt.Errorf("wal: AppendMetadataSnapshot: %d is behind current snapshot pointer %d", uptoIndex, w.metadata.LatestSnapshotIndex)
+	}
+	meta := w.metadata
+	meta.LatestSnapshotIndex = uptoIndex
+	if err := w.appendLocked(RecordTypeMetadata, encodeMetadata(meta)); err != nil {
+		return err
+	}
+	if err := w.current.Sync(); err != nil {
+		return err
+	}
+	w.metadata = meta
+	w.firstLogIndex = uptoIndex + 1
+	return nil
+}
+
+// CompactBefore durably deletes every whole WAL segment that holds only
+// LogEntry records at or before uptoIndex (docs/wal.md §7,
+// docs/snapshots.md §8) — the physical half of log compaction; the
+// logical half (recovery/replay no longer trusting indices at or before
+// the boundary) is what AppendMetadataSnapshot + the two-pass validation
+// in Open already establish, independent of whether this method has run
+// yet or how far it got.
+//
+// Eligibility is determined from segment ids alone (docs/storage.md §3:
+// a segment's id is the first logical index it holds — the highest
+// index segment ids[i] can possibly contain is therefore ids[i+1]-1),
+// never by re-reading a segment's contents. The current (last,
+// open-for-writing) segment is never deleted, which is exactly why
+// AppendMetadataSnapshot (and internal/node.WALStorage.Reaffirm for
+// HardState) must always target the current segment immediately before
+// this is called — the invariant "whatever this compaction is about to
+// leave behind still contains everything a future Open needs" holds
+// only because of that ordering, not because of anything CompactBefore
+// itself checks.
+//
+// CompactBefore is safe to call repeatedly (idempotent: a no-op once
+// nothing more is eligible) and safe to interrupt at any point — each
+// segment deletion is its own fsync'd directory operation
+// (storage.RemoveSegment), so a crash mid-loop simply leaves some, not
+// all, eligible segments removed. This is deliberately the same
+// "extra history retained, nothing required ever lost" safe default
+// docs/snapshots.md's compaction-failure handling calls for: a partially
+// completed compaction is never a correctness problem, only a
+// (temporary, self-healing on the next successful call) disk-space one.
+func (w *WAL) CompactBefore(uptoIndex uint64) error {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if w.closed {
+		return ErrClosed
+	}
+	ids, err := storage.ListSegmentIDs(w.dir)
+	if err != nil {
+		return err
+	}
+	currentID := w.current.ID()
+	for i, id := range ids {
+		if id == currentID {
+			break
+		}
+		var maxIndexInSegment uint64
+		if i+1 < len(ids) {
+			maxIndexInSegment = ids[i+1] - 1
+		} else {
+			// Unreachable in practice (the current segment is always
+			// last), but treat conservatively as "unknown upper bound,"
+			// never delete it, rather than guessing.
+			break
+		}
+		if maxIndexInSegment > uptoIndex {
+			break // this segment (and every later one) is still needed
+		}
+		if err := storage.RemoveSegment(w.dir, id); err != nil {
+			return err
+		}
+	}
 	return nil
 }
 

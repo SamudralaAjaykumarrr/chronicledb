@@ -125,6 +125,55 @@ func (s *Store) CheckConflicts(startSeq uint64, mutations []Mutation) (key strin
 	return "", 0, false
 }
 
+// KeyChain pairs a key with its full version chain, as returned by
+// Export (docs/snapshots.md §2's "committed MVCC data" content). It is
+// the unit of transfer between a live Store and a serialized state-
+// machine snapshot.
+type KeyChain struct {
+	Key      string
+	Versions []Version
+}
+
+// Export returns a deep copy of every key's version chain, sorted
+// ascending by Key so a caller serializing this into a deterministic
+// byte stream (internal/fsm's state-machine snapshot encoding) never
+// depends on Go's unordered map iteration (docs/invariants.md
+// DETERMINISM BOUNDARY's spirit — snapshot bytes are not on Apply's own
+// determinism-critical path, but reproducible encoding is required for
+// two independently-constructed FSMs to produce byte-identical
+// snapshots, a useful and tested property). Each chain's Versions slice
+// remains sorted ascending by CommitSeq, exactly as Store maintains it
+// internally.
+func (s *Store) Export() []KeyChain {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	out := make([]KeyChain, 0, len(s.chains))
+	for k, v := range s.chains {
+		out = append(out, KeyChain{Key: k, Versions: append([]Version(nil), v...)})
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].Key < out[j].Key })
+	return out
+}
+
+// RestoreStore reconstructs a Store directly from previously-exported
+// key chains (docs/recovery.md snapshot restore path), bypassing
+// ApplyCommit's monotonicity/atomicity machinery entirely: a snapshot
+// restore is not a sequence of individual commits, it is the
+// installation of already-decided, already-checksum-verified state
+// (docs/snapshots.md §5's validation is the caller's responsibility,
+// performed before this is ever called — RestoreStore itself does not
+// re-validate CommitSeq ordering within a chain, trusting the caller's
+// own checksum-verified decode). Each chain's Versions must already be
+// sorted ascending by CommitSeq, matching what Export produces —
+// Visible's binary search depends on this invariant.
+func RestoreStore(chains []KeyChain) *Store {
+	m := make(map[string][]Version, len(chains))
+	for _, kc := range chains {
+		m[kc.Key] = kc.Versions
+	}
+	return &Store{chains: m}
+}
+
 // ApplyCommit atomically appends one new version per mutation, all
 // sharing commitSeq, to their respective version chains
 // (docs/mvcc.md §5, ATOMICITY invariant): no reader taking the store's

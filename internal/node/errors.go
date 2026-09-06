@@ -49,4 +49,15 @@ var (
 	// Node's event loop has shut down (Stop called, or a fatal local
 	// error occurred), and to any request still pending at that moment.
 	ErrNodeStopped = errors.New("node: node is stopped")
+
+	// ErrRecoveryGap is returned by Open when no locally available,
+	// validated state (a validated snapshot, or none at all) covers the
+	// durable log's own oldest surviving entry — docs/recovery.md §4's
+	// "the log does not cover full history from index 1" case,
+	// generalized to a possibly-nonzero snapshot boundary. This is one
+	// of the cases V1 never attempts to auto-repair: the documented
+	// operator procedure is to discard this node's local data directory
+	// and rejoin it to the cluster as a brand-new node (full snapshot
+	// install + log catch-up, docs/recovery.md §4).
+	ErrRecoveryGap = errors.New("node: local durable state has a gap; operator intervention required")
 )

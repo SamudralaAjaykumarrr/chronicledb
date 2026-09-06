@@ -59,8 +59,8 @@ mismatched-payload `RequestID` reuse and a `GetRequestOutcome` query,
 both exercised by real disk-backed recovery, not just in-memory
 shortcuts. Tested and passing against
 [`docs/scenario-corpus.md`](scenario-corpus.md) §Idempotency
-(ID-1 through ID-7; the snapshot+compaction leg of ID-4 remains Phase 6
-scope), including deterministic-replay tests (two independently
+(ID-1 through ID-7; the snapshot+compaction leg of ID-4 is proven as of
+Phase 6), including deterministic-replay tests (two independently
 constructed `internal/fsm.FSM` instances applying the identical
 command history reach byte-identical outcomes) and restart-recovery
 tests proving a conflicted `RequestID`'s `ABORTED` outcome — not just a
@@ -118,13 +118,31 @@ snapshot, dynamic membership, or a general client wire protocol
 (`internal/protocol`) — those remain out of scope per the phase
 boundary below and, where applicable, Phase 6.
 
-### Phase 6 — Snapshots + restart recovery + log compaction
+### Phase 6 — Snapshots + restart recovery + log compaction — COMPLETE (at this phase's own scope)
 
 `internal/snapshot` is implemented per
-[`docs/snapshots.md`](snapshots.md); full recovery
-([`docs/recovery.md`](recovery.md)) including snapshot-based follower
-catch-up and log truncation is proven. Tested against
-[`docs/scenario-corpus.md`](scenario-corpus.md) §Snapshots.
+[`docs/snapshots.md`](snapshots.md): checksum/version-framed encoding
+of `internal/fsm` state, crash-safe temp-file/fsync/atomic-rename
+creation and load-with-fallback-on-corruption. `internal/node` wires
+the driver-side lifecycle — restart restore (§Open, extending
+[`docs/recovery.md`](recovery.md) §7 to start `commitIndex`/
+`appliedIndex` at a restored snapshot's boundary instead of always 0),
+live creation/compaction once durable log growth crosses
+`Config.SnapshotThreshold`, and the `MsgInstallSnapshotRequest`/
+`MsgInstallSnapshotResponse` wire protocol `internal/raft.Core` now
+implements (a new `Core.Compact` for a node's own local compaction,
+distinct from installing a peer's snapshot). `internal/wal` gained the
+durable snapshot pointer and physical segment compaction
+(`AppendMetadataSnapshot`/`CompactBefore`/`FirstIndex`, see
+[`docs/wal.md`](wal.md) §11). Full recovery including snapshot-based
+follower catch-up and log truncation is proven against
+[`docs/scenario-corpus.md`](scenario-corpus.md) §Snapshots (SN-1
+through SN-6) — see `internal/raft/snapshot_test.go`,
+`internal/wal/snapshot_test.go`, and
+`internal/node/node_test.go::TestSN1_RestartRestoresFromSnapshotAndCompactsLog`/
+`TestSN5_FollowerCatchesUpViaSnapshotAfterLeaderCompaction`. Per
+§Maturity Model below, `STRONG DISTRIBUTED V1` additionally requires
+Phase 7 (chaos/combined fault schedules), not yet attempted.
 
 ### Phase 7 — Network partitions + crash lab + fault injection / chaos
 

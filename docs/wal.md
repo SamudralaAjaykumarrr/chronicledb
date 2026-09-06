@@ -1,8 +1,9 @@
 # Write-Ahead Log (WAL) / Durable Log Architecture
 
 Status: Implemented since Phase 1 (`internal/wal`); see §9 for Phase 1's
-implementation-time decisions and §10 for Phase 5's (suffix truncation,
-`HardState` read/write support) — both sections resolve specific gaps
+implementation-time decisions, §10 for Phase 5's (suffix truncation,
+`HardState` read/write support), and §11 for Phase 6's (live snapshot-
+pointer/log-compaction support) — these sections resolve specific gaps
 this document's earlier drafts left open, without changing anything
 else here.
 
@@ -270,3 +271,51 @@ still owns interpreting what the opaque payload bytes mean.
   multi-segment truncation (forcing whole segment-file deletion, not
   just an in-place shrink) and the interrupted-truncation crash-safety
   scenario above — see `internal/wal/truncate_test.go`.
+
+## 11. Phase 6 implementation decisions (resolved)
+
+Phase 6 closes §7/§8's remaining gap — a live compaction mechanism —
+with three additions, all still keeping `internal/wal` ignorant of
+Raft/snapshot semantics beyond the opaque `Metadata.LatestSnapshotIndex`
+pointer it already tracked since Phase 1 (`internal/snapshot` and
+`internal/node` own everything about what a snapshot actually contains):
+
+- **`WAL.AppendMetadataSnapshot(uptoIndex)`** durably records that a
+  fully-persisted, validated snapshot now covers history up to and
+  including `uptoIndex`: a fresh `Metadata` record (last-one-wins, §9)
+  is appended to the *current* segment and synced. This also advances
+  `FirstIndex()` immediately, live in this process — not only on a
+  future restart's re-derivation from the record — because a caller
+  installing a peer's snapshot mid-process (`internal/node.WALStorage.
+  InstallSnapshot`) needs "the oldest index this WAL still logically
+  serves" to move the instant it is durably adopted.
+- **`WAL.CompactBefore(uptoIndex)`** deletes every whole segment file
+  holding only `LogEntry` records at or before `uptoIndex` — the
+  physical half of compaction, always called only after
+  `AppendMetadataSnapshot` has already durably recorded the boundary it
+  relies on (§7's "snapshot durable before truncation," which is what
+  makes `LOG-COMPACTION-SAFETY` hold). Eligibility is decided purely
+  from segment ids (a segment's id is the first logical index it holds,
+  per `docs/storage.md` §3), never by re-reading contents; the current
+  segment is never deleted. Safe to call repeatedly and safe to
+  interrupt at any point — each segment deletion is its own fsync'd
+  directory operation, so a crash mid-loop leaves extra, harmless,
+  already-superseded history behind rather than losing anything a
+  future `Open` needs.
+- **`WAL.FirstIndex()`** exposes the oldest `LogEntry` index this WAL
+  can still serve (`Metadata.LatestSnapshotIndex + 1`; 1 for a node
+  that has never compacted) so a caller (`internal/node.Open`) can
+  detect the one case recovery must refuse rather than silently
+  under-replay: the durable log's own oldest physically-surviving entry
+  starting strictly after where the (possibly snapshot-covered)
+  recoverable boundary says it should (`docs/recovery.md` §4). `Open`'s
+  own two-pass validation independently enforces the same rule at
+  startup: a physically-scanned log's first `LogEntry` record is
+  allowed to start at or before `Metadata.LatestSnapshotIndex + 1`
+  (harmless not-yet-fully-compacted leftovers), never strictly after it
+  (a genuine gap, refused as `ErrCorrupt`).
+- All three are exercised by real on-disk tests, including multi-
+  segment compaction, a live-process `FirstIndex()` advance with no
+  intervening restart, and a restart immediately after compaction
+  correctly replaying only the entries actually still needed — see
+  `internal/wal/snapshot_test.go`.

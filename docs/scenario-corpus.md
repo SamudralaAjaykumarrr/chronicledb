@@ -2,12 +2,15 @@
 
 Status: LD-1 through LD-6 (Phase 1, `internal/wal`), TX-1 through TX-8
 (Phase 2, `internal/mvcc` + `internal/txn`), ID-1 through ID-7
-immediate/after-restart (Phase 3), a Phase-4 subset of RF-1 through
-RF-15 (`internal/raft` + `internal/fault`'s deterministic simulator),
-and a Phase-5 subset of the same RF-1 through RF-15 (`internal/node` +
-`internal/transport` against real disk/network, and
-`cmd/chronicledb-node` against genuine separate OS processes) — see
-each scenario's **Status** line below for exactly which — have passing,
+immediate/after-restart and, as of Phase 6, ID-4's after-snapshot leg
+(Phase 3/6), a Phase-4 subset of RF-1 through RF-15 (`internal/raft` +
+`internal/fault`'s deterministic simulator), a Phase-5 subset of the
+same RF-1 through RF-15 (`internal/node` + `internal/transport` against
+real disk/network, and `cmd/chronicledb-node` against genuine separate
+OS processes), and SN-1 through SN-6 plus RF-3's snapshot-catch-up leg
+(Phase 6, `internal/snapshot` + `internal/node` + `internal/wal` +
+`internal/raft`) — see each scenario's **Status** line below for
+exactly which — have passing,
 reproducible tests. **Every other scenario in this document does not
 currently pass, because it is not implemented yet.** This document
 specifies the deterministic scenarios future test suites (see
@@ -274,7 +277,7 @@ executable.
   cover all three outcome-retention paths.
 - **Invariants**: `IDEMPOTENCY`, `REQUEST OUTCOME STABILITY`.
 - **Phase**: 3 (immediate/after-restart), 6 (after snapshot+compaction).
-- **Status**: immediate/after-restart passing (see ID-1/ID-2 above); after-snapshot+compaction remains Phase 6 scope, not implemented (no `internal/snapshot` exists yet).
+- **Status**: immediate/after-restart passing (see ID-1/ID-2 above); after-snapshot+compaction now also passing (Phase 6) — `internal/fsm/snapshot_test.go::TestEncodeStateDecodeStateRoundTrip` proves a snapshot's `EncodeState`/`DecodeState` round-trips both a `COMMITTED` and an `ABORTED` `RequestID` outcome (including the fingerprint needed to detect a later mismatched-payload reuse) exactly as plain log replay does, and `internal/node/node_test.go::TestSN1_RestartRestoresFromSnapshotAndCompactsLog` proves the same end-to-end against a real disk-backed node restarting from a snapshot with no log replay involved at all.
 
 ### ID-5: New `RequestID` with same mutations
 
@@ -376,8 +379,10 @@ executable.
   restart —
   `internal/node/node_test.go::TestFollowerRestartCatchesUpViaLogReplication`,
   `cmd/chronicledb-node/main_test.go::TestRealProcesses_ElectionReplicationCrashRestartFailover`
-  (real SIGKILL + process restart). The snapshot-catch-up leg remains
-  Phase 6 (no `internal/snapshot` exists yet).
+  (real SIGKILL + process restart). The snapshot-catch-up leg is now
+  also passing (Phase 6) —
+  `internal/node/node_test.go::TestSN5_FollowerCatchesUpViaSnapshotAfterLeaderCompaction`
+  (see SN-5 above).
 
 ### RF-4: Leader crash before quorum
 
@@ -584,6 +589,7 @@ executable.
   only entries after `I`.
 - **Invariants**: `SNAPSHOT SAFETY`.
 - **Phase**: 6.
+- **Status**: passing — `internal/node/node_test.go::TestSN1_RestartRestoresFromSnapshotAndCompactsLog` proves both halves against a real disk-backed node: state as of `I` is restored from the snapshot alone (no replay needed), and the reopened WAL's own `FirstIndex()` confirms only entries after `I` remain durable at all.
 
 ### SN-2: Crash during snapshot creation
 
@@ -592,6 +598,7 @@ executable.
   snapshot (if any) or full log replay used instead.
 - **Invariants**: `SNAPSHOT SAFETY`.
 - **Phase**: 6.
+- **Status**: passing — `internal/snapshot/manager_test.go::TestManagerCleansStaleTempFilesOnOpen` (stale temp file never considered a candidate, cleaned up on next open) and `TestManagerCreateLeavesNoTempFileOnSuccess`/`TestManagerRetainsOnlyLatestAfterNewCreate` (a prior valid snapshot is never disturbed until a new one is itself fully durable).
 
 ### SN-3: Interrupted snapshot installation
 
@@ -601,6 +608,7 @@ executable.
   reconnection; no partial state ever considered installed.
 - **Invariants**: `SNAPSHOT SAFETY`.
 - **Phase**: 6.
+- **Status**: passing — `internal/snapshot/manager_test.go::TestManagerInstallValidatesBeforeWriting` (a payload that fails validation touches nothing on disk at all) and `TestManagerInstallSucceedsAndIsLoadable` (a successful install is immediately, durably loadable); `internal/node.Node.handleInstallSnapshot` calls `Manager.Install` before ever touching `raft.Core` or durable log state, so a kill at any point before `Install` returns leaves nothing installed to resume from but the prior state.
 
 ### SN-4: Corrupted snapshot
 
@@ -609,6 +617,7 @@ executable.
   or operator intervention per [`docs/recovery.md`](recovery.md) §4.
 - **Invariants**: `SNAPSHOT SAFETY`, `RECOVERY NON-INVENTION`.
 - **Phase**: 6.
+- **Status**: passing — `internal/snapshot/manager_test.go::TestManagerLoadFallsBackOnCorruption` (older valid snapshot used instead) and `internal/wal/snapshot_test.go::TestOpenRefusesWhenLogGapExceedsSnapshotPointer` (the operator-intervention leg: no valid snapshot covers the durable log's own gap, so `internal/node.Open` refuses to start — see `ErrRecoveryGap`).
 
 ### SN-5: Follower catch-up via snapshot
 
@@ -618,6 +627,7 @@ executable.
   follower installs it and resumes normal replication.
 - **Invariants**: `SNAPSHOT SAFETY`, `LOG COMPACTION SAFETY`.
 - **Phase**: 6.
+- **Status**: passing — `internal/raft/snapshot_test.go::TestAppendEntriesMessageSendsInstallSnapshotWhenPeerBehindSnapshot` (leader-side trigger) and `internal/node/node_test.go::TestSN5_FollowerCatchesUpViaSnapshotAfterLeaderCompaction` (end-to-end against real disk/network: an isolated follower, healed after the leader has compacted past what it needs, is proven caught up via an actual installed snapshot — its own `FirstIndex()` boundary moves to match, which only a genuine install ever does — not merely eventual convergence by some other means).
 
 ### SN-6: Safe log truncation after snapshot
 
@@ -628,6 +638,7 @@ executable.
   still succeeds using the snapshot.
 - **Invariants**: `LOG COMPACTION SAFETY`.
 - **Phase**: 6.
+- **Status**: passing — `internal/wal/snapshot_test.go::TestCompactBeforeDeletesOnlySegmentsFullyAtOrBeforeBoundary`, `TestCompactBeforeNeverDeletesCurrentSegment`, and `TestReopenAfterSnapshotAndCompactionReplaysOnlyRemainingEntries` (a real reopen immediately after compaction correctly replays only what remains, using the snapshot for everything before it).
 
 ---
 
@@ -645,15 +656,17 @@ executable.
 
 Scenarios with an explicit **Status: passing** line above currently
 pass at the stated scope — LD-1 through LD-6, TX-1 through TX-8, ID-1
-through ID-7 (immediate/after-restart), the Phase-4 simulator-only
-subset of RF-1 through RF-15, and the Phase-5 real-disk/real-network/
-real-process subset of RF-1 through RF-15 listed in the Phase 5 row
-above. Every other scenario in this document is not claimed to pass. A
-passing Phase-4 (simulator-only) RF-\* status is not by itself a claim
-that scenario's real multi-process (Phase 5) leg passes — check the
-specific scenario's own Status line, since as of Phase 5 several (but
-not all) now carry both. This table exists to make future maturity
-claims falsifiable: a claim that ChronicleDB has reached a given
-roadmap phase must be checked against whether the scenarios listed for
-that phase (and all prior phases), at the scope that phase actually
-requires, have passing, reproducible tests.
+through ID-7 (immediate/after-restart and, as of Phase 6, ID-4's
+after-snapshot+compaction leg), the Phase-4 simulator-only subset of
+RF-1 through RF-15, the Phase-5 real-disk/real-network/real-process
+subset of RF-1 through RF-15 listed in the Phase 5 row above, and
+SN-1 through SN-6 plus RF-3's snapshot-catch-up leg (Phase 6). Every
+other scenario in this document is not claimed to pass. A passing
+Phase-4 (simulator-only) RF-\* status is not by itself a claim that
+scenario's real multi-process (Phase 5) leg passes — check the specific
+scenario's own Status line, since as of Phase 5 several (but not all)
+now carry both. This table exists to make future maturity claims
+falsifiable: a claim that ChronicleDB has reached a given roadmap phase
+must be checked against whether the scenarios listed for that phase
+(and all prior phases), at the scope that phase actually requires, have
+passing, reproducible tests.

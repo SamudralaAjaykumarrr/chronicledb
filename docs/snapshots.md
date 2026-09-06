@@ -1,7 +1,15 @@
 # Snapshots and Log Compaction
 
-Status: Architecture Foundation. No snapshot implementation exists
-yet.
+Status: Implemented (Phase 6). `internal/snapshot` implements the
+encode/checksum/version framing and crash-safe create/load/install
+sequence described below (§2-§7); `internal/node` implements the
+driver-side lifecycle (restart restore, live creation/compaction
+triggering, and the `MsgInstallSnapshotRequest`/`Response` wire
+protocol against `internal/raft`) and `internal/wal` implements the
+durable snapshot pointer and log compaction (§8; see
+[`docs/wal.md`](wal.md) §11). Tested against
+[`docs/scenario-corpus.md`](scenario-corpus.md) §Snapshots (SN-1
+through SN-6).
 
 Snapshots are correctness artifacts, not merely a disk-space
 optimization. This document defines what a snapshot contains, how it

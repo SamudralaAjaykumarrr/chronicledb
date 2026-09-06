@@ -38,8 +38,8 @@ design.
 Phase 3 — the deterministic state-machine boundary (`internal/fsm`)
 and `RequestID` idempotency — is also implemented and tested against
 `docs/scenario-corpus.md` §Idempotency (ID-1 through ID-7; the
-snapshot+compaction leg of ID-4 remains Phase 6 scope). `internal/fsm`
-is now the sole `Apply(index, command) -> outcome` boundary for
+snapshot+compaction leg of ID-4 is proven as of Phase 6, see below).
+`internal/fsm` is now the sole `Apply(index, command) -> outcome` boundary for
 transaction commits, proven deterministic by feeding an identical
 ordered command history into two independently constructed `FSM`
 instances and asserting byte-identical outcomes. The `RequestID`
@@ -96,6 +96,30 @@ deliberate scope decision (RF-2, RF-7, RF-8, RF-14, RF-15).
 Per [`docs/roadmap.md`](docs/roadmap.md) §Maturity Model,
 `REPLICATED PROTOTYPE` is Phases 4-5 together; both are now complete
 and evidenced.
+
+Phase 6 — snapshots, snapshot-based restart recovery, and Raft log
+compaction (`internal/snapshot`, extending `internal/node`/
+`internal/wal`/`internal/raft`) — is now also implemented: a node
+restarting restores its deterministic state (MVCC data, tombstones,
+`RequestID` outcomes) from the newest validated snapshot instead of
+always replaying its full durable log from index 1, falling back to an
+older snapshot or empty state exactly as a corrupted or missing
+snapshot requires; a node creates a fresh snapshot and compacts its own
+log once durable growth crosses a configured threshold; and a follower
+too far behind for ordinary log replication is caught up via a genuine
+`MsgInstallSnapshotRequest`/`Response` round trip
+(`internal/raft.Core`'s new snapshot-boundary-aware log and
+`Core.Compact`) rather than being stuck. Tested against
+[`docs/scenario-corpus.md`](docs/scenario-corpus.md) §Snapshots (SN-1
+through SN-6) at both the unit level (`internal/raft/snapshot_test.go`,
+`internal/wal/snapshot_test.go`, `internal/snapshot/manager_test.go`)
+and end-to-end against real disk/network (`internal/node/node_test.go`).
+
+Per [`docs/roadmap.md`](docs/roadmap.md) §Maturity Model,
+`STRONG DISTRIBUTED V1` requires Phases 6-7 together; Phase 7
+(chaos/combined fault schedules) has not yet been attempted, so this
+repository's current maturity claim remains `REPLICATED PROTOTYPE`
+above.
 
 No SQL implementation exists yet. See
 [`docs/roadmap.md`](docs/roadmap.md) §Maturity Model for the

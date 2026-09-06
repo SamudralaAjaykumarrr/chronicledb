@@ -39,21 +39,35 @@ import (
 type WALStorage struct {
 	w  *wal.WAL
 	hs raft.HardState
-	// entries[i] holds log index i+1 (mirrors internal/fault.MemoryStorage's
-	// convention so the two Storage implementations behave identically
-	// from raft.Core's point of view).
-	entries []raft.Entry
+	// baseIndex is the log index immediately before entries[0]: entries[i]
+	// holds log index baseIndex+i+1. 0 for a node with no snapshot yet
+	// (exactly Phase 5's original "entries[i] holds index i+1" convention
+	// as the baseIndex==0 special case); otherwise the boundary of the
+	// most recent snapshot this mirror has been rebased against (via
+	// OpenWALStorage at restart, or Compact/InstallSnapshot live —
+	// docs/snapshots.md §8), mirroring raft.Core's own snapshotIndex
+	// field, which a correct driver always keeps in lockstep with this
+	// one.
+	baseIndex uint64
+	entries   []raft.Entry
 }
 
 // OpenWALStorage constructs a WALStorage backed by w, reconstructing its
 // in-memory mirror from whatever w's own recovery (wal.Open) already
 // validated: the most recent HardState record and every LogEntry record
-// from index 1 forward (docs/raft.md §5.1, docs/recovery.md §9). This
-// does not itself determine commitIndex/appliedIndex — per ADR-0008,
-// those are never trusted from disk and must be re-established by the
-// caller via legitimate leader contact or this node's own election.
+// from w.FirstIndex() forward (docs/raft.md §5.1, docs/recovery.md §9;
+// w.FirstIndex() is 1 for a node with no snapshot yet, matching Phase
+// 5's original behavior exactly as a special case). This does not
+// itself determine commitIndex/appliedIndex — per ADR-0008, those are
+// never trusted from disk and must be re-established by the caller via
+// legitimate leader contact or this node's own election, and this does
+// not itself restore state-machine content from a snapshot either — the
+// caller (Open in node.go) is responsible for loading and validating
+// any snapshot via internal/snapshot.Manager and reconciling its
+// boundary against w.FirstIndex() before trusting this mirror's start
+// point (see Open's doc comment).
 func OpenWALStorage(w *wal.WAL) (*WALStorage, error) {
-	s := &WALStorage{w: w}
+	s := &WALStorage{w: w, baseIndex: w.FirstIndex() - 1}
 
 	if raw := w.LatestHardState(); raw != nil {
 		hs, err := decodeHardState(raw)
@@ -63,7 +77,7 @@ func OpenWALStorage(w *wal.WAL) (*WALStorage, error) {
 		s.hs = hs
 	}
 
-	it, err := w.Replay(1)
+	it, err := w.Replay(w.FirstIndex())
 	if err != nil {
 		return nil, fmt.Errorf("node: opening replay iterator: %w", err)
 	}
@@ -89,6 +103,77 @@ func (s *WALStorage) InitialState() (raft.HardState, error) {
 	return s.hs, nil
 }
 
+// Reaffirm re-appends this WALStorage's currently known HardState as a
+// fresh WAL record (mirroring SetHardState) purely so a copy of it lands
+// in the WAL's *current* segment — required immediately before
+// internal/wal.WAL.CompactBefore, which never deletes the current
+// segment, so this guarantees compaction can never delete the only
+// remaining durable copy of HardState (docs/wal.md §7, see
+// WAL.CompactBefore's doc comment). Safe to call even when the current
+// segment already holds a HardState record (last-one-wins makes a fresh
+// append functionally identical); a no-op-safe call otherwise.
+func (s *WALStorage) Reaffirm() error {
+	return s.SetHardState(s.hs)
+}
+
+// Compact discards entries[i] for every index <= uptoIndex from this
+// in-memory mirror and advances baseIndex to match — the storage-layer
+// counterpart to raft.Core.Compact, always called immediately alongside
+// it so the two stay in permanent agreement about which indices this
+// node still holds (docs/snapshots.md §8). This does not touch durable
+// state at all; internal/wal.WAL.CompactBefore (the durable half) is
+// called separately by the same caller. A no-op if uptoIndex does not
+// advance baseIndex.
+func (s *WALStorage) Compact(uptoIndex raft.Index) {
+	if uint64(uptoIndex) <= s.baseIndex {
+		return
+	}
+	pos := uint64(uptoIndex) - s.baseIndex
+	if pos > uint64(len(s.entries)) {
+		pos = uint64(len(s.entries))
+	}
+	s.entries = append([]raft.Entry(nil), s.entries[pos:]...)
+	s.baseIndex = uint64(uptoIndex)
+}
+
+// InstallSnapshot durably adopts a peer's snapshot boundary at
+// uptoIndex (docs/snapshots.md §7 step 3-4): it records the new
+// snapshot pointer (AppendMetadataSnapshot), re-affirms HardState into
+// the current segment, then discards this node's entire durable and
+// in-memory log — any entries beyond uptoIndex are necessarily either
+// stale/divergent relative to the installed snapshot's origin or
+// harmlessly re-derivable (the leader re-sends anything genuinely
+// committed once ordinary replication resumes, mirroring
+// raft.Core.handleInstallSnapshotRequest's identical "always discard
+// the whole log" simplification — see that method's doc comment for why
+// this is safe). Truncating to uptoIndex+1 durably resets the WAL's own
+// next-index assignment counter too, so subsequent Append calls resume
+// exactly at uptoIndex+1, matching the in-memory mirror this leaves
+// behind (empty, rebased to uptoIndex). Finally, CompactBefore reclaims
+// whole segment files now fully superseded by the new boundary.
+//
+// The caller (internal/node.Node) must call this — and every write it
+// performs must land durably — strictly before ever handing the
+// triggering MsgInstallSnapshotRequest to raft.Core.Step, per that
+// message's documented driver contract (see raft.MsgInstallSnapshotRequest).
+func (s *WALStorage) InstallSnapshot(uptoIndex raft.Index) error {
+	if err := s.w.AppendMetadataSnapshot(uint64(uptoIndex)); err != nil {
+		return fmt.Errorf("node: recording installed snapshot pointer: %w", err)
+	}
+	if err := s.Reaffirm(); err != nil {
+		return fmt.Errorf("node: reaffirming hard state before compaction: %w", err)
+	}
+	if err := s.w.Truncate(uint64(uptoIndex) + 1); err != nil {
+		return fmt.Errorf("node: discarding superseded log entries: %w", err)
+	}
+	if err := s.w.CompactBefore(uint64(uptoIndex)); err != nil {
+		return fmt.Errorf("node: compacting log after snapshot install: %w", err)
+	}
+	s.entries = nil
+	s.baseIndex = uint64(uptoIndex)
+	return nil
+}
+
 // SetHardState durably appends and syncs a HardState record before
 // returning (docs/raft.md §5: currentTerm/votedFor must survive
 // restart before they can affect other nodes' state — ADR-0008), then
@@ -106,14 +191,19 @@ func (s *WALStorage) SetHardState(hs raft.HardState) error {
 }
 
 func (s *WALStorage) LastIndex() (raft.Index, error) {
-	return raft.Index(len(s.entries)), nil
+	return raft.Index(s.baseIndex) + raft.Index(len(s.entries)), nil
 }
 
+// Entries returns entries in [lo, hi), same as raft.Storage documents,
+// but never below baseIndex+1 — this mirror holds nothing at or before
+// its own snapshot boundary (docs/snapshots.md §8), exactly as
+// raft.Core's own log no longer does past its matching snapshotIndex.
 func (s *WALStorage) Entries(lo, hi raft.Index) ([]raft.Entry, error) {
-	if lo < 1 {
-		lo = 1
+	base := raft.Index(s.baseIndex)
+	if lo < base+1 {
+		lo = base + 1
 	}
-	maxHi := raft.Index(len(s.entries) + 1)
+	maxHi := base + raft.Index(len(s.entries)) + 1
 	if hi > maxHi {
 		hi = maxHi
 	}
@@ -121,7 +211,7 @@ func (s *WALStorage) Entries(lo, hi raft.Index) ([]raft.Entry, error) {
 		return nil, nil
 	}
 	out := make([]raft.Entry, hi-lo)
-	copy(out, s.entries[lo-1:hi-1])
+	copy(out, s.entries[lo-base-1:hi-base-1])
 	return out, nil
 }
 
@@ -134,8 +224,12 @@ func (s *WALStorage) Truncate(fromIndex raft.Index) error {
 	if err := s.w.Truncate(uint64(fromIndex)); err != nil {
 		return fmt.Errorf("node: truncating durable log from %d: %w", fromIndex, err)
 	}
-	if int(fromIndex-1) < len(s.entries) {
-		s.entries = s.entries[:fromIndex-1]
+	base := raft.Index(s.baseIndex)
+	if pos := fromIndex - base - 1; pos < raft.Index(len(s.entries)) {
+		if pos < 0 {
+			pos = 0
+		}
+		s.entries = s.entries[:pos]
 	}
 	return nil
 }
@@ -150,7 +244,7 @@ func (s *WALStorage) Append(entries []raft.Entry) error {
 	if len(entries) == 0 {
 		return nil
 	}
-	want := raft.Index(len(s.entries) + 1)
+	want := raft.Index(s.baseIndex) + raft.Index(len(s.entries)) + 1
 	for _, e := range entries {
 		if e.Index != want {
 			return fmt.Errorf("node: WALStorage.Append: non-contiguous append (got index %d, want %d)", e.Index, want)

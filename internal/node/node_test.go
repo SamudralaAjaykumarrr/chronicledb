@@ -42,15 +42,27 @@ type testCluster struct {
 	addrs map[raft.NodeID]string
 	dirs  map[raft.NodeID]string
 	nodes map[raft.NodeID]*Node
+	// snapshotThreshold overrides Config.SnapshotThreshold for every node
+	// this cluster opens (0 keeps the package default) — tests proving
+	// snapshot creation/compaction/follower-catch-up (docs/scenario-
+	// corpus.md §Snapshots) need this small enough to trigger within a
+	// handful of proposals rather than Config's much larger production
+	// default.
+	snapshotThreshold uint64
 }
 
 func newTestCluster(t *testing.T, n int) *testCluster {
+	return newTestClusterWithSnapshotThreshold(t, n, 0)
+}
+
+func newTestClusterWithSnapshotThreshold(t *testing.T, n int, snapshotThreshold uint64) *testCluster {
 	t.Helper()
 	tc := &testCluster{
-		t:     t,
-		addrs: make(map[raft.NodeID]string, n),
-		dirs:  make(map[raft.NodeID]string, n),
-		nodes: make(map[raft.NodeID]*Node, n),
+		t:                 t,
+		addrs:             make(map[raft.NodeID]string, n),
+		dirs:              make(map[raft.NodeID]string, n),
+		nodes:             make(map[raft.NodeID]*Node, n),
+		snapshotThreshold: snapshotThreshold,
 	}
 	for i := 0; i < n; i++ {
 		id := raft.NodeID(fmt.Sprintf("n%d", i+1))
@@ -76,16 +88,35 @@ func (tc *testCluster) configFor(id raft.NodeID) Config {
 			peerAddrs[p] = tc.addrs[p]
 		}
 	}
+	// A node that actually creates snapshots (snapshotThreshold != 0)
+	// performs real synchronous fsync-heavy I/O (temp file write, fsync,
+	// atomic rename, directory fsync — docs/snapshots.md §3) inside its
+	// single event-loop goroutine, momentarily blocking heartbeat/tick
+	// processing exactly like every other durable write already does
+	// (processOutput's own per-entry Sync) — just measurably more
+	// expensive. The default election/heartbeat timeouts below are tuned
+	// tight enough that ordinary per-entry fsync latency never triggers
+	// a spurious election, but not tight enough to reliably absorb the
+	// strictly larger snapshot-creation fsync sequence too — so tests
+	// that opt into real snapshot creation get proportionally larger
+	// timeouts, trading test speed for not conflating "the snapshot
+	// feature genuinely doesn't work" with "this disk was briefly
+	// slower than a hard-coded budget assumed."
+	electionTicks, heartbeatTicks := 5, 1
+	if tc.snapshotThreshold != 0 {
+		electionTicks, heartbeatTicks = 30, 3
+	}
 	return Config{
 		ID:                         id,
 		Peers:                      append([]raft.NodeID(nil), tc.ids...),
 		PeerAddrs:                  peerAddrs,
 		ListenAddr:                 tc.addrs[id],
 		DataDir:                    tc.dirs[id],
-		ElectionTimeoutTicks:       5,
+		ElectionTimeoutTicks:       electionTicks,
 		ElectionTimeoutJitterTicks: 5,
-		HeartbeatTimeoutTicks:      1,
+		HeartbeatTimeoutTicks:      heartbeatTicks,
 		TickInterval:               10 * time.Millisecond,
+		SnapshotThreshold:          tc.snapshotThreshold,
 	}
 }
 
@@ -793,5 +824,114 @@ func TestClusterRestartRecoversFSMAndRequestIDOutcomes(t *testing.T) {
 			v, ok := tc.node(id).FSM().Store().Visible("k1", outcome.CommitSeq)
 			return ok && string(v) == "v1"
 		})
+	}
+}
+
+// TestSN1_RestartRestoresFromSnapshotAndCompactsLog is SN-1
+// (docs/scenario-corpus.md §Snapshots): a node creates a snapshot at
+// index I during live operation, later restarts, and recovery restores
+// state from that snapshot rather than replaying the full log from
+// index 1 — proven here not just by correct post-restart state but by
+// the durable log itself only physically covering indices after I, both
+// before and after the restart (docs/snapshots.md §8, §3).
+func TestSN1_RestartRestoresFromSnapshotAndCompactsLog(t *testing.T) {
+	const threshold = 3
+	const numKeys = 9 // an exact multiple of threshold: the boundary lands precisely at 9, nothing left in an uncompacted "tail"
+	tc := newTestClusterWithSnapshotThreshold(t, 1, threshold)
+	leaderID := tc.awaitLeader(5 * time.Second)
+	leader := tc.node(leaderID)
+
+	outcomes := make([]fsm.Outcome, numKeys)
+	for i := 0; i < numKeys; i++ {
+		key := fmt.Sprintf("k%d", i)
+		outcome, err := propose(t, leader, cmd(fmt.Sprintf("r%d", i), uint64(i+1), 0, key, "v"), 3*time.Second)
+		if err != nil || outcome.Status != fsm.StatusCommitted {
+			t.Fatalf("Propose #%d: outcome=%+v err=%v", i, outcome, err)
+		}
+		outcomes[i] = outcome
+	}
+
+	awaitCondition(t, 3*time.Second, "snapshot boundary reaches index 9", func() bool {
+		return leader.Status().SnapshotIndex == numKeys
+	})
+	if got := leader.walog.FirstIndex(); got != numKeys+1 {
+		t.Fatalf("live FirstIndex() = %d, want %d (log compacted through the snapshot boundary)", got, numKeys+1)
+	}
+
+	tc.crash(leaderID)
+	restarted := tc.restart(leaderID)
+	tc.awaitLeader(5 * time.Second)
+
+	if got := restarted.walog.FirstIndex(); got != numKeys+1 {
+		t.Fatalf("FirstIndex() after restart = %d, want %d (recovery re-derived the same boundary from durable metadata, not a full replay from 1)", got, numKeys+1)
+	}
+	st := restarted.Status()
+	if int(st.SnapshotIndex) != numKeys || uint64(st.AppliedIndex) < uint64(numKeys) {
+		t.Fatalf("Status after restart = %+v, want SnapshotIndex=%d AppliedIndex>=%d", st, numKeys, numKeys)
+	}
+	for i := 0; i < numKeys; i++ {
+		key := fmt.Sprintf("k%d", i)
+		if _, ok := restarted.FSM().Store().Visible(key, outcomes[i].CommitSeq); !ok {
+			t.Fatalf("key %s (covered by the snapshot) not immediately visible after restart", key)
+		}
+	}
+}
+
+// TestSN5_FollowerCatchesUpViaSnapshotAfterLeaderCompaction is SN-5
+// (docs/scenario-corpus.md §Snapshots): a follower isolated long enough
+// that the leader compacts past what ordinary AppendEntries replication
+// could still serve it is, once healed, caught up via a genuine
+// MsgInstallSnapshotRequest/Response round trip rather than plain log
+// replication — proven by the follower's own durable log boundary
+// ending up identical to the leader's compacted boundary, which only
+// WALStorage.InstallSnapshot (the InstallSnapshot receive path) ever
+// produces on a follower, never ordinary Append-driven replication.
+func TestSN5_FollowerCatchesUpViaSnapshotAfterLeaderCompaction(t *testing.T) {
+	const threshold = 3
+	const numKeys = 9
+	tc := newTestClusterWithSnapshotThreshold(t, 3, threshold)
+	leaderID := tc.awaitLeader(5 * time.Second)
+	leader := tc.node(leaderID)
+
+	var follower raft.NodeID
+	for _, id := range tc.ids {
+		if id != leaderID {
+			follower = id
+			break
+		}
+	}
+	tc.isolate(follower)
+
+	outcomes := make([]fsm.Outcome, numKeys)
+	for i := 0; i < numKeys; i++ {
+		key := fmt.Sprintf("k%d", i)
+		outcome, err := propose(t, leader, cmd(fmt.Sprintf("r%d", i), uint64(i+1), 0, key, "v"), 3*time.Second)
+		if err != nil || outcome.Status != fsm.StatusCommitted {
+			t.Fatalf("Propose #%d: outcome=%+v err=%v", i, outcome, err)
+		}
+		outcomes[i] = outcome
+	}
+	awaitCondition(t, 3*time.Second, "leader compacts its own log while the follower is isolated", func() bool {
+		return leader.Status().SnapshotIndex == numKeys
+	})
+	if got := leader.walog.FirstIndex(); got != numKeys+1 {
+		t.Fatalf("leader FirstIndex() = %d, want %d before healing the partition", got, numKeys+1)
+	}
+
+	tc.heal(follower)
+	awaitCondition(t, 5*time.Second, "isolated follower catches up via an installed snapshot", func() bool {
+		st := tc.node(follower).Status()
+		return int(st.SnapshotIndex) == numKeys && uint64(st.AppliedIndex) >= uint64(numKeys)
+	})
+
+	fnode := tc.node(follower)
+	if got := fnode.walog.FirstIndex(); got != numKeys+1 {
+		t.Fatalf("follower FirstIndex() after catch-up = %d, want %d — only a genuine InstallSnapshot install ever moves a follower's own boundary this way", got, numKeys+1)
+	}
+	for i := 0; i < numKeys; i++ {
+		key := fmt.Sprintf("k%d", i)
+		if _, ok := fnode.FSM().Store().Visible(key, outcomes[i].CommitSeq); !ok {
+			t.Fatalf("key %s not visible on the follower after snapshot catch-up", key)
+		}
 	}
 }

@@ -58,11 +58,30 @@ type Core struct {
 	votedFor    NodeID
 	leaderID    NodeID
 
-	// log is 1-indexed; log[0] is a fixed sentinel {Index:0, Term:0}
-	// entry representing "before the first real entry," so
-	// prevLogIndex==0 checks are always trivially satisfied
-	// (docs/raft.md §3).
+	// log holds entries after the snapshot boundary. log[0] is a fixed
+	// sentinel entry {Index: snapshotIndex, Term: snapshotTerm}
+	// representing "the last entry already covered by a snapshot" (or
+	// {0,0} for a node with no snapshot yet, exactly Phase 4's original
+	// {Index:0,Term:0} sentinel as a special case), so
+	// prevLogIndex==snapshotIndex checks are always trivially satisfied
+	// the same way prevLogIndex==0 always was (docs/raft.md §3). log[i]
+	// for i>=1 holds the real entry at logical index snapshotIndex+i;
+	// use pos(idx) to convert a real Index into a log slice position.
 	log []Entry
+
+	// snapshotIndex/snapshotTerm are the boundary of the most recent
+	// snapshot this Core's log has been compacted against (0,0 for a
+	// node with no snapshot yet) — docs/snapshots.md §2's
+	// lastIncludedIndex/lastIncludedTerm, mirrored here because log
+	// entries at or before this boundary are no longer held in c.log at
+	// all (docs/raft.md §5 "snapshot.lastIncludedIndex/Term" persistent
+	// state). Never advanced by Step on its own initiative — only by
+	// NewCoreFromSnapshot (restart) or a validated
+	// MsgInstallSnapshotRequest (docs/snapshots.md §7) whose underlying
+	// bytes the driver has already durably installed before this Step
+	// call (see handleInstallSnapshotRequest's doc comment).
+	snapshotIndex Index
+	snapshotTerm  Term
 
 	commitIndex Index
 	// appliedIndex is bookkeeping-only (docs/raft.md §3): Step never
@@ -97,15 +116,35 @@ type Core struct {
 // election (docs/recovery.md §2) — NewCore never trusts a cached
 // commitIndex from disk, because none is ever persisted (ADR-0008).
 func NewCore(cfg Config, hs HardState, entries []Entry) (*Core, error) {
+	return NewCoreFromSnapshot(cfg, hs, 0, 0, entries)
+}
+
+// NewCoreFromSnapshot is NewCore's general form (docs/raft.md §5.1,
+// extended by this phase for snapshot-based recovery): entries must be
+// exactly what Storage.Entries(snapshotIndex+1, Storage.LastIndex()+1)
+// returns — a gap-free run starting at snapshotIndex+1, each entry's
+// Index field matching its position. NewCore is the snapshotIndex==0
+// special case (a node with no snapshot yet), unchanged from Phase 4.
+//
+// Per docs/raft.md §5.1 as refined by this phase (see docs/raft.md's
+// Phase 6 implementation note): commitIndex and appliedIndex both start
+// at snapshotIndex, not 0 — a locally-validated, checksum-verified
+// snapshot's mere existence at that boundary is itself the legitimate
+// proof of prior commitment ADR-0008 requires (never a bare cached
+// number blindly trusted from disk); this is what keeps
+// appliedIndex <= commitIndex true immediately after construction.
+// commitIndex still only advances further via legitimate leader contact
+// or this node's own election, exactly as before.
+func NewCoreFromSnapshot(cfg Config, hs HardState, snapshotIndex Index, snapshotTerm Term, entries []Entry) (*Core, error) {
 	if err := cfg.validate(); err != nil {
 		return nil, fmt.Errorf("%w: %v", ErrInvalidConfig, err)
 	}
 	log := make([]Entry, 0, len(entries)+1)
-	log = append(log, Entry{}) // sentinel: Index 0, Term 0
+	log = append(log, Entry{Index: snapshotIndex, Term: snapshotTerm}) // sentinel
 	for i, e := range entries {
-		wantIdx := Index(i + 1)
+		wantIdx := snapshotIndex + Index(i) + 1
 		if e.Index != wantIdx {
-			return nil, fmt.Errorf("%w: entries must be gap-free starting at 1 (entry %d has Index %d, want %d)", ErrInvalidConfig, i, e.Index, wantIdx)
+			return nil, fmt.Errorf("%w: entries must be gap-free starting at %d (entry %d has Index %d, want %d)", ErrInvalidConfig, snapshotIndex+1, i, e.Index, wantIdx)
 		}
 		log = append(log, e)
 	}
@@ -115,6 +154,10 @@ func NewCore(cfg Config, hs HardState, entries []Entry) (*Core, error) {
 		currentTerm:   hs.CurrentTerm,
 		votedFor:      hs.VotedFor,
 		log:           log,
+		snapshotIndex: snapshotIndex,
+		snapshotTerm:  snapshotTerm,
+		commitIndex:   snapshotIndex,
+		appliedIndex:  snapshotIndex,
 		nextIndex:     make(map[NodeID]Index),
 		matchIndex:    make(map[NodeID]Index),
 		votesReceived: make(map[NodeID]bool),
@@ -123,15 +166,17 @@ func NewCore(cfg Config, hs HardState, entries []Entry) (*Core, error) {
 
 // --- Read-only accessors (observability, tests, harness bookkeeping) ---
 
-func (c *Core) ID() NodeID          { return c.cfg.ID }
-func (c *Core) Role() Role          { return c.role }
-func (c *Core) CurrentTerm() Term   { return c.currentTerm }
-func (c *Core) VotedFor() NodeID    { return c.votedFor }
-func (c *Core) LeaderID() NodeID    { return c.leaderID }
-func (c *Core) CommitIndex() Index  { return c.commitIndex }
-func (c *Core) AppliedIndex() Index { return c.appliedIndex }
-func (c *Core) LastIndex() Index    { return c.lastIndex() }
-func (c *Core) LastLogTerm() Term   { return c.lastTerm() }
+func (c *Core) ID() NodeID           { return c.cfg.ID }
+func (c *Core) Role() Role           { return c.role }
+func (c *Core) CurrentTerm() Term    { return c.currentTerm }
+func (c *Core) VotedFor() NodeID     { return c.votedFor }
+func (c *Core) LeaderID() NodeID     { return c.leaderID }
+func (c *Core) CommitIndex() Index   { return c.commitIndex }
+func (c *Core) AppliedIndex() Index  { return c.appliedIndex }
+func (c *Core) LastIndex() Index     { return c.lastIndex() }
+func (c *Core) LastLogTerm() Term    { return c.lastTerm() }
+func (c *Core) SnapshotIndex() Index { return c.snapshotIndex }
+func (c *Core) SnapshotTerm() Term   { return c.snapshotTerm }
 
 // SetApplied records that internal/fsm has applied through idx
 // (bookkeeping only; never consulted by Step). A no-op if idx does not
@@ -142,16 +187,59 @@ func (c *Core) SetApplied(idx Index) {
 	}
 }
 
-// EntryAt returns the log entry at i (i must be >= 1), or ok=false if
-// i is out of range.
-func (c *Core) EntryAt(i Index) (e Entry, ok bool) {
-	if i == 0 || int(i) >= len(c.log) {
-		return Entry{}, false
+// Compact advances this Core's own snapshotIndex/snapshotTerm to
+// uptoIndex and discards every log entry at or before it from memory,
+// from the compacting node's own perspective (docs/snapshots.md §8) —
+// distinct from handleInstallSnapshotRequest, which handles a
+// *follower* receiving a leader's snapshot over the wire; Compact is
+// what a node (leader or follower) calls after it has itself durably
+// created and confirmed a local snapshot (docs/snapshots.md §3) and now
+// wants to reclaim the log entries that snapshot makes redundant.
+// Compact performs no I/O and does not itself create or validate any
+// snapshot — the caller (internal/node) must already have durably
+// written and confirmed one covering uptoIndex before calling this; it
+// only updates in-memory bookkeeping to match durable state the caller
+// already established, exactly mirroring what NewCoreFromSnapshot does
+// at construction time for a snapshot loaded at restart.
+//
+// uptoIndex must be > c.snapshotIndex (there is something new to
+// compact) and <= c.appliedIndex (never discard entries this node has
+// not itself already applied — a snapshot can only ever be created at
+// or before appliedIndex, docs/snapshots.md §3's "creation point").
+// Compact is a no-op returning false if either bound is violated,
+// leaving Core entirely unchanged.
+func (c *Core) Compact(uptoIndex Index) bool {
+	if uptoIndex <= c.snapshotIndex || uptoIndex > c.appliedIndex {
+		return false
 	}
-	return c.log[i], true
+	p := c.pos(uptoIndex)
+	term := c.log[p].Term
+	newLog := make([]Entry, len(c.log)-p)
+	newLog[0] = Entry{Index: uptoIndex, Term: term}
+	copy(newLog[1:], c.log[p+1:])
+	c.log = newLog
+	c.snapshotIndex = uptoIndex
+	c.snapshotTerm = term
+	return true
 }
 
-// Entries returns a copy of the entries at indices [1, LastIndex()].
+// EntryAt returns the log entry at i (i must be > snapshotIndex), or
+// ok=false if i is out of range or at/before the snapshot boundary (its
+// content is no longer held in c.log at all — see snapshotIndex's doc
+// comment).
+func (c *Core) EntryAt(i Index) (e Entry, ok bool) {
+	if i <= c.snapshotIndex {
+		return Entry{}, false
+	}
+	p := c.pos(i)
+	if p < 0 || p >= len(c.log) {
+		return Entry{}, false
+	}
+	return c.log[p], true
+}
+
+// Entries returns a copy of the entries at indices
+// [snapshotIndex+1, LastIndex()].
 func (c *Core) Entries() []Entry {
 	out := make([]Entry, len(c.log)-1)
 	copy(out, c.log[1:])
@@ -164,14 +252,34 @@ func (c *Core) Entries() []Entry {
 func (c *Core) MatchIndexOf(peer NodeID) Index { return c.matchIndex[peer] }
 func (c *Core) NextIndexOf(peer NodeID) Index  { return c.nextIndex[peer] }
 
-func (c *Core) lastIndex() Index { return Index(len(c.log) - 1) }
+// pos converts a real (snapshot-relative-independent) log index into
+// its position in c.log, where position 0 is always the sentinel entry
+// {Index: snapshotIndex, Term: snapshotTerm}. Callers must check the
+// result against len(c.log) (and, for indices that must be a real held
+// entry rather than possibly the sentinel, against > 0) before indexing
+// — pos itself never bounds-checks, mirroring termAt/EntryAt's own
+// explicit range checks around every call site.
+func (c *Core) pos(i Index) int { return int(i) - int(c.snapshotIndex) }
+
+func (c *Core) lastIndex() Index { return c.snapshotIndex + Index(len(c.log)-1) }
 func (c *Core) lastTerm() Term   { return c.log[len(c.log)-1].Term }
 
+// termAt returns the term of the entry at real index i, or 0 if i is
+// out of range in either direction: strictly before the snapshot
+// boundary (compacted away — its term is no longer knowable from this
+// node's own log at all, which is exactly why a leader whose nextIndex
+// for a peer falls to or below snapshotIndex must fall back to
+// InstallSnapshot instead of computing a term to send — see
+// appendEntriesMessage) or strictly after the last held entry.
 func (c *Core) termAt(i Index) Term {
-	if int(i) >= len(c.log) {
+	if i < c.snapshotIndex {
 		return 0
 	}
-	return c.log[i].Term
+	p := c.pos(i)
+	if p >= len(c.log) {
+		return 0
+	}
+	return c.log[p].Term
 }
 
 func (c *Core) isLogUpToDate(otherLastIndex Index, otherLastTerm Term) bool {
@@ -321,21 +429,34 @@ func (c *Core) handlePropose(data []byte) Output {
 	return out
 }
 
-// appendEntriesMessage builds the next AppendEntriesRequest to send
-// peer, per this Leader's current view of nextIndex[peer], and
-// optimistically advances nextIndex[peer] past whatever it includes
-// (corrected backward later on a rejection — docs/raft.md §3).
+// appendEntriesMessage builds the next replication message to send
+// peer, per this Leader's current view of nextIndex[peer]: an
+// AppendEntriesRequest carrying whatever entries this Leader still
+// holds from nextIndex[peer] forward, optimistically advancing
+// nextIndex[peer] past whatever it includes (corrected backward later
+// on a rejection — docs/raft.md §3) — or, if nextIndex[peer] has fallen
+// to or below this Leader's own snapshotIndex (the entries peer needs
+// have been compacted away — docs/snapshots.md §7/§8), a
+// MsgInstallSnapshotRequest carrying only the snapshot boundary
+// metadata; the driver fills in the actual snapshot bytes before
+// sending (see MsgInstallSnapshotRequest's doc comment).
 func (c *Core) appendEntriesMessage(peer NodeID) Message {
 	next := c.nextIndex[peer]
 	if next < 1 {
 		next = 1
+	}
+	if next <= c.snapshotIndex {
+		return Message{
+			Type: MsgInstallSnapshotRequest, From: c.cfg.ID, To: peer, Term: c.currentTerm,
+			LastIncludedIndex: c.snapshotIndex, LastIncludedTerm: c.snapshotTerm,
+		}
 	}
 	prevIndex := next - 1
 	prevTerm := c.termAt(prevIndex)
 
 	var entries []Entry
 	if next <= c.lastIndex() {
-		entries = append([]Entry(nil), c.log[next:]...)
+		entries = append([]Entry(nil), c.log[c.pos(next):]...)
 		c.nextIndex[peer] = c.lastIndex() + 1
 	} else {
 		c.nextIndex[peer] = next
@@ -392,6 +513,10 @@ func (c *Core) handleMessage(msg Message) Output {
 		return c.handleAppendEntriesRequest(msg)
 	case MsgAppendEntriesResponse:
 		return c.handleAppendEntriesResponse(msg)
+	case MsgInstallSnapshotRequest:
+		return c.handleInstallSnapshotRequest(msg)
+	case MsgInstallSnapshotResponse:
+		return c.handleInstallSnapshotResponse(msg)
 	default:
 		return Output{}
 	}
@@ -507,6 +632,28 @@ func (c *Core) handleAppendEntriesRequest(msg Message) Output {
 	out.ResetElectionTimer = true
 	out.ElectionTimeoutTicks = c.cfg.electionTimeout()
 
+	if msg.PrevLogIndex < c.snapshotIndex {
+		// This node's own snapshot already covers more history than the
+		// leader's view of it assumes (e.g. a stale in-flight
+		// AppendEntries sent just before this node installed a snapshot,
+		// or a defensive resend after an InstallSnapshotResponse the
+		// leader hasn't processed yet). Never invented state either way:
+		// simply report how far ahead this node already durably is, so
+		// the leader can advance nextIndex/matchIndex and either resend
+		// from the correct point or recognize this peer is already
+		// caught up (docs/snapshots.md §7).
+		out.Messages = append(out.Messages, Message{
+			Type: MsgAppendEntriesResponse, From: c.cfg.ID, To: msg.From,
+			Term: c.currentTerm, Success: true, MatchIndex: c.snapshotIndex,
+		})
+		if stateChanged {
+			seq := c.nextPersistSeq()
+			hs := HardState{CurrentTerm: c.currentTerm, VotedFor: c.votedFor}
+			out.PersistRequest = &PersistRequest{Seq: seq, HardState: &hs}
+		}
+		return out
+	}
+
 	if msg.PrevLogIndex > c.lastIndex() || c.termAt(msg.PrevLogIndex) != msg.PrevLogTerm {
 		ci, ct := c.conflictHint(msg.PrevLogIndex)
 		out.Messages = append(out.Messages, Message{
@@ -534,7 +681,7 @@ func (c *Core) handleAppendEntriesRequest(msg Message) Output {
 			}
 			truncateFrom = idx
 			c.invalidatePendingFrom(idx)
-			c.log = c.log[:idx]
+			c.log = c.log[:c.pos(idx)]
 		}
 		appendStart = i
 		break
@@ -599,7 +746,7 @@ func (c *Core) conflictHint(prevIndex Index) (conflictIndex Index, conflictTerm 
 	}
 	t := c.termAt(prevIndex)
 	i := prevIndex
-	for i > 1 && c.termAt(i-1) == t {
+	for i > c.snapshotIndex+1 && c.termAt(i-1) == t {
 		i--
 	}
 	return i, t
@@ -616,7 +763,14 @@ func (c *Core) advanceFollowerCommit(newCommit Index, out *Output) {
 		return
 	}
 	start := c.commitIndex + 1
-	out.CommittedEntries = append(out.CommittedEntries, c.log[start:newCommit+1]...)
+	if start <= c.snapshotIndex {
+		// Some of [start, newCommit] is already covered by a snapshot
+		// installed since commitIndex was last advanced (its content was
+		// restored directly into the state machine, not via
+		// CommittedEntries) — only report entries genuinely beyond it.
+		start = c.snapshotIndex + 1
+	}
+	out.CommittedEntries = append(out.CommittedEntries, c.log[c.pos(start):c.pos(newCommit)+1]...)
 	c.commitIndex = newCommit
 }
 
@@ -689,11 +843,133 @@ func (c *Core) advanceLeaderCommit(out *Output) {
 		}
 		if count >= c.cfg.majority() {
 			start := c.commitIndex + 1
-			out.CommittedEntries = append(out.CommittedEntries, c.log[start:n+1]...)
+			if start <= c.snapshotIndex {
+				start = c.snapshotIndex + 1
+			}
+			out.CommittedEntries = append(out.CommittedEntries, c.log[c.pos(start):c.pos(n)+1]...)
 			c.commitIndex = n
 			return
 		}
 	}
+}
+
+// handleInstallSnapshotRequest implements the follower side of
+// docs/snapshots.md §7. Unlike AppendEntries/RequestVote, this message's
+// effect on this node's own committed/applied state is never gated
+// behind a Core-issued PersistRequest: the actual snapshot bytes are
+// validated and durably installed by the driver (internal/node)
+// *before* it ever calls Core.Step for this message — mirroring the
+// same "durable before visible" ordering PersistRequest gating achieves
+// for votes/appends, just performed by the driver directly, because
+// installing arbitrary-sized snapshot state is I/O internal/raft itself
+// never performs (docs/raft.md §1). A driver that violates this
+// ordering (calls Step before the bytes are durably installed) breaks
+// the correctness this method assumes; see internal/node's
+// handleInstallSnapshot for the exact required sequence.
+func (c *Core) handleInstallSnapshotRequest(msg Message) Output {
+	var out Output
+
+	if msg.Term < c.currentTerm {
+		out.Messages = append(out.Messages, Message{
+			Type: MsgInstallSnapshotResponse, From: c.cfg.ID, To: msg.From,
+			Term: c.currentTerm, Success: false,
+		})
+		return out
+	}
+
+	stateChanged := false
+	if msg.Term > c.currentTerm {
+		if c.stepDownTo(msg.Term) {
+			out.SteppedDown = true
+		}
+		stateChanged = true
+	} else if c.role != Follower {
+		if c.stepDownTo(msg.Term) {
+			out.SteppedDown = true
+		}
+	}
+	c.leaderID = msg.From
+	out.ResetElectionTimer = true
+	out.ElectionTimeoutTicks = c.cfg.electionTimeout()
+
+	if msg.LastIncludedIndex <= c.snapshotIndex {
+		// Stale or duplicate: this node's own boundary is already at
+		// least as far. Still acknowledge (idempotent) so the leader can
+		// advance nextIndex/matchIndex past what it mistakenly thought
+		// was missing (docs/snapshots.md §7 step 6's "no partial state").
+		out.Messages = append(out.Messages, Message{
+			Type: MsgInstallSnapshotResponse, From: c.cfg.ID, To: msg.From,
+			Term: c.currentTerm, Success: true, MatchIndex: c.snapshotIndex,
+		})
+		if stateChanged {
+			seq := c.nextPersistSeq()
+			hs := HardState{CurrentTerm: c.currentTerm, VotedFor: c.votedFor}
+			out.PersistRequest = &PersistRequest{Seq: seq, HardState: &hs}
+		}
+		return out
+	}
+
+	// Atomically replace this node's entire local log view with the new
+	// boundary (docs/snapshots.md §7 step 3: "atomically replaces its
+	// entire state-machine state"). V1 always discards the whole log
+	// rather than attempting to preserve a matching suffix beyond the
+	// new boundary — simpler, still correct (any legitimately committed
+	// suffix beyond LastIncludedIndex that this discards is re-sent by
+	// the leader via ordinary AppendEntries once nextIndex catches up;
+	// nothing committed is ever lost, only re-transmitted).
+	c.snapshotIndex = msg.LastIncludedIndex
+	c.snapshotTerm = msg.LastIncludedTerm
+	c.log = []Entry{{Index: c.snapshotIndex, Term: c.snapshotTerm}}
+	c.pending = nil
+	if c.commitIndex < c.snapshotIndex {
+		c.commitIndex = c.snapshotIndex
+	}
+	c.SetApplied(c.snapshotIndex)
+
+	if stateChanged {
+		seq := c.nextPersistSeq()
+		hs := HardState{CurrentTerm: c.currentTerm, VotedFor: c.votedFor}
+		out.PersistRequest = &PersistRequest{Seq: seq, HardState: &hs}
+	}
+	out.Messages = append(out.Messages, Message{
+		Type: MsgInstallSnapshotResponse, From: c.cfg.ID, To: msg.From,
+		Term: c.currentTerm, Success: true, MatchIndex: c.snapshotIndex,
+	})
+	return out
+}
+
+// handleInstallSnapshotResponse is the leader-side counterpart: on a
+// successful acknowledgement it advances matchIndex/nextIndex for the
+// peer exactly as a successful AppendEntriesResponse would (docs/raft.md
+// §3), then re-evaluates the commit rule and, if the peer still needs
+// more, sends its next replication message (which may itself be a
+// further InstallSnapshotRequest, an AppendEntriesRequest, or nothing
+// further if peer is now fully caught up).
+func (c *Core) handleInstallSnapshotResponse(msg Message) Output {
+	var out Output
+	if msg.Term > c.currentTerm {
+		if c.stepDownTo(msg.Term) {
+			out.SteppedDown = true
+		}
+		seq := c.nextPersistSeq()
+		hs := HardState{CurrentTerm: c.currentTerm, VotedFor: c.votedFor}
+		out.PersistRequest = &PersistRequest{Seq: seq, HardState: &hs}
+		return out
+	}
+	if c.role != Leader || msg.Term != c.currentTerm || !msg.Success {
+		return out // stale reply, or a rejection the driver will retry on its own next round
+	}
+	if msg.MatchIndex > c.matchIndex[msg.From] {
+		c.matchIndex[msg.From] = msg.MatchIndex
+	}
+	if msg.MatchIndex+1 > c.nextIndex[msg.From] {
+		c.nextIndex[msg.From] = msg.MatchIndex + 1
+	}
+	c.advanceLeaderCommit(&out)
+	if c.nextIndex[msg.From] <= c.lastIndex() {
+		out.Messages = append(out.Messages, c.appendEntriesMessage(msg.From))
+	}
+	return out
 }
 
 func (c *Core) handlePersistenceComplete(seq uint64) Output {
@@ -740,5 +1016,6 @@ func (c *Core) handlePersistenceComplete(seq uint64) Output {
 }
 
 func (c *Core) entryStillPresent(index Index, term Term) bool {
-	return int(index) < len(c.log) && c.log[index].Term == term
+	p := c.pos(index)
+	return p >= 0 && p < len(c.log) && c.log[p].Term == term
 }

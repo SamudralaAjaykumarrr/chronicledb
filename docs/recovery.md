@@ -7,16 +7,28 @@ restoration via `internal/fsm.Apply` replay) are implemented. Phase 4
 implemented step 9's *logic* — `raft.NewCore` reconstructing
 currentTerm/votedFor/log from a `raft.Storage`, with commitIndex/
 appliedIndex always starting at 0 per §2 below — against
-`internal/fault`'s simulated (in-memory) durable store. Phase 5 now
-wires the identical logic against the real `internal/wal`-backed
+`internal/fault`'s simulated (in-memory) durable store. Phase 5 wired
+the identical logic against the real `internal/wal`-backed
 `raft.Storage` adapter (`internal/node.WALStorage`, see
 [`docs/raft.md`](raft.md) §10.1) and against `internal/fsm`/
 `internal/mvcc` for step 11's replicated-mode leg (§7 below) — see
 `internal/node/node_test.go` for restart/rejoin/full-cluster-restart
 proof and §7's note on the specific commit-boundary-reconstruction
-nuance a full-cluster restart exposes. Steps 2-4, 10, and 13-14 (state-
-machine *snapshots* specifically) remain Phase 6 scope and are not
-implemented yet; step 10 (Raft log compaction) likewise.
+nuance a full-cluster restart exposes. Phase 6 now implements steps
+2-4, 10, and 13-14 (state-machine *snapshots* and Raft log compaction):
+`internal/node.Open` locates, validates, and restores from the newest
+snapshot `internal/snapshot.Manager` will trust (falling back to an
+older one, or to empty state, exactly as §1 steps 2-4 specify),
+`commitIndex`/`appliedIndex` start at the snapshot's own
+`lastIncludedIndex` rather than unconditionally at 0 (§2's rule
+generalizes: recovered state advances only as far as this node's own
+snapshot *plus* whatever it can further prove committed via legitimate
+leader contact or its own election — never further), and a durable log
+whose oldest physically-surviving entry starts strictly after that
+boundary — with no valid snapshot covering the gap — refuses startup
+per §4, rather than silently skipping the missing range. See
+`internal/node/node_test.go::TestSN1_RestartRestoresFromSnapshotAndCompactsLog`
+and `TestSN5_FollowerCatchesUpViaSnapshotAfterLeaderCompaction`.
 
 This document defines the exact restart/recovery sequence a
 ChronicleDB node follows, so that a durable-but-uncommitted suffix,
@@ -241,20 +253,26 @@ never needs to distinguish "committed" from "merely present" the way
 Raft-mode recovery eventually will; it only needs to reproduce the
 same deterministic decision, which `Apply`'s determinism guarantees.
 
-## 7. Replicated-mode recovery (Phase 5)
+## 7. Replicated-mode recovery (Phase 5, extended by Phase 6)
 
 `internal/node.Node`'s restart path implements this document's §1 for
 replicated mode, exactly per §2's rule (a durable log entry is never
 itself proof of commitment): `internal/node.OpenWALStorage`
 reconstructs `currentTerm`/`votedFor`/the full log from `internal/wal`
-(step 9), `raft.NewCore` starts `commitIndex`/`appliedIndex` at 0 as
-always (§2), and a brand-new `internal/fsm.FSM` (step 11's replicated-
-mode leg) is populated only as real `Output.CommittedEntries` batches
-actually arrive from `Core.Step` — never by eagerly replaying "every
-`LogEntry` record found on disk," which would be exactly the
-log-presence-implies-committed mistake §2 forbids. This is the same
-rule Phase 4 already implemented in the deterministic simulator; Phase
-5 wires the identical logic against a real, restarted process.
+(step 9), `raft.NewCoreFromSnapshot` starts `commitIndex`/`appliedIndex`
+at the restored snapshot's `lastIncludedIndex` (0 for a node with no
+snapshot yet — Phase 5's original "always 0" behavior as this
+boundary's special case, §2), and the `internal/fsm.FSM` restored from
+that snapshot (Phase 6; a brand-new empty one, Phase 5's original
+behavior, if none exists) is advanced further only as real
+`Output.CommittedEntries` batches actually arrive from `Core.Step` —
+never by eagerly replaying "every `LogEntry` record found on disk,"
+which would be exactly the log-presence-implies-committed mistake §2
+forbids. This is the same rule Phase 4 already implemented in the
+deterministic simulator; Phase 5 wired the identical logic against a
+real, restarted process, and Phase 6 generalizes the starting boundary
+from a hardcoded 0 to "this node's own snapshot, if any" without
+changing the rule itself.
 
 A restarted node re-establishes its committed boundary the same two
 ways §2 always specified — by rejoining as a follower and learning it

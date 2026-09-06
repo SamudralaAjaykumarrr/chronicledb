@@ -10,6 +10,25 @@ const (
 	MsgRequestVoteResponse
 	MsgAppendEntriesRequest
 	MsgAppendEntriesResponse
+	// MsgInstallSnapshotRequest asks a follower to install the snapshot
+	// covering (LastIncludedIndex, LastIncludedTerm) — used when a
+	// leader's own retained log no longer reaches back far enough to
+	// bring a peer up to date with ordinary AppendEntries
+	// (docs/snapshots.md §7). Core itself never carries the actual
+	// snapshot bytes: it emits this message with SnapshotData left
+	// empty, and the driver (internal/node) is responsible for filling
+	// SnapshotData in from its local snapshot store before the message
+	// is actually put on the wire, and for validating/durably installing
+	// SnapshotData on the receiving side BEFORE ever feeding this
+	// message back into the receiving Core (see Core.Step's doc comment
+	// on this message type for the exact contract).
+	MsgInstallSnapshotRequest
+	// MsgInstallSnapshotResponse acknowledges a MsgInstallSnapshotRequest
+	// once the receiver has durably installed it (Success=true,
+	// MatchIndex=the installed LastIncludedIndex) or rejects it
+	// (Success=false, e.g. failed local validation) — docs/snapshots.md
+	// §5's "rejects it and requests re-transmission."
+	MsgInstallSnapshotResponse
 )
 
 func (t MessageType) String() string {
@@ -22,6 +41,10 @@ func (t MessageType) String() string {
 		return "AppendEntriesRequest"
 	case MsgAppendEntriesResponse:
 		return "AppendEntriesResponse"
+	case MsgInstallSnapshotRequest:
+		return "InstallSnapshotRequest"
+	case MsgInstallSnapshotResponse:
+		return "InstallSnapshotResponse"
 	default:
 		return "Unknown"
 	}
@@ -71,4 +94,14 @@ type Message struct {
 	// index).
 	ConflictIndex Index
 	ConflictTerm  Term
+
+	// InstallSnapshot request fields (MsgInstallSnapshotRequest). Core
+	// itself only ever reads/writes LastIncludedIndex/LastIncludedTerm;
+	// SnapshotData is opaque cargo Core never inspects (see
+	// MsgInstallSnapshotRequest's doc comment) — carried on Message
+	// purely so it rides the same wire frame internal/transport already
+	// carries every other Message type over, without a second RPC path.
+	LastIncludedIndex Index
+	LastIncludedTerm  Term
+	SnapshotData      []byte
 }
