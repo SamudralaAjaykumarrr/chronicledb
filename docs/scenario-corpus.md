@@ -7,9 +7,12 @@ immediate/after-restart and, as of Phase 6, ID-4's after-snapshot leg
 `internal/fault`'s deterministic simulator), a Phase-5 subset of the
 same RF-1 through RF-15 (`internal/node` + `internal/transport` against
 real disk/network, and `cmd/chronicledb-node` against genuine separate
-OS processes), and SN-1 through SN-6 plus RF-3's snapshot-catch-up leg
+OS processes), SN-1 through SN-6 plus RF-3's snapshot-catch-up leg
 (Phase 6, `internal/snapshot` + `internal/node` + `internal/wal` +
-`internal/raft`) — see each scenario's **Status** line below for
+`internal/raft`), and, as of Phase 7, the chaos/combined-fault variants
+of RF-11, RF-13, RF-15, SN-3, and SN-5 (`internal/fault/chaos_test.go`,
+`internal/node/chaos_test.go`, `cmd/chronicledb-node/chaos_test.go`) —
+see each scenario's **Status** line below for
 exactly which — have passing,
 reproducible tests. **Every other scenario in this document does not
 currently pass, because it is not implemented yet.** This document
@@ -42,6 +45,24 @@ each entry's Status line and [`docs/raft.md`](raft.md) §10.2 for why
 this is a deliberate scope line, not an oversight. A scenario with no
 Status line below is not yet covered by any test, in the simulator or
 otherwise.
+
+**Phase 7 note on the "chaos variant" lines below**: a Status line
+additionally reading "the chaos variant is now also passing (Phase 7)"
+means the scenario's already-proven-Phase-4/5/6 shape is additionally
+exercised inside a seeded, randomized, combined-fault schedule (breadth
+and adversarial combination per [`docs/roadmap.md`](roadmap.md) Phase
+7's own framing — not new mechanism) at one or more of three layers:
+`internal/fault/chaos_test.go` (the deterministic raft-core simulator,
+cheapest per-iteration and run at the highest seed counts),
+`internal/node/chaos_test.go` (real `internal/wal`-backed disk and real
+TCP `internal/transport`, in-process), and
+`cmd/chronicledb-node/chaos_test.go` (genuine separate OS processes,
+`-tags=integration`, real SIGKILL). Not every scenario has a chaos
+variant at every layer — check each entry's own Status line for which.
+[`docs/testing-strategy.md`](testing-strategy.md) §6-7 is the
+authoritative, itemized account of Phase 7's chaos capabilities, the
+seeds/reproduction method, and the two genuine bugs plus one data race
+this work found and fixed.
 
 Each scenario specifies: initial state, action/failure, event
 ordering, expected state, client-visible outcome, invariants involved,
@@ -507,7 +528,14 @@ executable.
   `internal/transport.Transport.Block`/`Unblock` for partition
   injection) —
   `internal/node/node_test.go::TestRF11_MinorityPartitionCannotCommit`.
-  The chaos (randomized, combined-fault) variant remains Phase 7.
+  The chaos (randomized, combined-fault) variant is now also passing
+  (Phase 7): `internal/fault/chaos_test.go::TestChaos_QuorumSafetyRandomizedPartitionTiming`
+  (randomized-timing minority partition, many seeds, at the raft-core
+  layer) and `internal/node/chaos_test.go::TestChaos_AsymmetricPartitionNoSafetyViolation`
+  (a real, directional-only partition against real TCP, via the new
+  `Transport.BlockSend`/`BlockRecv`) and `cmd/chronicledb-node/chaos_test.go::TestRealChaos_RealPartitionHeal`
+  (a genuine partition between real OS processes via the new `/fault`
+  control-plane endpoint).
 
 ### RF-12: Majority election
 
@@ -539,7 +567,12 @@ executable.
   (heals the partition, confirms the old leader steps down, its
   never-committed speculative write is truncated and never
   materializes, and all three real nodes converge on the committed
-  value). The chaos variant remains Phase 7.
+  value). The chaos variant is now also passing (Phase 7):
+  `internal/fault/chaos_test.go::TestChaos_RepeatedPartitionHealAcrossLeaders`
+  (raft-core layer, seeded, several partition/heal cycles across
+  changing leaders, checked against a `committedOracle`) and
+  `internal/node/chaos_test.go::TestChaos_RepeatedPartitionHealAcrossLeaders`
+  (the real-disk/real-TCP equivalent).
 
 ### RF-14: Slow follower
 
@@ -575,8 +608,20 @@ executable.
   crashing and a term-2 leader being elected in
   `cmd/chronicledb-node/main_test.go`), but an adversarial,
   specifically-repeated-election stress scenario is not independently
-  reproduced against real sockets/processes. The full chaos variant
-  remains Phase 7.
+  reproduced against real sockets/processes. The full chaos variant is
+  now also passing (Phase 7):
+  `internal/fault/chaos_test.go::TestChaos_CombinedRandomizedSchedule`
+  (a much richer combined action space than the Phase 4 property test —
+  elections, proposals, crashes/restarts, partitions/isolation/heals,
+  message drop/duplicate/delay, and local compaction — checked after
+  every action, seeded; default a fast CI-sized seed count, or a much
+  larger count via the `CHRONICLEDB_CHAOS_SEEDS` environment variable)
+  and `internal/fault/chaos_test.go::TestChaos_AsymmetricPartitionSafety`.
+  A genuine Raft liveness bug this exact chaos scenario surfaced (a node
+  stepping down from Leader/Candidate without granting the triggering
+  vote/response could be left with no election timer ever armed again)
+  is documented and fixed in
+  [`docs/testing-strategy.md`](testing-strategy.md) §7.
 
 ---
 
@@ -607,8 +652,25 @@ executable.
 - **Expected state**: restarts installation from scratch on
   reconnection; no partial state ever considered installed.
 - **Invariants**: `SNAPSHOT SAFETY`.
-- **Phase**: 6.
-- **Status**: passing — `internal/snapshot/manager_test.go::TestManagerInstallValidatesBeforeWriting` (a payload that fails validation touches nothing on disk at all) and `TestManagerInstallSucceedsAndIsLoadable` (a successful install is immediately, durably loadable); `internal/node.Node.handleInstallSnapshot` calls `Manager.Install` before ever touching `raft.Core` or durable log state, so a kill at any point before `Install` returns leaves nothing installed to resume from but the prior state.
+- **Phase**: 6, 7 (chaos variant).
+- **Status**: passing — `internal/snapshot/manager_test.go::TestManagerInstallValidatesBeforeWriting` (a payload that fails validation touches nothing on disk at all) and `TestManagerInstallSucceedsAndIsLoadable` (a successful install is immediately, durably loadable); `internal/node.Node.handleInstallSnapshot` calls `Manager.Install` before ever touching `raft.Core` or durable log state, so a kill at any point before `Install` returns leaves nothing installed to resume from but the prior state. The chaos variant is now also passing (Phase 7):
+  `internal/fault/chaos_test.go::TestChaos_SnapshotMessageChaos` (leader
+  compaction combined with drop/duplicate/delay chaos specifically
+  targeting `MsgInstallSnapshotRequest`/`Response` traffic, seeded, at
+  the raft-core message-protocol layer),
+  `internal/node/chaos_test.go::TestChaos_SnapshotFollowerCrashDuringCatchupResumesCleanly`
+  (a real follower crashed and restarted immediately after healing, before
+  catch-up could possibly have completed, against real disk/network), and
+  `cmd/chronicledb-node/chaos_test.go::TestRealChaos_SIGKILLDuringSnapshotInstall`
+  (genuine, repeated real-process SIGKILL attempts timed around a real
+  snapshot install — best-effort timing, since a real OS process is not
+  as controllable as the simulator, but the safety property — no
+  partial/corrupt state, eventual clean convergence — is asserted
+  unconditionally). This exact combination (a live, non-restarted
+  snapshot install followed by further real replication) is what
+  surfaced a genuine WAL bug, fixed and covered by its own deterministic
+  regression test — see [`docs/testing-strategy.md`](testing-strategy.md)
+  §7.
 
 ### SN-4: Corrupted snapshot
 
@@ -626,8 +688,18 @@ executable.
 - **Expected state**: leader sends a snapshot instead of log entries;
   follower installs it and resumes normal replication.
 - **Invariants**: `SNAPSHOT SAFETY`, `LOG COMPACTION SAFETY`.
-- **Phase**: 6.
-- **Status**: passing — `internal/raft/snapshot_test.go::TestAppendEntriesMessageSendsInstallSnapshotWhenPeerBehindSnapshot` (leader-side trigger) and `internal/node/node_test.go::TestSN5_FollowerCatchesUpViaSnapshotAfterLeaderCompaction` (end-to-end against real disk/network: an isolated follower, healed after the leader has compacted past what it needs, is proven caught up via an actual installed snapshot — its own `FirstIndex()` boundary moves to match, which only a genuine install ever does — not merely eventual convergence by some other means).
+- **Phase**: 6, 7 (chaos variant: catch-up followed by further real
+  replication).
+- **Status**: passing — `internal/raft/snapshot_test.go::TestAppendEntriesMessageSendsInstallSnapshotWhenPeerBehindSnapshot` (leader-side trigger) and `internal/node/node_test.go::TestSN5_FollowerCatchesUpViaSnapshotAfterLeaderCompaction` (end-to-end against real disk/network: an isolated follower, healed after the leader has compacted past what it needs, is proven caught up via an actual installed snapshot — its own `FirstIndex()` boundary moves to match, which only a genuine install ever does — not merely eventual convergence by some other means). The Phase 7 chaos variant specifically stresses "resumes normal replication" beyond mere catch-up —
+  `cmd/chronicledb-node/chaos_test.go::TestRealChaos_SIGKILLDuringSnapshotInstall`
+  proposes further entries after a real follower's snapshot install and
+  confirms they replicate normally; this is exactly the combination that
+  surfaced a genuine `wal.WAL.Truncate` bug (a live, non-restarted
+  snapshot install did not durably-equivalently advance the WAL's own
+  next-log-index counter, fatally erroring the very next real append) —
+  fixed, with a deterministic regression test at
+  `internal/wal/snapshot_test.go::TestTruncateJumpsNextIndexForwardPastInstalledSnapshotGap`;
+  see [`docs/testing-strategy.md`](testing-strategy.md) §7.
 
 ### SN-6: Safe log truncation after snapshot
 
@@ -652,21 +724,32 @@ executable.
 | 4 | RF-1, RF-2, RF-3 (log-catch-up leg), RF-7 .. RF-15 — in the deterministic simulator only (see the Phase 4 note above) |
 | 5 | RF-1, RF-3 (log-catch-up leg), RF-4, RF-5, RF-6, RF-9 .. RF-13 in a real multi-process/real-disk deployment (see the Phase 5 note above); RF-2, RF-7, RF-8, RF-14, RF-15 remain simulator-only by deliberate scope (see each entry and [`docs/raft.md`](raft.md) §10.2); ID-4 (immediate/after-restart already from 3) |
 | 6 | SN-1 .. SN-6, ID-4 (after snapshot+compaction), RF-3's snapshot-catch-up leg |
-| 7 | Chaos/combined variants of RF-11, RF-13, RF-15 under randomized fault schedules |
+| 7 | Chaos/combined variants of RF-11, RF-13, RF-15 and SN-3/SN-5 under randomized fault schedules, plus RequestID/transaction chaos and genuine real-process SIGKILL evidence not tied to a single numbered scenario (see the Phase 7 note above and [`docs/testing-strategy.md`](testing-strategy.md) §6-7) |
 
 Scenarios with an explicit **Status: passing** line above currently
 pass at the stated scope — LD-1 through LD-6, TX-1 through TX-8, ID-1
 through ID-7 (immediate/after-restart and, as of Phase 6, ID-4's
 after-snapshot+compaction leg), the Phase-4 simulator-only subset of
 RF-1 through RF-15, the Phase-5 real-disk/real-network/real-process
-subset of RF-1 through RF-15 listed in the Phase 5 row above, and
-SN-1 through SN-6 plus RF-3's snapshot-catch-up leg (Phase 6). Every
+subset of RF-1 through RF-15 listed in the Phase 5 row above, SN-1
+through SN-6 plus RF-3's snapshot-catch-up leg (Phase 6), and the
+Phase-7 chaos variants of RF-11, RF-13, RF-15, SN-3, and SN-5 called
+out in each of those entries' own Status lines above. Every
 other scenario in this document is not claimed to pass. A passing
 Phase-4 (simulator-only) RF-\* status is not by itself a claim that
 scenario's real multi-process (Phase 5) leg passes — check the specific
 scenario's own Status line, since as of Phase 5 several (but not all)
-now carry both. This table exists to make future maturity claims
-falsifiable: a claim that ChronicleDB has reached a given roadmap phase
-must be checked against whether the scenarios listed for that phase
-(and all prior phases), at the scope that phase actually requires, have
-passing, reproducible tests.
+now carry both, and likewise a Phase 5/6 status is not by itself a
+claim that a scenario's Phase 7 chaos variant passes. This table exists
+to make future maturity claims falsifiable: a claim that ChronicleDB
+has reached a given roadmap phase must be checked against whether the
+scenarios listed for that phase (and all prior phases), at the scope
+that phase actually requires, have passing, reproducible tests. Not
+every category Phase 7's own brief describes maps to a single numbered
+scenario here (RequestID-retry-across-multiple-leadership-epochs,
+transaction atomicity under a leader crash, and the real-process SIGKILL
+evidence are proven by named tests cited in
+[`docs/testing-strategy.md`](testing-strategy.md) §7 rather than a
+dedicated corpus entry) — that document's §7 is the authoritative,
+itemized Phase 7 evidence list; this table's Phase 7 row is a summary,
+not the complete accounting.

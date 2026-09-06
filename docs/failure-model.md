@@ -1,9 +1,14 @@
 # Failure Model
 
-Status: Architecture Foundation. No implementation exists yet; this
-document specifies required behavior that future tests (see
+Status: this document's required behavior is implemented and tested
+through Phase 7 (see [`docs/roadmap.md`](roadmap.md)) — each failure
+class below's "future tests" are, as of the phase named in each
+section's own status notes, largely present; see
 [`docs/testing-strategy.md`](testing-strategy.md) and
-[`docs/scenario-corpus.md`](scenario-corpus.md)) must verify.
+[`docs/scenario-corpus.md`](scenario-corpus.md) for exactly which. This
+document remains the specification new tests are checked against, not
+merely a historical one — a future test gap against any class below is
+still a defect to close, not a reason to weaken the requirement here.
 
 For each failure class: what may be lost, what must survive, what
 must never happen, client-visible behavior, invariants protected, and
@@ -189,6 +194,11 @@ Full worked scenario in [`docs/replication.md`](replication.md) §5.
 - **Future tests**: simulator scenario with adversarial timer
   scheduling to confirm eventual convergence, per
   [`docs/scenario-corpus.md`](scenario-corpus.md).
+- **Status (Phase 7)**: `internal/fault/chaos_test.go::TestChaos_AsymmetricPartitionSafety`
+  proves this — and, in the course of proving it, found and led to the
+  fix of a genuine bug where "must never happen indefinitely" was
+  actually violated under an asymmetric partition: see
+  [`docs/testing-strategy.md`](testing-strategy.md) §7.1.
 
 ### 2.9 Slow follower
 

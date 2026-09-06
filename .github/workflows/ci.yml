@@ -25,17 +25,34 @@ jobs:
         run: go test ./...
       - name: go test -race
         run: go test -race ./...
-      - name: real multi-process integration (cmd/chronicledb-node)
+      - name: chaos suites (deterministic + real-disk)
+        # Phase 7's seeded, reproducible randomized chaos suites — a
+        # fast, CI-sized seed count on every push (already included in
+        # the plain "go test ./..." above; this step just isolates them
+        # for a clear pass/fail signal and higher log verbosity). See
+        # docs/testing-strategy.md §6.5 for the CHRONICLEDB_CHAOS_SEEDS
+        # environment variable used to run a much larger seed count
+        # locally/nightly, e.g.:
+        #   CHRONICLEDB_CHAOS_SEEDS=5000 go test ./internal/fault/... -run TestChaos -timeout 300s
+        run: |
+          go test ./internal/fault/... -run TestChaos -v -timeout 120s
+          go test ./internal/node/... -run TestChaos -v -timeout 120s
+      - name: real multi-process integration + real-process chaos (cmd/chronicledb-node)
         # Real OS processes, real TCP sockets, real disk, a real SIGKILL,
         # leader election/failover, and a RequestID retry — the Phase 5
         # "real multi-process/real-disk proof" evidence
         # docs/testing-strategy.md and docs/roadmap.md require in
-        # addition to the deterministic simulator above. Fast and fully
-        # localhost-contained, so it runs on every push rather than
-        # being gated to a manual/nightly job; see
-        # cmd/chronicledb-node/main_test.go's doc comment for the
-        # explicit standalone invocation.
-        run: go test -tags=integration ./cmd/chronicledb-node/... -v -timeout 120s
+        # addition to the deterministic simulator above — plus Phase
+        # 7's real-process chaos suite (chaos_test.go: a follower
+        # SIGKILLed mid-replication, repeated SIGKILL attempts around a
+        # real snapshot install, a lost-response-then-retry sequence,
+        # and a genuine network partition/heal via the /fault
+        # control-plane endpoint). Fast and fully localhost-contained,
+        # so it runs on every push rather than being gated to a
+        # manual/nightly job; see cmd/chronicledb-node/main_test.go's
+        # and chaos_test.go's doc comments for the explicit standalone
+        # invocation.
+        run: go test -tags=integration ./cmd/chronicledb-node/... -v -timeout 180s
       - name: fuzz smoke (wal)
         run: go test ./internal/wal/... -fuzz FuzzDecodeFrameBytes -fuzztime 15s
       - name: fuzz smoke (fsm)

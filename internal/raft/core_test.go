@@ -405,3 +405,109 @@ func TestProposeRejectedWhenNotLeader(t *testing.T) {
 		t.Fatalf("expected ProposalRejected=true for a non-leader")
 	}
 }
+
+// --- Phase 7 regression: a node stepping down from Leader/Candidate
+// must always get a fresh election timer, even when the message that
+// caused the step-down does not itself grant a vote or accept a
+// replication RPC. Found by internal/fault's chaos suite
+// (TestChaos_AsymmetricPartitionSafety, seed 609): a node whose log was
+// behind a higher-term candidate's correctly refused that candidate's
+// vote (RAFT-ELECTION-SAFETY intact), but — since handleElectionTimeout
+// disarms a node's election timer forever after its first no-op firing
+// as Leader (docs/testing-strategy.md §3.1's driver model: a timer only
+// re-arms via an explicit Output.ResetElectionTimer) — a former Leader
+// or Candidate that stepped down without granting a vote, and without
+// receiving a fresh AppendEntries/InstallSnapshotRequest to reset it,
+// was left with NO election timer running at all. If the only
+// candidate whose vote requests keep arriving can never actually win
+// (its own log is behind), the cluster could be left permanently unable
+// to elect anyone — a genuine liveness bug, not a safety violation.
+
+// TestRejectedVoteAfterStepDownStillResetsElectionTimer covers the
+// handleRequestVoteRequest reject-path regression directly.
+func TestRejectedVoteAfterStepDownStillResetsElectionTimer(t *testing.T) {
+	a, err := NewCore(testConfig("A", threePeers()), HardState{}, []Entry{{Index: 1, Term: 1, Data: []byte("x")}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	a.Step(Input{Kind: InputElectionTimeout}) // A becomes Candidate at term 1, log still [1]
+	if a.Role() != Candidate {
+		t.Fatalf("Role() = %v, want Candidate", a.Role())
+	}
+
+	// B campaigns at a much higher term but with an empty (strictly
+	// older) log: A must step down (term 5 > 1) yet correctly refuse
+	// the vote (RAFT-ELECTION-SAFETY: B's log is not up to date).
+	out := a.Step(Input{Kind: InputMessage, Message: Message{
+		Type: MsgRequestVoteRequest, From: "B", To: "A", Term: 5, LastLogIndex: 0, LastLogTerm: 0,
+	}})
+	if len(out.Messages) != 1 || out.Messages[0].VoteGranted {
+		t.Fatalf("expected the vote to be denied (stale candidate log), got %+v", out.Messages)
+	}
+	if !out.SteppedDown || a.Role() != Follower || a.CurrentTerm() != 5 {
+		t.Fatalf("expected a step-down to Follower/term 5, got SteppedDown=%v Role()=%v CurrentTerm()=%d", out.SteppedDown, a.Role(), a.CurrentTerm())
+	}
+	if !out.ResetElectionTimer || out.ElectionTimeoutTicks <= 0 {
+		t.Fatalf("a former Candidate that stepped down without granting a vote must still get a fresh election timer, got ResetElectionTimer=%v ElectionTimeoutTicks=%d", out.ResetElectionTimer, out.ElectionTimeoutTicks)
+	}
+}
+
+// TestVoteResponseStepDownStillResetsElectionTimer covers the
+// handleRequestVoteResponse regression: a Candidate learning of a
+// higher term purely from a (rejecting) vote reply must still get a
+// fresh election timer once it steps down.
+func TestVoteResponseStepDownStillResetsElectionTimer(t *testing.T) {
+	a := mustNewCore(t, "A", threePeers())
+	a.Step(Input{Kind: InputElectionTimeout}) // A becomes Candidate at term 1
+	out := a.Step(Input{Kind: InputMessage, Message: Message{
+		Type: MsgRequestVoteResponse, From: "B", To: "A", Term: 99, VoteGranted: false,
+	}})
+	if !out.SteppedDown || a.Role() != Follower || a.CurrentTerm() != 99 {
+		t.Fatalf("expected a step-down to Follower/term 99, got SteppedDown=%v Role()=%v CurrentTerm()=%d", out.SteppedDown, a.Role(), a.CurrentTerm())
+	}
+	if !out.ResetElectionTimer || out.ElectionTimeoutTicks <= 0 {
+		t.Fatalf("a former Candidate that stepped down on a stale vote response must still get a fresh election timer, got ResetElectionTimer=%v ElectionTimeoutTicks=%d", out.ResetElectionTimer, out.ElectionTimeoutTicks)
+	}
+}
+
+// TestAppendEntriesResponseStepDownStillResetsElectionTimer covers the
+// handleAppendEntriesResponse regression: a stale Leader learning of a
+// higher term purely from a heartbeat reply — which has no independent
+// election timer running at all while it believes itself Leader — must
+// get a fresh one armed the instant it steps down.
+func TestAppendEntriesResponseStepDownStillResetsElectionTimer(t *testing.T) {
+	a := mustNewCore(t, "A", []NodeID{"A"}) // single-node cluster: instantly becomes Leader
+	out := a.Step(Input{Kind: InputElectionTimeout})
+	if !out.BecameLeader || a.Role() != Leader {
+		t.Fatalf("expected A to become Leader immediately in a single-node cluster")
+	}
+	out = a.Step(Input{Kind: InputMessage, Message: Message{
+		Type: MsgAppendEntriesResponse, From: "B", To: "A", Term: 99, Success: false,
+	}})
+	if !out.SteppedDown || a.Role() != Follower || a.CurrentTerm() != 99 {
+		t.Fatalf("expected a step-down to Follower/term 99, got SteppedDown=%v Role()=%v CurrentTerm()=%d", out.SteppedDown, a.Role(), a.CurrentTerm())
+	}
+	if !out.ResetElectionTimer || out.ElectionTimeoutTicks <= 0 {
+		t.Fatalf("a former Leader stepping down on a stale AppendEntriesResponse must get a fresh election timer (it had none running as Leader), got ResetElectionTimer=%v ElectionTimeoutTicks=%d", out.ResetElectionTimer, out.ElectionTimeoutTicks)
+	}
+}
+
+// TestInstallSnapshotResponseStepDownStillResetsElectionTimer covers
+// the handleInstallSnapshotResponse regression, the same shape as
+// TestAppendEntriesResponseStepDownStillResetsElectionTimer.
+func TestInstallSnapshotResponseStepDownStillResetsElectionTimer(t *testing.T) {
+	a := mustNewCore(t, "A", []NodeID{"A"})
+	out := a.Step(Input{Kind: InputElectionTimeout})
+	if !out.BecameLeader || a.Role() != Leader {
+		t.Fatalf("expected A to become Leader immediately in a single-node cluster")
+	}
+	out = a.Step(Input{Kind: InputMessage, Message: Message{
+		Type: MsgInstallSnapshotResponse, From: "B", To: "A", Term: 99, Success: false,
+	}})
+	if !out.SteppedDown || a.Role() != Follower || a.CurrentTerm() != 99 {
+		t.Fatalf("expected a step-down to Follower/term 99, got SteppedDown=%v Role()=%v CurrentTerm()=%d", out.SteppedDown, a.Role(), a.CurrentTerm())
+	}
+	if !out.ResetElectionTimer || out.ElectionTimeoutTicks <= 0 {
+		t.Fatalf("a former Leader stepping down on a stale InstallSnapshotResponse must get a fresh election timer (it had none running as Leader), got ResetElectionTimer=%v ElectionTimeoutTicks=%d", out.ResetElectionTimer, out.ElectionTimeoutTicks)
+	}
+}

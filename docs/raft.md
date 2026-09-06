@@ -505,3 +505,50 @@ issuance, independent of `matchIndex`'s absolute value. This is
 implementation detail local to `internal/node` (`Core` itself is
 unmodified), recorded here because the failure mode is subtle enough
 that a future re-implementation should not rediscover it the hard way.
+
+## 11. Phase 7 implementation notes
+
+### 11.1 Election-timer liveness bug found by chaos testing (resolved)
+
+`docs/testing-strategy.md` §7.1 has the full account;
+`docs/failure-model.md` §2.8 has the accepted-behavior framing this bug
+actually violated. Summary for readers of this document specifically:
+`Core.handleRequestVoteRequest`'s reject-but-stepped-down path,
+`handleRequestVoteResponse`'s higher-term stepdown, and both
+`handleAppendEntriesResponse`'s and `handleInstallSnapshotResponse`'s
+higher-term stepdowns each correctly stepped a former Leader/Candidate
+down to Follower (`Output.SteppedDown`) but did not also set
+`Output.ResetElectionTimer` — unlike `handleAppendEntriesRequest` and
+`handleInstallSnapshotRequest`, which always do, unconditionally,
+regardless of whether the specific request they carry is itself
+accepted. A Leader has no election timer running (only its heartbeat
+timer), so a driver that only ever arms/rearms the election timer from
+`ResetElectionTimer` left such a node with none running, permanently,
+once it stepped down through one of the four gapped paths — a genuine
+liveness bug an adversarial asymmetric partition (a higher-term
+candidate whose log is not up to date, correctly denied forever, while
+every other node silently loses its own ability to ever call a fresh
+election) could trigger. Fixed: all four paths now set
+`ResetElectionTimer`/`ElectionTimeoutTicks` whenever `stepDownTo`
+reports the node was previously Leader or Candidate, matching the
+request-handler paths' existing unconditional behavior. This closes a
+general principle worth stating explicitly for any future handler added
+to `Core`: **any transition that leaves a node in Follower role must
+either come with an election timer reset in the same `Output`, or rely
+on one already known to be live** — a plain Follower staying Follower
+already has one; a former Leader or Candidate does not, by
+construction, and must always get a fresh one.
+
+### 11.2 Directional (asymmetric) partition support
+
+The deterministic simulator already supported this since Phase 4
+(`internal/fault.Transport.IsolateLink(from, to)`, one direction only).
+Phase 7 added the same capability to the production transport
+(`internal/transport.Transport.BlockSend`/`BlockRecv`, alongside the
+existing symmetric `Block`/`Unblock`) so an asymmetric partition —
+docs/roadmap.md Phase 7's own required topology — can be exercised
+against real sockets too, not only the simulator. `Core` itself
+required no change: an asymmetric partition is entirely a transport-
+layer/message-delivery concern, exactly the kind of fault
+`docs/failure-model.md` §2.6 already documents Raft as designed to
+tolerate for liveness without affecting safety.

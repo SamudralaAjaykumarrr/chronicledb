@@ -1,8 +1,11 @@
 # Roadmap and Maturity Model
 
-Status: Architecture Foundation. This document defines the phase
-sequence and the evidence gates that govern when a maturity claim is
-allowed. **No phase past Phase 0 has begun.**
+Status: this document defines the phase sequence and the evidence
+gates that govern when a maturity claim is allowed. Phases 1-7 are
+complete (each at its own documented scope — see that phase's own
+section below for exactly what it does and does not claim); current
+maturity is `STRONG DISTRIBUTED V1` (§Maturity Model below). Phase 8
+(Constrained SQL) has not begun.
 
 ## Phase sequence
 
@@ -141,17 +144,51 @@ through SN-6) — see `internal/raft/snapshot_test.go`,
 `internal/wal/snapshot_test.go`, and
 `internal/node/node_test.go::TestSN1_RestartRestoresFromSnapshotAndCompactsLog`/
 `TestSN5_FollowerCatchesUpViaSnapshotAfterLeaderCompaction`. Per
-§Maturity Model below, `STRONG DISTRIBUTED V1` additionally requires
-Phase 7 (chaos/combined fault schedules), not yet attempted.
+§Maturity Model below, `STRONG DISTRIBUTED V1` additionally required
+Phase 7 (chaos/combined fault schedules), now also complete — see that
+phase's own section below.
 
-### Phase 7 — Network partitions + crash lab + fault injection / chaos
+### Phase 7 — Network partitions + crash lab + fault injection / chaos — COMPLETE (at this phase's own scope)
 
 Combined, randomized fault schedules (partitions, crashes, disk
 faults, message-level faults, all together, at scale, over many
 iterations) are run via `internal/fault`, per
 [`docs/testing-strategy.md`](testing-strategy.md) §3.3 "chaos tests."
 This phase is about *breadth and adversarial combination* of scenarios
-already individually proven in Phases 1-6, not new mechanism.
+already individually proven in Phases 1-6, not new mechanism — and, per
+that guiding principle, no new Raft/replication/snapshot mechanism was
+added; the additions are: deterministic disk-fault injection and a
+graceful (non-panicking) failure path in `internal/fault`, a
+directional-only partition hook (`Transport.BlockSend`/`BlockRecv`) in
+`internal/transport` needed to express an asymmetric partition against
+real sockets (a purely symmetric `Block`/`Unblock` cannot), and a
+minimal `/fault` control-plane endpoint in `cmd/chronicledb-node` to
+drive that same hook against genuine separate OS processes. Seeded,
+reproducible randomized property suites
+(`internal/fault/chaos_test.go`) combine elections, proposals,
+crashes/restarts, partitions/isolation/heals, message drop/duplicate/
+delay, local log compaction, asymmetric partitions, and injected disk
+faults, checked after every action against RAFT-ELECTION-SAFETY,
+RAFT-LOG-MATCHING, and a simplified reference-model oracle for
+COMMITTED-PREFIX-SAFETY; `internal/node/chaos_test.go` and
+`cmd/chronicledb-node/chaos_test.go` (the latter `-tags=integration`,
+genuine SIGKILL) prove the same combined-fault shapes end to end
+against real disk/network/processes. This chaos work found and fixed
+two genuine bugs (a Raft liveness bug where a node stepping down from
+Leader/Candidate without granting the triggering vote/response could be
+left with no election timer ever armed again, under an adversarial
+asymmetric partition; and a WAL bug where installing a snapshot that
+advances a node past a gap it never physically held any entries for did
+not durably-equivalent-ly advance the WAL's own next-log-index counter,
+fatally erroring the next live append) and one genuine data race (a
+plain-pointer `internal/node.Node.fsmachine` field read/written from
+different goroutines during snapshot install, fixed with
+`atomic.Pointer`) — see
+[`docs/testing-strategy.md`](testing-strategy.md) §7 for the full,
+honest account of each, its regression test, and what remains
+untested. See [`docs/scenario-corpus.md`](scenario-corpus.md)'s Phase 7
+note for the precise chaos-variant accounting of RF-11/RF-13/RF-15 and
+the SN-\* scenarios.
 
 ### Phase 8 — Constrained SQL using real transaction machinery
 
@@ -224,8 +261,8 @@ interpretation guidance, not exhaustive:
 | `ARCHITECTURE FOUNDATION` | All documents/ADRs in [`docs/README.md`](README.md) exist, are internally consistent (see the cross-document consistency review performed for this phase), define every system boundary listed in [`docs/architecture.md`](architecture.md), and no database implementation has begun. |
 | `SINGLE-NODE DURABLE ENGINE` | Phase 1 complete: `docs/scenario-corpus.md` §Local Durability scenarios pass, reproducibly, in CI. `internal/storage`/`internal/wal` implement and test LD-1 through LD-6 (see test files under those packages); a GitHub Actions workflow (`.github/workflows/ci.yml`) runs `go test -race ./...` on every push. |
 | `TRANSACTIONAL ENGINE` | Phases 2-3 complete: §Transactions and §Idempotency (immediate/after-restart) scenarios pass. |
-| `REPLICATED PROTOTYPE` | Phases 4-5 complete: §Raft/Replication scenarios pass in the deterministic simulator and in a real multi-process three-node deployment. **This repository's current state** — see [`docs/scenario-corpus.md`](scenario-corpus.md)'s Phase 5 note for the specific per-scenario accounting: RF-1, RF-3 (log-catch-up leg), RF-4, RF-5, RF-6, RF-9 through RF-13 are proven against real disk/network/processes; RF-2, RF-7, RF-8, RF-14, and RF-15 remain proven only in the deterministic simulator, by deliberate, documented scope decisions ([`docs/raft.md`](raft.md) §10.2), not gaps in the wiring this gate is actually about. |
-| `STRONG DISTRIBUTED V1` | Phases 6-7 complete: §Snapshots scenarios pass; chaos/combined fault schedules run for a meaningful duration without an invariant violation. |
+| `REPLICATED PROTOTYPE` | Phases 4-5 complete: §Raft/Replication scenarios pass in the deterministic simulator and in a real multi-process three-node deployment. See [`docs/scenario-corpus.md`](scenario-corpus.md)'s Phase 5 note for the specific per-scenario accounting: RF-1, RF-3 (log-catch-up leg), RF-4, RF-5, RF-6, RF-9 through RF-13 are proven against real disk/network/processes; RF-2, RF-7, RF-8, RF-14, and RF-15 remain proven only in the deterministic simulator, by deliberate, documented scope decisions ([`docs/raft.md`](raft.md) §10.2), not gaps in the wiring this gate is actually about. |
+| `STRONG DISTRIBUTED V1` | Phases 6-7 complete: §Snapshots scenarios pass; chaos/combined fault schedules run for a meaningful duration without an invariant violation. **This repository's current state** — see [`docs/scenario-corpus.md`](scenario-corpus.md)'s Phase 7 note and [`docs/testing-strategy.md`](testing-strategy.md) §6-7 for the specific evidence: seeded randomized chaos suites at `internal/fault` (raft-core layer, tens of thousands of seeds run clean locally during this phase), real-disk/real-TCP chaos at `internal/node`, and genuine real-process SIGKILL chaos at `cmd/chronicledb-node`, plus the two genuine bugs and one data race this work found and fixed, each with a deterministic regression test. |
 | `PORTFOLIO READY` | Phase 8-9 substantially complete: constrained SQL works end-to-end on the real engine; observability surfaces exist; auth/TLS gap from [`docs/non-goals.md`](non-goals.md) is resolved or explicitly, prominently documented as a deployment prerequisite. |
 | `OPEN-SOURCE READY` | Phase 11 packaging complete on top of `PORTFOLIO READY`: license, contribution docs, versioned release, no known unresolved correctness gaps. |
 | `EXTERNAL-REVIEW READY` | `OPEN-SOURCE READY` plus a specific, documented invitation/process for Phase 12 review is in place. |

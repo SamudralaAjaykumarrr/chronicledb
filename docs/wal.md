@@ -319,3 +319,30 @@ pointer it already tracked since Phase 1 (`internal/snapshot` and
   intervening restart, and a restart immediately after compaction
   correctly replaying only the entries actually still needed — see
   `internal/wal/snapshot_test.go`.
+
+## 12. Phase 7 implementation decisions (resolved)
+
+Phase 7's chaos testing (`docs/testing-strategy.md` §7.3) found a
+genuine bug in `Truncate`'s interaction with §11's compaction
+mechanism, specific to a live (not-yet-restarted) process: `Truncate`
+is documented ("Truncate durably discards every RecordTypeLogEntry
+record with index >= fromIndex, so a subsequent AppendLogEntry resumes
+exactly at fromIndex") as guaranteeing where the next append lands, but
+its no-op guard for "nothing at or after fromIndex exists" — correct
+and necessary for its original caller, `raft.Storage.Truncate`'s
+divergent-suffix repair, where `fromIndex` is always an index already
+physically present — silently violated that same guarantee for a
+second, later caller `internal/node.WALStorage.InstallSnapshot`
+introduced in Phase 6: jumping `nextLogIndex` *forward*, past a gap
+this WAL never physically held any entries for, to match a newly
+installed snapshot's boundary (the ordinary shape for a follower whose
+log was simply behind, not diverged). `Truncate` now advances
+`nextLogIndex` to `fromIndex` in this no-op-for-physical-content case
+too, whenever `fromIndex` is actually ahead of it — bringing the live
+in-memory counter into agreement with what `Open`'s own restart
+recovery already independently derives from the durable
+`Metadata.LatestSnapshotIndex` pointer when no `LogEntry` record
+survives (§11's `AppendMetadataSnapshot`, always called before
+`Truncate` within `InstallSnapshot`, so no additional durable write is
+needed for this fix — the value it needs was already durable). See
+`internal/wal/snapshot_test.go::TestTruncateJumpsNextIndexForwardPastInstalledSnapshotGap`.

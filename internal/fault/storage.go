@@ -27,12 +27,59 @@ type MemoryStorage struct {
 	mu      sync.Mutex
 	hs      raft.HardState
 	entries []raft.Entry // entries[i] holds log index i+1
+
+	// failAppends/failSetHardState/failTruncate count down remaining
+	// injected failures for their respective operation
+	// (docs/failure-model.md §1.8 "disk write failure"; Phase 7's
+	// deterministic disk-fault-injection capability
+	// docs/testing-strategy.md §3.1 already documents but Phase 4 never
+	// implemented). Each call while the counter is > 0 decrements it and
+	// returns errInjectedFault instead of performing the write; once the
+	// counter reaches 0, calls succeed normally again — so a test can
+	// inject exactly N consecutive failures (typically 1) at a precise
+	// moment without needing wall-clock or call-count coordination
+	// elsewhere.
+	failAppends      int
+	failSetHardState int
+	failTruncate     int
 }
+
+// errInjectedFault is returned by a MemoryStorage operation a test has
+// deliberately configured to fail (FailNextAppends etc.), modeling a
+// real disk write/fsync failure (docs/failure-model.md §1.8) without
+// touching real disk I/O.
+var errInjectedFault = fmt.Errorf("fault: injected storage failure")
 
 // NewMemoryStorage returns an empty MemoryStorage, as a brand-new
 // node's durable store would start.
 func NewMemoryStorage() *MemoryStorage {
 	return &MemoryStorage{}
+}
+
+// FailNextAppends configures the next n calls to Append to fail with
+// errInjectedFault instead of persisting anything, deterministically
+// modeling a disk write/fsync failure at an exact, reproducible point
+// in a run (docs/failure-model.md §1.8).
+func (s *MemoryStorage) FailNextAppends(n int) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.failAppends = n
+}
+
+// FailNextSetHardState configures the next n calls to SetHardState to
+// fail with errInjectedFault. See FailNextAppends.
+func (s *MemoryStorage) FailNextSetHardState(n int) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.failSetHardState = n
+}
+
+// FailNextTruncate configures the next n calls to Truncate to fail
+// with errInjectedFault. See FailNextAppends.
+func (s *MemoryStorage) FailNextTruncate(n int) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.failTruncate = n
 }
 
 func (s *MemoryStorage) InitialState() (raft.HardState, error) {
@@ -44,6 +91,10 @@ func (s *MemoryStorage) InitialState() (raft.HardState, error) {
 func (s *MemoryStorage) SetHardState(hs raft.HardState) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if s.failSetHardState > 0 {
+		s.failSetHardState--
+		return errInjectedFault
+	}
 	s.hs = hs
 	return nil
 }
@@ -75,6 +126,10 @@ func (s *MemoryStorage) Entries(lo, hi raft.Index) ([]raft.Entry, error) {
 func (s *MemoryStorage) Truncate(fromIndex raft.Index) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if s.failTruncate > 0 {
+		s.failTruncate--
+		return errInjectedFault
+	}
 	if fromIndex < 1 {
 		return fmt.Errorf("fault: MemoryStorage.Truncate: fromIndex must be >= 1, got %d", fromIndex)
 	}
@@ -87,6 +142,10 @@ func (s *MemoryStorage) Truncate(fromIndex raft.Index) error {
 func (s *MemoryStorage) Append(entries []raft.Entry) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if s.failAppends > 0 {
+		s.failAppends--
+		return errInjectedFault
+	}
 	want := raft.Index(len(s.entries) + 1)
 	for _, e := range entries {
 		if e.Index != want {

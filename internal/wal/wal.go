@@ -386,7 +386,24 @@ func (w *WAL) Truncate(fromIndex uint64) error {
 		return fmt.Errorf("wal: Truncate: fromIndex must be >= 1, got %d", fromIndex)
 	}
 	if fromIndex >= w.nextLogIndex {
-		return nil // nothing at or after fromIndex exists
+		// Nothing physically present at or after fromIndex to remove,
+		// but this method's own contract ("a subsequent AppendLogEntry
+		// resumes exactly at fromIndex") still must hold — in
+		// particular for internal/node.WALStorage.InstallSnapshot's use
+		// of Truncate to jump this WAL's own next-index counter forward
+		// past a gap it never physically held any entries for (the
+		// ordinary case for a follower catching up via snapshot: its
+		// log was behind, not merely diverged). Recovery (Open, above)
+		// already derives exactly this value
+		// (meta.LatestSnapshotIndex+1) from the durably-recorded
+		// snapshot pointer when no LogEntry record survives, so this is
+		// purely bringing this live, not-yet-restarted WAL's in-memory
+		// counter into agreement with what a restart would already
+		// compute — no additional durable write is required here.
+		if fromIndex > w.nextLogIndex {
+			w.nextLogIndex = fromIndex
+		}
+		return nil
 	}
 
 	ids, err := storage.ListSegmentIDs(w.dir)

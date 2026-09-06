@@ -38,12 +38,13 @@ import (
 
 func main() {
 	var (
-		id         = flag.String("id", "", "this node's ID")
-		listenAddr = flag.String("listen", "", "raft transport listen address (host:port)")
-		httpAddr   = flag.String("http", "", "control-plane HTTP listen address (host:port)")
-		peersFlag  = flag.String("peers", "", "comma-separated id=addr list for every OTHER cluster member")
-		allFlag    = flag.String("cluster", "", "comma-separated id list of every cluster member, including this one")
-		dataDir    = flag.String("datadir", "", "durable log directory")
+		id                = flag.String("id", "", "this node's ID")
+		listenAddr        = flag.String("listen", "", "raft transport listen address (host:port)")
+		httpAddr          = flag.String("http", "", "control-plane HTTP listen address (host:port)")
+		peersFlag         = flag.String("peers", "", "comma-separated id=addr list for every OTHER cluster member")
+		allFlag           = flag.String("cluster", "", "comma-separated id list of every cluster member, including this one")
+		dataDir           = flag.String("datadir", "", "durable log directory")
+		snapshotThreshold = flag.Uint64("snapshot-threshold", 0, "log entries since last snapshot before compacting (0 = package default); tests use a small value to force snapshot/compaction chaos quickly")
 	)
 	flag.Parse()
 
@@ -80,6 +81,7 @@ func main() {
 		ElectionTimeoutJitterTicks: 10,
 		HeartbeatTimeoutTicks:      2,
 		TickInterval:               25 * time.Millisecond,
+		SnapshotThreshold:          *snapshotThreshold,
 		Logger:                     logger,
 	}
 
@@ -126,7 +128,51 @@ func newControlServer(n *node.Node, logger *log.Logger) *controlServer {
 	s.mux.HandleFunc("/status", s.handleStatus)
 	s.mux.HandleFunc("/propose", s.handlePropose)
 	s.mux.HandleFunc("/outcome", s.handleOutcome)
+	s.mux.HandleFunc("/fault", s.handleFault)
 	return s
+}
+
+// handleFault is Phase 7's minimal real-process fault-injection hook
+// (docs/roadmap.md Phase 7's "real network partition injection...
+// controlled transport fault hooks only if consistent with the repo
+// architecture"): it exposes internal/transport.Transport's
+// Block/Unblock and directional BlockSend/BlockRecv/UnblockSend/
+// UnblockRecv (this phase's own addition, for asymmetric partitions)
+// over the same local control plane /propose and /status already use,
+// so an integration test can inject and heal a real network partition
+// between genuine OS processes — not just in-process
+// (internal/node/chaos_test.go) or in the deterministic simulator
+// (internal/fault/chaos_test.go).
+func (s *controlServer) handleFault(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "POST required", http.StatusMethodNotAllowed)
+		return
+	}
+	action := r.URL.Query().Get("action")
+	peer := raft.NodeID(r.URL.Query().Get("peer"))
+	if peer == "" {
+		http.Error(w, "peer is required", http.StatusBadRequest)
+		return
+	}
+	tr := s.n.Transport()
+	switch action {
+	case "block":
+		tr.Block(peer)
+	case "unblock":
+		tr.Unblock(peer)
+	case "blocksend":
+		tr.BlockSend(peer)
+	case "unblocksend":
+		tr.UnblockSend(peer)
+	case "blockrecv":
+		tr.BlockRecv(peer)
+	case "unblockrecv":
+		tr.UnblockRecv(peer)
+	default:
+		http.Error(w, "unknown action: "+action, http.StatusBadRequest)
+		return
+	}
+	w.WriteHeader(http.StatusOK)
 }
 
 func (s *controlServer) ServeHTTP(w http.ResponseWriter, r *http.Request) { s.mux.ServeHTTP(w, r) }

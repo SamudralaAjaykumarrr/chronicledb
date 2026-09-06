@@ -34,6 +34,44 @@ func TestFirstIndexTracksSnapshotPointerLive(t *testing.T) {
 	}
 }
 
+// TestTruncateJumpsNextIndexForwardPastInstalledSnapshotGap is a Phase 7
+// chaos regression (found by cmd/chronicledb-node's real-process
+// TestRealChaos_SIGKILLDuringSnapshotInstall: a real follower installed
+// a snapshot at index 10, kept running without restarting, and then
+// fatally errored the moment it needed to durably append index 11 —
+// "WAL assigned index 1 for raft log index 11 (log responsibility
+// mismatch)"). internal/node.WALStorage.InstallSnapshot calls
+// Truncate(uptoIndex+1) specifically to jump this WAL's own next-index
+// counter forward to match a peer's snapshot boundary — the ordinary
+// case for a follower whose log was simply behind (not diverged), which
+// has nothing physically present at or after fromIndex to remove. This
+// proves that jump actually happens (matching the identical value a
+// restart's own recovery already derives from the durable snapshot
+// pointer — see Open's "!seenAnyLogEntry" branch), so the very next
+// AppendLogEntry after an install resumes at exactly the right index
+// without needing an intervening restart.
+func TestTruncateJumpsNextIndexForwardPastInstalledSnapshotGap(t *testing.T) {
+	dir := t.TempDir()
+	w, _ := mustOpen(t, dir, Options{})
+	defer w.Close()
+
+	// A brand-new WAL: nothing physically present yet at all.
+	if err := w.AppendMetadataSnapshot(10); err != nil {
+		t.Fatalf("AppendMetadataSnapshot(10): %v", err)
+	}
+	if err := w.Truncate(11); err != nil {
+		t.Fatalf("Truncate(11): %v", err)
+	}
+
+	idx, err := w.AppendLogEntry([]byte("x"))
+	if err != nil {
+		t.Fatalf("AppendLogEntry after Truncate past an installed-snapshot gap: %v", err)
+	}
+	if idx != 11 {
+		t.Fatalf("AppendLogEntry assigned index %d, want 11 (Truncate must advance nextLogIndex even when nothing physical needed removing)", idx)
+	}
+}
+
 func TestAppendMetadataSnapshotRejectsGoingBackward(t *testing.T) {
 	dir := t.TempDir()
 	w, _ := mustOpen(t, dir, Options{})

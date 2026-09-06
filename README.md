@@ -11,7 +11,7 @@ store, or a wrapper around an existing finished database or consensus
 library. See [`docs/vision.md`](docs/vision.md) for the full statement
 of intent and explicit non-goals.
 
-Current maturity: **REPLICATED PROTOTYPE**
+Current maturity: **STRONG DISTRIBUTED V1**
 
 Phase 1 — durable append-only segment storage (`internal/storage`) and
 a checksummed, replayable write-ahead log with crash recovery
@@ -115,11 +115,60 @@ through SN-6) at both the unit level (`internal/raft/snapshot_test.go`,
 `internal/wal/snapshot_test.go`, `internal/snapshot/manager_test.go`)
 and end-to-end against real disk/network (`internal/node/node_test.go`).
 
-Per [`docs/roadmap.md`](docs/roadmap.md) §Maturity Model,
-`STRONG DISTRIBUTED V1` requires Phases 6-7 together; Phase 7
-(chaos/combined fault schedules) has not yet been attempted, so this
-repository's current maturity claim remains `REPLICATED PROTOTYPE`
-above.
+Phase 7 — network partitions, a crash laboratory, and combined,
+randomized fault-injection chaos testing (extending
+`internal/fault`, `internal/node`, and `cmd/chronicledb-node`, no new
+mechanism) — is now also implemented. `internal/fault` gained
+deterministic disk-fault injection
+(`MemoryStorage.FailNextAppends`/`FailNextSetHardState`/`FailNextTruncate`),
+a `Node.Failed`/`FailErr` graceful-stop path for a genuine injected
+persistence failure (mirroring `internal/node.Node.fail` instead of
+panicking), and `Cluster.Compact`/`Cluster.Seed` — and
+`internal/fault/chaos_test.go` runs several seeded, reproducible
+randomized property suites against a much richer combined action space
+(elections, proposals, crashes/restarts, partitions/heals/isolation,
+message drop/duplicate/delay, local compaction, asymmetric
+(directional-only) partitions via `Transport.IsolateLink`, and injected
+disk faults) — by default a fast CI-sized seed count per suite, or a
+much larger count via the `CHRONICLEDB_CHAOS_SEEDS` environment
+variable for local/nightly stress runs (tens of thousands of seeds
+across the whole suite have been run clean locally during this phase's
+own development). `internal/transport` gained directional-only
+`BlockSend`/`BlockRecv` (an asymmetric-partition hook a purely symmetric
+`Block`/`Unblock` cannot express), used by new real-disk/real-TCP chaos
+tests in `internal/node/chaos_test.go` (repeated crash/restart cycles,
+retry across multiple leadership epochs, retry after snapshot
+compaction, conflict-outcome stability across a snapshot+restart,
+asymmetric partition safety, repeated partition/heal across changing
+leaders, transaction atomicity across a leader crash, and a follower
+crash during snapshot catch-up) and genuine real-process
+(`cmd/chronicledb-node/chaos_test.go`, `-tags=integration`) SIGKILL
+scenarios: a follower killed mid-replication, repeated SIGKILL attempts
+timed around a real snapshot install, a lost-response-then-retry
+sequence that never waits for the original response, and a real
+(not simulated) network partition/heal via a new minimal `/fault`
+control-plane endpoint. This chaos work found and fixed two genuine
+bugs — see [`docs/testing-strategy.md`](docs/testing-strategy.md) §7 for
+the full account: (1) a Raft election-safety-adjacent **liveness** bug
+in `internal/raft.Core` where a node stepping down from Leader/Candidate
+without granting the triggering vote/response could be left with no
+election timer armed at all, permanently, under an adversarial
+asymmetric-partition schedule; and (2) a genuine data race on
+`internal/node.Node`'s `FSM()` accessor during snapshot install
+(fixed with `atomic.Pointer`), plus (3) a WAL bug where
+`internal/node.WALStorage.InstallSnapshot`'s use of `wal.WAL.Truncate`
+to jump this node's own next-log-index counter forward past a
+snapshot-covered gap silently failed to do so when nothing physical
+needed removing — fatally erroring the very next append after a live
+(non-restarted) snapshot install. All three are fixed, each with its
+own deterministic regression test, and proven clean afterward at high
+seed counts. Per [`docs/roadmap.md`](docs/roadmap.md) §Maturity Model,
+`STRONG DISTRIBUTED V1` is Phases 6-7 together; both are now complete
+and evidenced, which is this repository's current maturity claim above.
+See [`docs/testing-strategy.md`](docs/testing-strategy.md) §6-7 and
+[`docs/scenario-corpus.md`](docs/scenario-corpus.md) for the precise,
+honest accounting of what Phase 7 does and does not claim (untested
+failure classes are documented explicitly, not implied covered).
 
 No SQL implementation exists yet. See
 [`docs/roadmap.md`](docs/roadmap.md) §Maturity Model for the

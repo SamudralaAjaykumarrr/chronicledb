@@ -43,6 +43,7 @@ type Cluster struct {
 	transport *Transport
 	rnd       *Rand
 	tick      int64
+	seed      int64
 }
 
 // NewCluster constructs a Cluster with one Node per entry in peers,
@@ -55,6 +56,7 @@ func NewCluster(peers []raft.NodeID, opts ClusterOptions) *Cluster {
 		nodes:     make(map[raft.NodeID]*Node, len(peers)),
 		transport: NewTransport(),
 		rnd:       NewRand(opts.Seed),
+		seed:      opts.Seed,
 	}
 	cl.order = append([]raft.NodeID(nil), peers...)
 	sort.Slice(cl.order, func(i, j int) bool { return cl.order[i] < cl.order[j] })
@@ -86,6 +88,29 @@ func (cl *Cluster) Transport() *Transport { return cl.transport }
 
 // LogicalTick returns the cluster's current logical time.
 func (cl *Cluster) LogicalTick() int64 { return cl.tick }
+
+// Seed returns the seed this cluster was constructed with
+// (docs/testing-strategy.md §3.2's reproduction triple: configuration +
+// seed + explicit call sequence) — a failing chaos run logs this so it
+// can be replayed exactly.
+func (cl *Cluster) Seed() int64 { return cl.seed }
+
+// Compact performs a node's own local log compaction against a
+// snapshot boundary at uptoIndex (docs/snapshots.md §3's "a node's own
+// local compaction," the same operation internal/node.Node.maybeSnapshot
+// performs against a real snapshot; the simulator has no FSM/snapshot
+// content of its own — see internal/fault's package doc comment — so
+// this only exercises raft.Core's log-retention side of
+// LOG-COMPACTION-SAFETY, which is transport/FSM-independent by
+// construction). It reports whether the compaction actually advanced
+// anything, mirroring raft.Core.Compact.
+func (cl *Cluster) Compact(id raft.NodeID, uptoIndex raft.Index) bool {
+	n := cl.nodes[id]
+	if n == nil || n.Crashed() {
+		return false
+	}
+	return n.core.Compact(uptoIndex)
+}
 
 func (cl *Cluster) flush(n *Node) {
 	for _, m := range n.DrainOutbox() {

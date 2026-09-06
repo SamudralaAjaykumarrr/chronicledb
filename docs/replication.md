@@ -204,6 +204,28 @@ Required, exact behavior:
 | Partition active, `B` elected | `A` cannot commit; any write appears hung/timed out from the client's perspective until the client redirects to `B`/`C` | Full read/write service, including strong reads via `B`'s `ReadIndex` (§4) |
 | Partition healed | `A` (now follower) redirects/rejects writes; a client still pointed at `A` for reads must not be served a stale "strong" read from `A` post-partition-formation — `A` (as follower) does not serve leader-only strong reads at all in V1 (§4) | Unaffected |
 
+### 5.2 Asymmetric partitions and chaos evidence (Phase 7)
+
+The scenario above is a *symmetric* partition (`A` can neither send to
+nor receive from `B`/`C`). An asymmetric partition — `A` can still
+*send* to `B` (so `B` might durably persist an entry `A` proposes) but
+cannot *receive* `B`'s acknowledgements back — is a harder case in
+principle (a leader that cannot observe its own replication progress),
+but resolves via the identical mechanism: `A` can never observe a
+majority `matchIndex` for anything proposed during the cut (no
+acknowledgement reaches it), so `QUORUM-SAFETY` holds by the same
+current-term commit rule ([`docs/raft.md`](raft.md) §4), without
+needing to know the cut is directional rather than total. This is now
+proven, not just argued: seeded, randomized chaos testing combines
+asymmetric partitions with elections/proposals at the deterministic
+raft-core layer, in-process against real disk/network via
+`internal/transport`'s new `BlockSend`/`BlockRecv` hooks, and against
+genuine separate OS processes via `cmd/chronicledb-node`'s new
+`/fault` control-plane endpoint — see
+[`docs/testing-strategy.md`](testing-strategy.md) §6 for the full
+account, including a genuine election-timer liveness bug this exact
+testing found and fixed (§7.1 there).
+
 ## 6. What ChronicleDB explicitly does not guarantee
 
 - Availability during a genuine minority-partition on the minority

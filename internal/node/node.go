@@ -7,6 +7,7 @@ import (
 	"log"
 	"path/filepath"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/SamudralaAjaykumarrr/chronicledb/internal/fsm"
@@ -186,11 +187,23 @@ type pendingRead struct {
 type Node struct {
 	cfg Config
 
-	core      *raft.Core
-	walog     *wal.WAL
-	storage   *WALStorage
-	snapMgr   *snapshot.Manager
-	fsmachine *fsm.FSM
+	core    *raft.Core
+	walog   *wal.WAL
+	storage *WALStorage
+	snapMgr *snapshot.Manager
+	// fsmachine is normally only ever touched by run's single goroutine
+	// (this type's own doc comment), with one deliberate exception: a
+	// snapshot install (handleInstallSnapshot) atomically replaces it
+	// wholesale, and FSM() is documented as safe to call from any
+	// goroutine for read-only access. An atomic.Pointer, not a plain
+	// *fsm.FSM field, is what actually makes that safe — a plain field
+	// swapped on the event-loop goroutine while FSM() reads it
+	// concurrently from elsewhere is a genuine data race (found by
+	// Phase 7 chaos testing under -race: a follower crashing and
+	// restarting repeatedly during snapshot catch-up, polled
+	// concurrently via FSM(), reliably raced the pointer swap in
+	// handleInstallSnapshot against a concurrent FSM() read).
+	fsmachine atomic.Pointer[fsm.FSM]
 	tr        *transport.Transport
 	logger    *log.Logger
 
@@ -351,7 +364,6 @@ func Open(cfg Config) (*Node, error) {
 		walog:        w,
 		storage:      st,
 		snapMgr:      snapMgr,
-		fsmachine:    fsmachine,
 		tr:           tr,
 		logger:       cfg.Logger,
 		appliedIndex: baseIndex,
@@ -362,6 +374,7 @@ func Open(cfg Config) (*Node, error) {
 		stopCh:       make(chan struct{}),
 		doneCh:       make(chan struct{}),
 	}
+	n.fsmachine.Store(fsmachine)
 	n.electionArmed = true
 	n.electionTicksLeft = core.NewElectionTimeout()
 	n.refreshStatusLocked()
@@ -386,7 +399,7 @@ func (n *Node) Transport() *transport.Transport { return n.tr }
 // that has otherwise established it is safe to read (e.g. after a
 // successful BeginReadIndex). Mutations must only ever happen via
 // Propose.
-func (n *Node) FSM() *fsm.FSM { return n.fsmachine }
+func (n *Node) FSM() *fsm.FSM { return n.fsmachine.Load() }
 
 // Status returns a snapshot of the node's current diagnostic state.
 // Safe to call from any goroutine.
@@ -445,7 +458,7 @@ func (n *Node) majority() int { return len(n.cfg.Peers)/2 + 1 }
 // never resolved (not leader, leadership lost, superseded, canceled, or
 // stopped).
 func (n *Node) Propose(ctx context.Context, cmd fsm.CommitTxnCommand) (fsm.Outcome, error) {
-	if outcome, err := n.fsmachine.Precheck(cmd); err == nil {
+	if outcome, err := n.fsmachine.Load().Precheck(cmd); err == nil {
 		return outcome, nil
 	} else if !errors.Is(err, fsm.ErrRequestIDUnknown) {
 		return fsm.Outcome{}, err
@@ -730,7 +743,7 @@ func (n *Node) applyCommitted(entries []raft.Entry) {
 			n.fail(fmt.Errorf("node: decoding committed entry %d: %w", e.Index, err))
 			return
 		}
-		outcome, err := n.fsmachine.Apply(uint64(e.Index), cmd)
+		outcome, err := n.fsmachine.Load().Apply(uint64(e.Index), cmd)
 		if err != nil {
 			n.fail(fmt.Errorf("node: applying committed entry %d: %w", e.Index, err))
 			return
@@ -774,7 +787,7 @@ func (n *Node) maybeSnapshot() {
 	}
 
 	meta := snapshot.Meta{LastIncludedIndex: n.appliedIndex, LastIncludedTerm: uint64(n.termAtApplied())}
-	if _, err := n.snapMgr.Create(meta, n.fsmachine); err != nil {
+	if _, err := n.snapMgr.Create(meta, n.fsmachine.Load()); err != nil {
 		n.fail(fmt.Errorf("node: creating snapshot at index %d: %w", meta.LastIncludedIndex, err))
 		return
 	}
@@ -845,7 +858,7 @@ func (n *Node) handleInstallSnapshot(msg raft.Message) {
 			n.fail(fmt.Errorf("node: installing snapshot at index %d: %w", snap.Meta.LastIncludedIndex, err))
 			return
 		}
-		n.fsmachine = snap.FSM
+		n.fsmachine.Store(snap.FSM)
 		n.appliedIndex = snap.Meta.LastIncludedIndex
 		// Any waiter for an index this install just superseded is never
 		// resolved from here (applyCommitted no longer replays it) — it

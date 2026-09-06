@@ -91,6 +91,45 @@ deterministic operation from a committed prefix:
   contents alone (though a directory scan as a fallback/consistency
   check is a reasonable implementation detail).
 
+### 3.1 Synchronous creation: known availability risk, honestly evidenced (Phase 6/7)
+
+`internal/node.Node.maybeSnapshot` runs snapshot creation (temp-file
+write, `fsync`, atomic rename, directory `fsync`) synchronously inside
+the same single event-loop goroutine that also processes heartbeat/
+election timers and `AppendEntries` — this is the documented, accepted
+V1 design (not a bug): a strictly more expensive but otherwise ordinary
+extension of the same "durable write blocks the event loop briefly"
+pattern every committed entry's own `fsync` already uses. Phase 7's
+brief asked this to be stressed honestly rather than assumed benign.
+Concrete evidence: `internal/node/node_test.go`'s real-disk/real-TCP
+`testCluster` uses deliberately tight election/heartbeat timeouts
+(5/1 ticks) to keep the ordinary suite fast, which comfortably absorbs
+one entry's `fsync` latency but not reliably the strictly larger
+snapshot-creation sequence — an early version of the snapshot tests
+using those same tight timeouts showed a reproducible ~10-20% flake
+rate (a spurious real election stealing leadership mid-test, purely
+from snapshot-creation latency occasionally exceeding the tight
+budget, especially under contended disk I/O). This is exactly the
+failure class this section warns about: **availability degradation
+(an unnecessary election), never a correctness violation** — no
+committed entry was ever lost or duplicated in any such run; the
+cluster simply and correctly elected a new leader and continued.
+`newTestClusterWithSnapshotThreshold`'s `configFor` now uses
+proportionally larger timeouts (30/3 ticks) specifically for any test
+that actually triggers real snapshot creation, trading test speed for
+not conflating this known, accepted availability characteristic with a
+genuine bug — Phase 7's own chaos suites
+(`internal/node/chaos_test.go`, `cmd/chronicledb-node/chaos_test.go`)
+combine real snapshot creation/compaction with crashes, restarts, and
+partitions at these same proportionally-sized timeouts and found no
+correctness violation attributable to this synchronous design, only
+the already-understood, already-mitigated availability characteristic
+above. No fix was made to *make snapshot creation asynchronous* — that
+would be a genuine architecture change requiring its own ADR (see
+`docs/roadmap.md` §9's "any optimization that weakens a documented
+invariant requires a new ADR"), and creation latency is not itself a
+correctness invariant; V1 accepts this trade-off explicitly.
+
 ## 4. Interrupted creation
 
 If the process crashes while writing the temporary snapshot file:
@@ -157,6 +196,16 @@ snapshot:
    reconnection — no partial snapshot state is ever considered
    installed (the same atomic-rename discipline from §3 applies
    locally on the follower before its own state is replaced).
+
+Step 5's "resume... from `lastIncludedIndex + 1`" is a durable-storage-
+layer guarantee, not just an in-memory one — Phase 7 chaos testing
+found a bug where it silently did not hold for a live (not-yet-
+restarted) follower's underlying WAL after an install: see
+[`docs/wal.md`](wal.md) §12 and
+[`docs/testing-strategy.md`](testing-strategy.md) §7.3 for the full
+account and fix (`wal.WAL.Truncate` now actually advances its own
+next-index counter to match, rather than only a future restart's
+recovery correctly re-deriving it).
 
 ## 8. Log truncation (compaction) after snapshot
 

@@ -89,9 +89,18 @@ type Transport struct {
 	addrs   map[raft.NodeID]string
 	senders map[raft.NodeID]*peerSender
 	blocked map[raft.NodeID]bool
-	closed  bool
-	closeCh chan struct{}
-	wg      sync.WaitGroup
+	// sendBlocked/recvBlocked hold directional-only blocks (BlockSend/
+	// BlockRecv), independent of the symmetric blocked map Block/Unblock
+	// maintain, so an asymmetric partition (this node can send to peer
+	// but not receive from it, or vice versa) can be modeled against a
+	// real socket — docs/scenario-corpus.md Phase 7's asymmetric-
+	// partition scenario, which Block/Unblock's symmetric-only semantics
+	// cannot express on their own.
+	sendBlocked map[raft.NodeID]bool
+	recvBlocked map[raft.NodeID]bool
+	closed      bool
+	closeCh     chan struct{}
+	wg          sync.WaitGroup
 
 	// inbound tracks every accepted (server-side) connection so Close
 	// can force them all shut — an accepted connection is otherwise not
@@ -111,14 +120,16 @@ func New(id raft.NodeID, listenAddr string, peerAddrs map[raft.NodeID]string) (*
 		return nil, fmt.Errorf("transport: listen on %s: %w", listenAddr, err)
 	}
 	t := &Transport{
-		id:      id,
-		ln:      ln,
-		recv:    make(chan raft.Message, 256),
-		addrs:   make(map[raft.NodeID]string, len(peerAddrs)),
-		senders: make(map[raft.NodeID]*peerSender),
-		blocked: make(map[raft.NodeID]bool),
-		closeCh: make(chan struct{}),
-		inbound: make(map[net.Conn]struct{}),
+		id:          id,
+		ln:          ln,
+		recv:        make(chan raft.Message, 256),
+		addrs:       make(map[raft.NodeID]string, len(peerAddrs)),
+		senders:     make(map[raft.NodeID]*peerSender),
+		blocked:     make(map[raft.NodeID]bool),
+		sendBlocked: make(map[raft.NodeID]bool),
+		recvBlocked: make(map[raft.NodeID]bool),
+		closeCh:     make(chan struct{}),
+		inbound:     make(map[net.Conn]struct{}),
 	}
 	for peer, addr := range peerAddrs {
 		t.addrs[peer] = addr
@@ -146,7 +157,7 @@ func (t *Transport) Recv() <-chan raft.Message { return t.recv }
 // identical possibility deterministically).
 func (t *Transport) Send(msg raft.Message) {
 	t.mu.Lock()
-	if t.closed || t.blocked[msg.To] {
+	if t.closed || t.blocked[msg.To] || t.sendBlocked[msg.To] {
 		t.mu.Unlock()
 		return
 	}
@@ -246,7 +257,7 @@ func (t *Transport) readLoop(conn net.Conn) {
 			return
 		}
 		t.mu.Lock()
-		blocked := t.blocked[msg.From]
+		blocked := t.blocked[msg.From] || t.recvBlocked[msg.From]
 		t.mu.Unlock()
 		if blocked {
 			continue // simulated partition: silently drop, as a real dropped packet would be
@@ -341,6 +352,42 @@ func (t *Transport) Unblock(peer raft.NodeID) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	delete(t.blocked, peer)
+}
+
+// BlockSend makes this Transport silently drop every message it tries
+// to send TO peer, without affecting messages received FROM peer — the
+// directional half of an asymmetric partition (this node -> peer is
+// cut, peer -> this node still works). Combine with the peer's own
+// BlockRecv(thisNodeID) (or leave it unblocked, for a one-way-only
+// cut) to build the specific asymmetric topology a test needs. See
+// Block's doc comment for the symmetric case.
+func (t *Transport) BlockSend(peer raft.NodeID) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.sendBlocked[peer] = true
+}
+
+// UnblockSend reverses a prior BlockSend.
+func (t *Transport) UnblockSend(peer raft.NodeID) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	delete(t.sendBlocked, peer)
+}
+
+// BlockRecv makes this Transport silently drop every message received
+// FROM peer, without affecting messages sent TO peer — the other
+// directional half of an asymmetric partition. See BlockSend.
+func (t *Transport) BlockRecv(peer raft.NodeID) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.recvBlocked[peer] = true
+}
+
+// UnblockRecv reverses a prior BlockRecv.
+func (t *Transport) UnblockRecv(peer raft.NodeID) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	delete(t.recvBlocked, peer)
 }
 
 // Close shuts down the listener and every open connection, and stops

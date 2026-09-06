@@ -570,6 +570,25 @@ func (c *Core) handleRequestVoteRequest(msg Message) Output {
 		seq := c.nextPersistSeq()
 		hs := HardState{CurrentTerm: c.currentTerm, VotedFor: c.votedFor}
 		out.PersistRequest = &PersistRequest{Seq: seq, HardState: &hs}
+		// A node that just left Leader or Candidate role
+		// (out.SteppedDown, set above by stepDownTo's return) but did
+		// NOT grant this vote (log not up to date, or already voted for
+		// someone else in the new term) must still get a fresh election
+		// timer armed here: a Leader has no election timer running at
+		// all (only its heartbeat timer), so without this, a driver that
+		// only ever arms/rearms the timer from ResetElectionTimer would
+		// leave this node with no way to ever become a candidate again
+		// on its own — a genuine liveness bug (RAFT-ELECTION-SAFETY
+		// itself is unaffected; this is what let a chaos-testing seed
+		// wedge a whole cluster into permanent unavailability: a
+		// higher-term candidate whose log was not up to date could force
+		// every other node to step down without ever being able to win
+		// an election itself, and — absent this reset — nothing else was
+		// left counting down to ever start a new, winnable one).
+		if out.SteppedDown {
+			out.ResetElectionTimer = true
+			out.ElectionTimeoutTicks = c.cfg.electionTimeout()
+		}
 	}
 	return out
 }
@@ -579,6 +598,12 @@ func (c *Core) handleRequestVoteResponse(msg Message) Output {
 	if msg.Term > c.currentTerm {
 		if c.stepDownTo(msg.Term) {
 			out.SteppedDown = true
+			// See the identical reasoning in handleRequestVoteRequest's
+			// reject-but-stepped-down path just above: a former Leader
+			// or Candidate stepping down here has no other source of a
+			// live election timer.
+			out.ResetElectionTimer = true
+			out.ElectionTimeoutTicks = c.cfg.electionTimeout()
 		}
 		seq := c.nextPersistSeq()
 		hs := HardState{CurrentTerm: c.currentTerm, VotedFor: c.votedFor}
@@ -779,6 +804,11 @@ func (c *Core) handleAppendEntriesResponse(msg Message) Output {
 	if msg.Term > c.currentTerm {
 		if c.stepDownTo(msg.Term) {
 			out.SteppedDown = true
+			// See handleRequestVoteRequest's identical reasoning: this
+			// former Leader has no other source of a live election
+			// timer once it steps down.
+			out.ResetElectionTimer = true
+			out.ElectionTimeoutTicks = c.cfg.electionTimeout()
 		}
 		seq := c.nextPersistSeq()
 		hs := HardState{CurrentTerm: c.currentTerm, VotedFor: c.votedFor}
@@ -950,6 +980,11 @@ func (c *Core) handleInstallSnapshotResponse(msg Message) Output {
 	if msg.Term > c.currentTerm {
 		if c.stepDownTo(msg.Term) {
 			out.SteppedDown = true
+			// See handleRequestVoteRequest's identical reasoning: this
+			// former Leader has no other source of a live election
+			// timer once it steps down.
+			out.ResetElectionTimer = true
+			out.ElectionTimeoutTicks = c.cfg.electionTimeout()
 		}
 		seq := c.nextPersistSeq()
 		hs := HardState{CurrentTerm: c.currentTerm, VotedFor: c.votedFor}

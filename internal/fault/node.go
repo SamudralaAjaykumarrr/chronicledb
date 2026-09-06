@@ -37,6 +37,21 @@ type Node struct {
 	committed []raft.Entry
 
 	crashed bool
+
+	// failed/failErr record a genuine local persistence failure
+	// (docs/failure-model.md §1.8, injected via MemoryStorage's
+	// FailNext* hooks) — distinct from Crash/Restart: a real driver
+	// (internal/node.Node.fail) stops trusting itself rather than
+	// silently continuing when a durable write it required actually
+	// fails, and never falsely acknowledges the operation that
+	// triggered it. A failed Node behaves like a crashed one for Step/
+	// Tick purposes (both become no-ops) but is never implicitly
+	// eligible for Restart: a real failed disk needs the same
+	// crash+restart recovery path as any other stop, modeled here by
+	// calling Crash then Restart explicitly once the test's fault
+	// injection window has passed.
+	failed  bool
+	failErr error
 }
 
 func newNode(cfg raft.Config) *Node {
@@ -72,8 +87,20 @@ func (n *Node) Core() *raft.Core { return n.core }
 func (n *Node) Storage() *MemoryStorage { return n.storage }
 
 // Crashed reports whether this node is currently down (after Crash,
-// before the matching Restart).
-func (n *Node) Crashed() bool { return n.crashed }
+// before the matching Restart), including a node stopped by Failed
+// (both make Step/Tick no-ops).
+func (n *Node) Crashed() bool { return n.crashed || n.failed }
+
+// Failed reports whether this node stopped itself after a genuine
+// local persistence failure (see FailErr), as opposed to an externally
+// injected Crash. A real driver treats this identically to needing a
+// restart (internal/node.Node.fail then relies on a real process
+// restart) — call Crash then Restart to model that recovery here.
+func (n *Node) Failed() bool { return n.failed }
+
+// FailErr returns the error that caused this node to stop itself via a
+// genuine local persistence failure, or nil if Failed() is false.
+func (n *Node) FailErr() error { return n.failErr }
 
 // Crash discards this node's volatile state — its live Core (role,
 // term cache, timers, undelivered outbox) — while leaving Storage,
@@ -82,6 +109,8 @@ func (n *Node) Crashed() bool { return n.crashed }
 // until Restart.
 func (n *Node) Crash() {
 	n.crashed = true
+	n.failed = false
+	n.failErr = nil
 	n.core = nil
 	n.outbox = nil
 	n.electionArmed = false
@@ -113,6 +142,8 @@ func (n *Node) Restart() {
 	}
 	n.core = core
 	n.crashed = false
+	n.failed = false
+	n.failErr = nil
 	n.armInitialElectionTimer()
 }
 
@@ -132,12 +163,26 @@ func (n *Node) CommittedEntries() []raft.Entry {
 // currently crashed) and applies the resulting Output, including
 // synchronously satisfying any PersistRequest.
 func (n *Node) Step(in raft.Input) {
-	if n.crashed {
+	if n.crashed || n.failed {
 		return
 	}
 	n.applyOutput(n.core.Step(in))
 }
 
+// applyOutput applies out's side effects. A genuine PersistRequest
+// failure (deliberately injected via MemoryStorage.FailNext*, modeling
+// docs/failure-model.md §1.8) stops this node exactly as
+// internal/node.Node.fail does in production — recorded via
+// Failed()/FailErr(), never silently ignored and never treated as if
+// the write had actually succeeded (no InputPersistenceComplete is
+// ever delivered for it, matching raft.PersistRequest's own documented
+// contract: Core only advances past a Seq once its driver reports it
+// complete). This is a distinct, intentional non-panic path: a real
+// disk failure is exactly the kind of environmental condition the
+// deterministic simulator must be able to model and recover from
+// (Crash+Restart), not an internal bug — MemoryStorage.Append's
+// non-contiguous-append check remains a panic-worthy invariant
+// violation because a correct driver can never trigger it.
 func (n *Node) applyOutput(out raft.Output) {
 	if out.ResetElectionTimer {
 		n.electionArmed = true
@@ -150,10 +195,21 @@ func (n *Node) applyOutput(out raft.Output) {
 	n.outbox = append(n.outbox, out.Messages...)
 	if len(out.CommittedEntries) > 0 {
 		n.committed = append(n.committed, out.CommittedEntries...)
+		// The simulator has no FSM of its own (see this package's doc
+		// comment) to drive Core.SetApplied the way
+		// internal/node.Node.applyCommitted does after a real fsm.Apply —
+		// here, a committed entry is considered "applied" the instant it
+		// commits, which is what lets chaos tests exercise Compact
+		// (docs/snapshots.md §3, which requires uptoIndex <= appliedIndex)
+		// without needing to model FSM application content the simulator
+		// deliberately stays free of.
+		n.core.SetApplied(out.CommittedEntries[len(out.CommittedEntries)-1].Index)
 	}
 	if out.PersistRequest != nil {
 		if err := raft.ApplyPersistRequest(n.storage, out.PersistRequest); err != nil {
-			panic(fmt.Sprintf("fault: MemoryStorage rejected a PersistRequest: %v", err))
+			n.failed = true
+			n.failErr = fmt.Errorf("fault: durable persistence failed: %w", err)
+			return
 		}
 		ack := n.core.Step(raft.Input{Kind: raft.InputPersistenceComplete, PersistSeq: out.PersistRequest.Seq})
 		n.applyOutput(ack)
@@ -165,7 +221,7 @@ func (n *Node) applyOutput(out raft.Output) {
 // InputElectionTimeout / InputHeartbeatTimeout exactly when their
 // independently-tracked countdowns reach zero. A no-op while crashed.
 func (n *Node) Tick() {
-	if n.crashed {
+	if n.crashed || n.failed {
 		return
 	}
 	if n.electionArmed {

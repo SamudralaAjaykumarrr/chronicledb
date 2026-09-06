@@ -143,13 +143,14 @@ func (rn *realNode) restart(t *testing.T, bin string) {
 }
 
 type statusJSON struct {
-	ID           string `json:"ID"`
-	Role         int    `json:"Role"`
-	Term         uint64 `json:"Term"`
-	Leader       string `json:"Leader"`
-	CommitIndex  uint64 `json:"CommitIndex"`
-	AppliedIndex uint64 `json:"AppliedIndex"`
-	LastIndex    uint64 `json:"LastIndex"`
+	ID            string `json:"ID"`
+	Role          int    `json:"Role"`
+	Term          uint64 `json:"Term"`
+	Leader        string `json:"Leader"`
+	CommitIndex   uint64 `json:"CommitIndex"`
+	AppliedIndex  uint64 `json:"AppliedIndex"`
+	LastIndex     uint64 `json:"LastIndex"`
+	SnapshotIndex uint64 `json:"SnapshotIndex"`
 }
 
 const roleLeader = 2 // raft.Leader's ordinal value (Follower=0, Candidate=1, Leader=2)
