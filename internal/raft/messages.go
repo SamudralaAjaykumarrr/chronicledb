@@ -104,4 +104,14 @@ type Message struct {
 	LastIncludedIndex Index
 	LastIncludedTerm  Term
 	SnapshotData      []byte
+
+	// Seq is a driver-assigned (internal/node), Core-opaque correlation
+	// token: Core itself never reads or writes it (always 0 on any
+	// Message Core constructs) and it plays no role in any Raft safety
+	// invariant. internal/node uses it to distinguish a Success
+	// AppendEntriesResponse that genuinely answers a specific, freshly
+	// sent AppendEntriesRequest from an older one merely processed
+	// later — see Node.ackSeq's doc comment for why that distinction is
+	// load-bearing for ADR-0010's ReadIndex freshness proof.
+	Seq uint64
 }

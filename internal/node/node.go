@@ -159,19 +159,22 @@ type readIndexReq struct {
 type pendingRead struct {
 	term raft.Term
 	// target is the log index a majority of peers must freshly
-	// reconfirm (via baseline below) before this read is safe, and the
-	// index appliedIndex must reach before it is returned as StartSeq.
+	// reconfirm (via requiredSeq below) before this read is safe, and
+	// the index appliedIndex must reach before it is returned as
+	// StartSeq.
 	target raft.Index
-	// baseline snapshots, per peer, the value of Node.lastAck at the
-	// moment this read was issued (see checkPendingReads): the read is
-	// safe only once a majority's lastAck has strictly advanced past
-	// its own baseline, proving each contributed a Success
-	// AppendEntriesResponse sent no earlier than this read's issuance —
-	// a live round-trip in the current term, not merely a possibly-
-	// stale cached replication fact (see Node.lastAck's doc comment for
-	// why comparing against matchIndex directly is not suffient).
-	baseline map[raft.NodeID]uint64
-	resultCh chan readResult
+	// requiredSeq is the value of Node.sentSeqCounter at the moment
+	// this read was issued (see checkPendingReads): the read is safe
+	// only once a majority's Node.ackSeq for that peer exceeds this
+	// value, proving each contributed a Success AppendEntriesResponse
+	// that itself echoes a request Seq assigned no earlier than this
+	// read's issuance — a live round-trip in the current term, not
+	// merely a possibly-stale cached replication fact (see
+	// Node.ackSeq's doc comment for why comparing against matchIndex
+	// directly, or against a purely local processing-order counter, is
+	// not sufficient).
+	requiredSeq uint64
+	resultCh    chan readResult
 }
 
 // Node is ChronicleDB's process-level runtime (docs/architecture.md §5
@@ -216,21 +219,37 @@ type Node struct {
 	waiters      map[raft.Index]waiter
 	pendingReads []pendingRead
 
-	// ackCounter/lastAck implement ADR-0010's ReadIndex freshness proof
-	// (docs/replication.md §4.1): lastAck[peer] is bumped to a fresh,
-	// strictly-increasing value exactly when this node, as Leader,
-	// processes a legitimate (current-term) Success
-	// AppendEntriesResponse from peer (see step). Comparing a pending
-	// read's baseline snapshot (checkPendingReads) against the CURRENT
-	// value proves a live round-trip happened after the read was
-	// issued — comparing against raft.Core's own matchIndex directly
-	// would not: matchIndex only ever increases and is never reset by a
-	// partition, so a leader that already replicated up to its current
-	// LastIndex before becoming isolated would otherwise pass a
+	// sentSeqCounter/ackSeq implement ADR-0010's ReadIndex freshness
+	// proof (docs/replication.md §4.1). sentSeqCounter is bumped once
+	// per outbound MsgAppendEntriesRequest this node ever sends (see
+	// processOutput), and that value is stamped onto the request's
+	// wire-carried Message.Seq; the follower's Core-independent
+	// response echoes the same Seq back (see step), and ackSeq[peer] is
+	// then set to the highest such echoed Seq this node, as Leader, has
+	// processed from peer in a legitimate (current-term) Success
+	// AppendEntriesResponse.
+	//
+	// checkPendingReads requires ackSeq[peer] to exceed the
+	// sentSeqCounter value captured when the read was issued
+	// (pendingRead.requiredSeq), proving a live round-trip answered a
+	// request sent no earlier than the read's issuance. This must be a
+	// wire-carried, request-specific correlation token, not simply "was
+	// some qualifying ack processed after the read was issued": Node's
+	// single event-loop goroutine can be arbitrarily delayed relative
+	// to real time (GC pause, scheduling contention, a burst of other
+	// work already queued), so an ack that was already in flight (sent
+	// and even received) before this node captured target/requiredSeq
+	// could otherwise still be *processed* after — and, judged only by
+	// processing order, be mistaken for live proof of post-issuance
+	// connectivity it does not actually provide. Comparing against
+	// raft.Core's own matchIndex directly would fail for a different,
+	// simpler reason: matchIndex only ever increases and is never reset
+	// by a partition, so a leader that already replicated up to its
+	// current LastIndex before becoming isolated would pass a
 	// matchIndex-based check vacuously, without any fresh contact at
 	// all, defeating the safety property this check exists to prove.
-	ackCounter uint64
-	lastAck    map[raft.NodeID]uint64
+	sentSeqCounter uint64
+	ackSeq         map[raft.NodeID]uint64
 
 	proposeCh   chan proposeReq
 	readIndexCh chan readIndexReq
@@ -375,7 +394,7 @@ func Open(cfg Config) (*Node, error) {
 		logger:       cfg.Logger,
 		appliedIndex: baseIndex,
 		waiters:      make(map[raft.Index]waiter),
-		lastAck:      make(map[raft.NodeID]uint64, len(cfg.Peers)),
+		ackSeq:       make(map[raft.NodeID]uint64, len(cfg.Peers)),
 		proposeCh:    make(chan proposeReq),
 		readIndexCh:  make(chan readIndexReq),
 		stopCh:       make(chan struct{}),
@@ -587,11 +606,14 @@ func (n *Node) step(in raft.Input) {
 	// Recognize a legitimate, current-term Success AppendEntriesResponse
 	// BEFORE handing it to Core, using exactly the same precondition
 	// (Role==Leader, msg.Term==CurrentTerm) Core itself uses to decide
-	// whether to actually honor it — see Node.lastAck's doc comment.
+	// whether to actually honor it — see Node.ackSeq's doc comment.
+	// Guarded with ">" (not unconditional) so an out-of-order-delivered
+	// older ack can never regress ackSeq below a fresher one already
+	// recorded.
 	if in.Kind == raft.InputMessage && in.Message.Type == raft.MsgAppendEntriesResponse && in.Message.Success &&
-		n.core.Role() == raft.Leader && in.Message.Term == n.core.CurrentTerm() {
-		n.ackCounter++
-		n.lastAck[in.Message.From] = n.ackCounter
+		n.core.Role() == raft.Leader && in.Message.Term == n.core.CurrentTerm() &&
+		in.Message.Seq > n.ackSeq[in.Message.From] {
+		n.ackSeq[in.Message.From] = in.Message.Seq
 	}
 	// raft.Core.handleElectionTimeout no-ops for an already-Leader node
 	// (docs/raft.md), so counting only the calls that can actually start
@@ -601,6 +623,20 @@ func (n *Node) step(in raft.Input) {
 		n.metrics.ElectionsTotal.Inc()
 	}
 	out := n.core.Step(in)
+	if in.Kind == raft.InputMessage && in.Message.Type == raft.MsgAppendEntriesRequest {
+		// Core is Seq-agnostic (see raft.Message.Seq's doc comment) and
+		// never sets it on a response it builds; echo back exactly the
+		// Seq this request carried so the original sender can correlate
+		// its own ackSeq bookkeeping (see Node.ackSeq's doc comment) —
+		// done here, once, rather than duplicated at every one of
+		// Core's several internal AppendEntriesResponse construction
+		// sites.
+		for i := range out.Messages {
+			if out.Messages[i].Type == raft.MsgAppendEntriesResponse {
+				out.Messages[i].Seq = in.Message.Seq
+			}
+		}
+	}
 	n.processOutput(out)
 }
 
@@ -641,16 +677,21 @@ func (n *Node) handleReadIndex(req readIndexReq) {
 	}
 	term0 := n.core.CurrentTerm()
 	target := n.core.LastIndex()
-	baseline := make(map[raft.NodeID]uint64, len(n.cfg.Peers))
-	for _, p := range n.cfg.Peers {
-		baseline[p] = n.lastAck[p]
-	}
+	// Every peer's ack must echo a request Seq strictly greater than
+	// sentSeqCounter's value right now — see Node.ackSeq's doc comment
+	// for why this must be a wire-carried, request-specific token
+	// rather than "was some ack merely processed after this point."
+	// This forced round's own outgoing requests (assigned fresh Seq
+	// values by processOutput, below) satisfy that by construction; so
+	// would any later, independently-timed heartbeat, which is exactly
+	// as valid a proof of liveness.
+	requiredSeq := n.sentSeqCounter
 	// Force an immediate fresh round of AppendEntries to every peer, so
 	// a subsequent Success acknowledgement in this same term proves
 	// this node was still the legitimate leader after target was
 	// captured (docs/replication.md §4.1 steps 1-2).
 	out := n.core.Step(raft.Input{Kind: raft.InputHeartbeatTimeout})
-	n.pendingReads = append(n.pendingReads, pendingRead{term: term0, target: target, baseline: baseline, resultCh: req.resultCh})
+	n.pendingReads = append(n.pendingReads, pendingRead{term: term0, target: target, requiredSeq: requiredSeq, resultCh: req.resultCh})
 	n.processOutput(out)
 }
 
@@ -673,7 +714,7 @@ func (n *Node) checkPendingReads() {
 			if p == n.cfg.ID {
 				continue
 			}
-			if n.lastAck[p] > pr.baseline[p] {
+			if n.ackSeq[p] > pr.requiredSeq {
 				acked++
 			}
 		}
@@ -718,6 +759,14 @@ func (n *Node) processOutput(out raft.Output) {
 				continue
 			}
 			m.SnapshotData = data
+		}
+		if m.Type == raft.MsgAppendEntriesRequest {
+			// Assign a fresh, strictly-increasing correlation token to
+			// every outbound AppendEntries request (regular heartbeat
+			// or a ReadIndex-forced one alike) — see Node.ackSeq's doc
+			// comment and raft.Message.Seq's doc comment.
+			n.sentSeqCounter++
+			m.Seq = n.sentSeqCounter
 		}
 		n.tr.Send(m)
 		n.metrics.RaftMessagesSentTotal.Inc()
