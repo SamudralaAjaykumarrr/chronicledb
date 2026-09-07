@@ -84,6 +84,26 @@ func TestModel_AdversarialHistoryAgainstIndependentOracle(t *testing.T) {
 	}
 }
 
+// TestModel_Regression_Seed1707LeadershipRetryGap pins the exact
+// history (steps=24, keyspace=5, matching
+// TestModel_AdversarialHistoryAgainstIndependentOracle's own
+// parameters) that first exposed a one-shot-retry gap in this file's
+// own submitAndCheck/stepRetrySameRequest helpers: seed 1707 isolates
+// the current leader immediately after healing a previously-isolated
+// former leader that has not yet processed the message that would
+// step it down, which can legitimately require more than one election
+// — and so more than one client-side retry — to resolve (see
+// proposeUntilResolved's doc comment). This is a test-harness
+// regression test, not evidence of a ChronicleDB bug: both
+// NotLeaderError and ErrLeadershipLost are the documented, honest
+// signals in that window. Runs unconditionally, independent of
+// CHRONICLEDB_ADVERSARIAL_SEEDS, so CI always exercises this exact
+// history rather than relying on someone remembering to run the full
+// high-seed-count campaign.
+func TestModel_Regression_Seed1707LeadershipRetryGap(t *testing.T) {
+	runModelHistory(t, 1707, 24, 5)
+}
+
 func runModelHistory(t *testing.T, seed int64, steps, keyspace int) {
 	t.Helper()
 	tc := newTestCluster(t, 3)
@@ -150,52 +170,83 @@ func runModelHistory(t *testing.T, seed int64, steps, keyspace int) {
 		return uint64(st.Term), st.Role.String()
 	}
 
-	submitAndCheck := func(kind string, c fsm.CommitTxnCommand, wantCommit bool, conflictKey string) {
-		leaderID, ok := currentLeader(3 * time.Second)
-		if !ok {
-			fail("seed %d: no leader available to submit %s", seed, kind)
+	// proposeUntilResolved submits c, retrying against whatever leader
+	// currently exists each time the attempt fails, until it either
+	// succeeds or an overall wall-clock deadline elapses. This is not
+	// an arbitrary retry-count cap: NotLeaderError/ErrLeadershipLost/
+	// ErrProposalSuperseded (internal/node/errors.go) are all documented
+	// as honest "outcome unknown, retry by RequestID against the current
+	// leader" signals with no promise that a *single* retry resolves
+	// them — back-to-back faults in this history (e.g. isolating the
+	// current leader before a just-healed former leader has processed
+	// the message that steps it down) can legitimately need more than
+	// one election to settle. A fixed one-shot retry treats that
+	// entirely correct, honest behavior as a test failure; bounding by
+	// a wall-clock deadline instead (reusing currentLeader's existing
+	// deterministic poll-for-exactly-one-leader wait, never a bare
+	// sleep) mirrors how a real client with a context deadline would
+	// behave, and still fails for a genuine liveness gap once the
+	// deadline is exhausted.
+	proposeUntilResolved := func(kind string, c fsm.CommitTxnCommand, overall time.Duration) (outcome fsm.Outcome, leaderID raft.NodeID, term uint64, role string, err error) {
+		deadline := time.Now().Add(overall)
+		for attempt := 1; ; attempt++ {
+			remaining := time.Until(deadline)
+			if remaining <= 0 {
+				return outcome, leaderID, term, role, err
+			}
+			waitFor := remaining
+			if waitFor > 3*time.Second {
+				waitFor = 3 * time.Second
+			}
+			var ok bool
+			leaderID, ok = currentLeader(waitFor)
+			if !ok {
+				if err == nil {
+					err = fmt.Errorf("no leader available")
+				}
+				continue
+			}
+			term, role = statusOf(leaderID)
+			ctxTimeout := time.Until(deadline)
+			if ctxTimeout > 3*time.Second {
+				ctxTimeout = 3 * time.Second
+			}
+			ctx, cancel := context.WithTimeout(context.Background(), ctxTimeout)
+			outcome, err = tc.node(leaderID).Propose(ctx, c)
+			cancel()
+			op := kind
+			if attempt > 1 {
+				op = kind + fmt.Sprintf("(retry#%d)", attempt-1)
+			}
+			var outcomeStr string
+			switch {
+			case err != nil:
+				outcomeStr = "err:" + err.Error()
+			case outcome.Status == fsm.StatusCommitted:
+				outcomeStr = fmt.Sprintf("COMMITTED(seq=%d)", outcome.CommitSeq)
+			default:
+				outcomeStr = fmt.Sprintf("ABORTED(key=%s)", outcome.ConflictKey)
+			}
+			rec.Record(oracle.Step{
+				Node: string(leaderID), Term: term, Role: role,
+				RequestID: string(c.RequestID), Op: op,
+				Args:    fmt.Sprintf("startSeq=%d muts=%v", c.StartSeq, toOracleMutations(c.Mutations)),
+				Outcome: outcomeStr,
+			})
+			if err == nil {
+				return outcome, leaderID, term, role, nil
+			}
 		}
-		term, role := statusOf(leaderID)
-		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
-		outcome, err := tc.node(leaderID).Propose(ctx, c)
-		cancel()
+	}
+
+	submitAndCheck := func(kind string, c fsm.CommitTxnCommand, wantCommit bool, conflictKey string) {
+		outcome, _, _, _, err := proposeUntilResolved(kind, c, 15*time.Second)
+		if err != nil {
+			fail("seed %d step: %s failed to resolve against any leader within the retry deadline: %v", seed, kind, err)
+		}
 
 		muts := toOracleMutations(c.Mutations)
 		fp := oracle.Fingerprint(c.TxnID, c.StartSeq, muts)
-
-		var outcomeStr string
-		switch {
-		case err != nil:
-			outcomeStr = "err:" + err.Error()
-		case outcome.Status == fsm.StatusCommitted:
-			outcomeStr = fmt.Sprintf("COMMITTED(seq=%d)", outcome.CommitSeq)
-		default:
-			outcomeStr = fmt.Sprintf("ABORTED(key=%s)", outcome.ConflictKey)
-		}
-		rec.Record(oracle.Step{
-			Node: string(leaderID), Term: term, Role: role,
-			RequestID: string(c.RequestID), Op: kind,
-			Args:    fmt.Sprintf("startSeq=%d muts=%v", c.StartSeq, muts),
-			Outcome: outcomeStr,
-		})
-
-		if err != nil {
-			// A leadership change racing the proposal is possible given
-			// this test's own crash/isolate steps; retry once against
-			// whatever leader now exists before treating it as a real
-			// failure, mirroring how a real client would react to a
-			// transient NotLeaderError/timeout.
-			leaderID2, ok2 := currentLeader(3 * time.Second)
-			if !ok2 {
-				fail("seed %d step: %s failed and no leader re-emerged: %v", seed, kind, err)
-			}
-			ctx2, cancel2 := context.WithTimeout(context.Background(), 3*time.Second)
-			outcome, err = tc.node(leaderID2).Propose(ctx2, c)
-			cancel2()
-			if err != nil {
-				fail("seed %d step: %s failed even after retrying against re-elected leader: %v", seed, kind, err)
-			}
-		}
 
 		committed := outcome.Status == fsm.StatusCommitted
 		if err := tracker.Observe(string(c.RequestID), fp, oracle.RecordedOutcome{
@@ -270,38 +321,10 @@ func runModelHistory(t *testing.T, seed int64, steps, keyspace int) {
 				continue
 			}
 			prev := everCommitted[sched.Intn(len(everCommitted))]
-			leaderID, ok := currentLeader(3 * time.Second)
-			if !ok {
-				fail("seed %d: no leader available for retry", seed)
-			}
-			term, role := statusOf(leaderID)
-			ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
-			outcome, err := tc.node(leaderID).Propose(ctx, prev.cmd)
-			cancel()
+			outcome, _, _, _, err := proposeUntilResolved("retry", prev.cmd, 15*time.Second)
 			if err != nil {
-				// A transient leadership change racing this retry is
-				// expected (this test crashes/isolates nodes elsewhere
-				// in the same history) — a real client reacts by
-				// retrying against whatever leader now exists, exactly
-				// like submitAndCheck's own fallback.
-				leaderID2, ok2 := currentLeader(3 * time.Second)
-				if !ok2 {
-					fail("seed %d: retry of already-committed RequestID %s failed and no leader re-emerged: %v", seed, prev.cmd.RequestID, err)
-				}
-				leaderID = leaderID2
-				term, role = statusOf(leaderID)
-				ctx2, cancel2 := context.WithTimeout(context.Background(), 3*time.Second)
-				outcome, err = tc.node(leaderID).Propose(ctx2, prev.cmd)
-				cancel2()
-				if err != nil {
-					fail("seed %d: retry of already-committed RequestID %s failed even after retrying against re-elected leader: %v", seed, prev.cmd.RequestID, err)
-				}
+				fail("seed %d: retry of already-committed RequestID %s failed to resolve against any leader within the retry deadline: %v", seed, prev.cmd.RequestID, err)
 			}
-			rec.Record(oracle.Step{
-				Node: string(leaderID), Term: term, Role: role,
-				RequestID: string(prev.cmd.RequestID), Op: "retry",
-				Outcome: fmt.Sprintf("COMMITTED(seq=%d)", outcome.CommitSeq),
-			})
 			if outcome.CommitSeq != prev.out.CommitSeq || outcome.Status != prev.out.Status {
 				fail("seed %d: REQUEST-OUTCOME-STABILITY violated: RequestID %s originally %+v, retry now %+v",
 					seed, prev.cmd.RequestID, prev.out, outcome)

@@ -17,7 +17,7 @@ import (
 // immediately releasing it, returning the address string for a Node's
 // ListenAddr/PeerAddrs. Standard "find a free port" test pattern; the
 // tiny window between release and the Node's own bind is acceptable
-// for these tests.
+// for a single, standalone reservation like this.
 func freeAddr(t *testing.T) string {
 	t.Helper()
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
@@ -27,6 +27,39 @@ func freeAddr(t *testing.T) string {
 	addr := ln.Addr().String()
 	ln.Close()
 	return addr
+}
+
+// freeAddrs reserves n distinct available TCP ports on 127.0.0.1 for a
+// single cluster's worth of nodes. Unlike calling freeAddr in a loop —
+// which releases each port before reserving the next, leaving a real
+// window where the OS hands the just-freed port straight back to the
+// very next reservation in the same loop (observed directly: two
+// nodes in the same testCluster occasionally got assigned the
+// identical port, and whichever one's real listener opened second
+// then failed with "address already in use" — a genuine bug in the
+// reservation pattern itself, not a flaky assertion, and unrelated to
+// any particular seed) — this holds every reservation open
+// simultaneously so the OS cannot hand out the same port twice, and
+// only releases all of them, together, immediately before the caller
+// binds its real listeners.
+func freeAddrs(t *testing.T, n int) []string {
+	t.Helper()
+	lns := make([]net.Listener, 0, n)
+	defer func() {
+		for _, ln := range lns {
+			ln.Close()
+		}
+	}()
+	addrs := make([]string, n)
+	for i := 0; i < n; i++ {
+		ln, err := net.Listen("tcp", "127.0.0.1:0")
+		if err != nil {
+			t.Fatalf("reserving free port %d/%d: %v", i+1, n, err)
+		}
+		lns = append(lns, ln)
+		addrs[i] = ln.Addr().String()
+	}
+	return addrs
 }
 
 // testCluster wires together a real, in-process, multi-goroutine
@@ -64,10 +97,11 @@ func newTestClusterWithSnapshotThreshold(t *testing.T, n int, snapshotThreshold 
 		nodes:             make(map[raft.NodeID]*Node, n),
 		snapshotThreshold: snapshotThreshold,
 	}
+	addrs := freeAddrs(t, n)
 	for i := 0; i < n; i++ {
 		id := raft.NodeID(fmt.Sprintf("n%d", i+1))
 		tc.ids = append(tc.ids, id)
-		tc.addrs[id] = freeAddr(t)
+		tc.addrs[id] = addrs[i]
 		tc.dirs[id] = t.TempDir()
 	}
 	for _, id := range tc.ids {
