@@ -6,7 +6,19 @@ follows [`docs/versioning.md`](docs/versioning.md) (SemVer, pre-1.0).
 
 ## [Unreleased]
 
-Nothing yet.
+### Added
+
+- Phase 12 (external review infrastructure, process only — no behavior
+  change): a public reviewer guide
+  (`docs/break-chronicledb.md`) mapping the "Break ChronicleDB"
+  challenge onto existing guarantees, non-guarantees, reviewer
+  personas, a 20-scenario challenge matrix, and the exact existing
+  build/test/chaos/adversarial reproduction commands; an evidence
+  ledger (`docs/external-review-findings.md`), starting with zero
+  entries since no external review has occurred yet; two optional
+  fields added to `.github/ISSUE_TEMPLATE/correctness_bug.yml` for
+  challenge-response reports. No production code, test assertion, or
+  security-reporting process changed.
 
 ## [0.1.0] - 2026-09-06
 

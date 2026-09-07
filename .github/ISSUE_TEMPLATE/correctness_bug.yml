@@ -72,3 +72,18 @@ body:
     attributes:
       label: Environment
       description: OS/arch, Go version, filesystem (see docs/support-matrix.md for what is actually tested).
+  - type: checkboxes
+    id: break-chronicledb
+    attributes:
+      label: Break ChronicleDB challenge
+      description: See docs/break-chronicledb.md for the external review process this report may be part of.
+      options:
+        - label: This report is a response to the Break ChronicleDB external review challenge.
+          required: false
+  - type: input
+    id: reviewer-handle
+    attributes:
+      label: Reviewer handle / affiliation (optional)
+      description: For the findings log at docs/external-review-findings.md. Leave blank to be recorded as "anonymous."
+    validations:
+      required: false

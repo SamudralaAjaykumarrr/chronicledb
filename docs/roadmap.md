@@ -4,16 +4,22 @@ Status: this document defines the phase sequence and the evidence
 gates that govern when a maturity claim is allowed. Phases 1-11 are
 complete (each at its own documented scope — see that phase's own
 section below for exactly what it does and does not claim); current
-maturity is `OPEN-SOURCE READY` (§Maturity Model below) — Phases 8 and
-9 together satisfy the underlying `PORTFOLIO READY` gate, with the
+maturity is `EXTERNAL-REVIEW READY` (§Maturity Model below) — Phases 8
+and 9 together satisfy the underlying `PORTFOLIO READY` gate, with the
 Authentication/TLS gap (`docs/non-goals.md` §Authentication and TLS)
 explicitly, prominently documented as a deployment prerequisite rather
 than resolved (the gate's own "resolved or explicitly, prominently
-documented" wording permits either), and Phase 11's packaging plus the
-actual publication of the `v0.1.0` tagged release satisfy
-`OPEN-SOURCE READY` on top of that. Phase 10 added deeper adversarial
-correctness evidence on top of the `PORTFOLIO READY` gate — no new
-named maturity level was defined for it in §Maturity Model below.
+documented" wording permits either), Phase 11's packaging plus the
+actual publication of the `v0.1.0` tagged release satisfy `OPEN-SOURCE
+READY` on top of that, and Phase 12's published external-review
+infrastructure (`docs/break-chronicledb.md`,
+`docs/external-review-findings.md`) satisfies `EXTERNAL-REVIEW READY`
+on top of that — **no external review has actually occurred yet**; see
+that phase's own section below for the precise distinction between
+"the process is open" and "the review has happened." Phase 10 added
+deeper adversarial correctness evidence on top of the `PORTFOLIO READY`
+gate — no new named maturity level was defined for it in §Maturity
+Model below.
 
 ## Phase sequence
 
@@ -488,6 +494,36 @@ correctness violations, with a bug-bounty-style "break it" framing.
 Maturity claims about external validation (see §Maturity Model) are
 only permitted based on the actual outcome of this phase, not before.
 
+**Phase 12a — review infrastructure published.** As of this writing,
+the review *process* is open and published, per
+[`docs/phase-12-plan.md`](phase-12-plan.md): a public reviewer guide
+([`docs/break-chronicledb.md`](break-chronicledb.md)) maps the
+externally reviewable guarantees, explicit non-guarantees, reviewer
+personas, and a 20-scenario challenge matrix onto the exact existing
+deterministic reproduction tooling (`internal/fault`'s chaos suites,
+`internal/oracle`'s model-based suites, fuzz targets,
+`cmd/chronicledb-node`'s `/fault` endpoint) — no new mechanism was
+built. The existing correctness-reporting workflow
+(`.github/ISSUE_TEMPLATE/correctness_bug.yml`, shipped in Phase 11) was
+extended, not replaced, with two optional fields linking a report to
+this challenge. An evidence ledger
+([`docs/external-review-findings.md`](external-review-findings.md))
+was published starting with zero entries. Publishing this
+infrastructure is exactly what satisfies `EXTERNAL-REVIEW READY` (see
+§Maturity Model) — it is real, checkable evidence (the documents exist
+and are accurate), not a prediction.
+
+**Phase 12b — review conducted, findings documented — not yet
+reached.** `EXTERNAL-REVIEW READY` is not the same as Phase 12 being
+"COMPLETE" the way Phases 1-11 are marked above: that requires the
+review to have actually happened — real reports (or an honestly
+documented null result after a stated period) recorded in
+[`docs/external-review-findings.md`](external-review-findings.md) —
+which `STAFF/PRINCIPAL DISCUSSION READY` requires and which does not
+exist as of this writing. No reviewer, finding, or review outcome is
+claimed here; publishing the invitation is not the same as anyone
+having accepted it.
+
 **SQL and deployment work is not moved ahead of the correctness
 foundations (Phases 1-7) without a new ADR providing a strong,
 specific architectural reason** — this is a standing constraint on
@@ -525,8 +561,8 @@ interpretation guidance, not exhaustive:
 | `STRONG DISTRIBUTED V1` | Phases 6-7 complete: §Snapshots scenarios pass; chaos/combined fault schedules run for a meaningful duration without an invariant violation. **This repository's current state** — see [`docs/scenario-corpus.md`](scenario-corpus.md)'s Phase 7 note and [`docs/testing-strategy.md`](testing-strategy.md) §6-7 for the specific evidence: seeded randomized chaos suites at `internal/fault` (raft-core layer, tens of thousands of seeds run clean locally during this phase), real-disk/real-TCP chaos at `internal/node`, and genuine real-process SIGKILL chaos at `cmd/chronicledb-node`, plus the two genuine bugs and one data race this work found and fixed, each with a deterministic regression test. |
 | `PORTFOLIO READY` | Phase 8-9 substantially complete: constrained SQL works end-to-end on the real engine; observability surfaces exist; auth/TLS gap from [`docs/non-goals.md`](non-goals.md) is resolved or explicitly, prominently documented as a deployment prerequisite. **This repository's current state** — Phase 8's real-cluster SQL evidence plus Phase 9's real, measured benchmarks ([`docs/benchmarks.md`](benchmarks.md)) and implemented/tested observability surfaces ([`docs/observability.md`](observability.md)); the Authentication/TLS gap remains explicitly, prominently documented ([`docs/non-goals.md`](non-goals.md) §Authentication and TLS) rather than resolved — this phase did not implement auth/TLS, which is out of Phase 9's own scope. |
 | `OPEN-SOURCE READY` | Phase 11 packaging complete on top of `PORTFOLIO READY`: license, contribution docs, versioned release, no known unresolved correctness gaps. **This repository's current state** — `v0.1.0` is the actual published, tagged release (see [`CHANGELOG.md`](../CHANGELOG.md)); the Authentication/TLS gap remains explicitly, prominently documented as a deployment prerequisite, per the same gate wording that already permitted this at `PORTFOLIO READY`. |
-| `EXTERNAL-REVIEW READY` | `OPEN-SOURCE READY` plus a specific, documented invitation/process for Phase 12 review is in place. |
-| `STAFF/PRINCIPAL DISCUSSION READY` | Phase 12 has actually occurred and its actual findings (not a prediction of findings) are documented and, where applicable, resolved. |
+| `EXTERNAL-REVIEW READY` | `OPEN-SOURCE READY` plus a specific, documented invitation/process for Phase 12 review is in place. **This repository's current state** — [`docs/break-chronicledb.md`](break-chronicledb.md) (the reviewer guide, guarantees/non-guarantees, challenge matrix, reproduction commands) and [`docs/external-review-findings.md`](external-review-findings.md) (the evidence ledger, currently zero entries) are published; the correctness-reporting workflow is extended accordingly. No external review has actually occurred yet — see `STAFF/PRINCIPAL DISCUSSION READY` below for what that would additionally require. |
+| `STAFF/PRINCIPAL DISCUSSION READY` | Phase 12 has actually occurred and its actual findings (not a prediction of findings) are documented and, where applicable, resolved. **Not yet reached** — zero reports have been received as of this writing ([`docs/external-review-findings.md`](external-review-findings.md)); this level requires real findings or a real, honestly-documented null result over a stated review window, not merely the process existing. |
 
 Advancing a maturity claim without its evidence gate is itself a
 documentation defect and must be corrected on discovery — see

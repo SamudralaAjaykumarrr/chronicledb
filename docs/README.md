@@ -1,9 +1,11 @@
 # ChronicleDB Documentation
 
-Status: current maturity is **OPEN-SOURCE READY** (Phases 0-11
-complete, and `v0.1.0` — the first tagged, versioned release — has
-been published; Phase 11 added this page's grouped map and the
-packaging/release documents below). See
+Status: current maturity is **EXTERNAL-REVIEW READY** (Phases 0-11
+complete, `v0.1.0` — the first tagged, versioned release — has been
+published, and Phase 12's external-review infrastructure — this page's
+new "External review (Phase 12)" subsection below — is now published;
+no external review has actually occurred yet, see
+[`external-review-findings.md`](external-review-findings.md)). See
 [`roadmap.md`](roadmap.md) §Maturity Model for the evidence gate behind
 that claim and [`../README.md`](../README.md) for the project-level
 summary.
@@ -124,6 +126,17 @@ terminology every other document depends on.
 - [`../CHANGELOG.md`](../CHANGELOG.md) — what changed, release by
   release.
 
+### External review (Phase 12)
+
+- [`break-chronicledb.md`](break-chronicledb.md) — the public "Break
+  ChronicleDB" reviewer guide: scope, threat/correctness model,
+  guarantees and explicit non-guarantees, reviewer personas, the
+  challenge matrix, build/test/chaos reproduction commands, and how to
+  report a correctness or security finding.
+- [`external-review-findings.md`](external-review-findings.md) — the
+  evidence ledger every report is recorded against, confirmed or not.
+  Currently zero entries — no external review has occurred yet.
+
 ## What this documentation does not claim
 
 Phases 1-10 are implemented and tested: durable storage and the WAL
@@ -153,6 +166,14 @@ particular, the authentication/TLS gap
 ([`non-goals.md`](non-goals.md) §Authentication and TLS) remains
 unresolved. `v0.1.0` — the first tagged, versioned release — has since
 been published (see [`releasing.md`](releasing.md) and
-[`../CHANGELOG.md`](../CHANGELOG.md)). See [`vision.md`](vision.md) and
-[`roadmap.md`](roadmap.md) §Maturity Model for how capability claims
-are gated on implementation evidence.
+[`../CHANGELOG.md`](../CHANGELOG.md)). Phase 12's external-review
+infrastructure ([`break-chronicledb.md`](break-chronicledb.md),
+[`external-review-findings.md`](external-review-findings.md)) is now
+published, but publishing the process is not the same as the process
+having produced a result: no external review has occurred, no
+reviewer or finding is claimed, and no maturity claim beyond
+`EXTERNAL-REVIEW READY` is made — `STAFF/PRINCIPAL DISCUSSION READY`
+requires an actual review's actual findings (confirmed, or an honestly
+documented null result), which do not exist yet. See
+[`vision.md`](vision.md) and [`roadmap.md`](roadmap.md) §Maturity Model
+for how capability claims are gated on implementation evidence.

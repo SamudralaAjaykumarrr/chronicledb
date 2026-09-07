@@ -187,7 +187,11 @@ data loss, a durability violation, an incorrect commit/read result, or
 any other invariant violation, since it asks for the extra evidence
 that kind of report needs. For a suspected security vulnerability, use
 [`SECURITY.md`](SECURITY.md)'s private reporting process instead of a
-public issue.
+public issue. If you're reviewing ChronicleDB specifically to try to
+find correctness violations, see
+[`docs/break-chronicledb.md`](docs/break-chronicledb.md) for the
+external-review process, challenge matrix, and reproduction tooling —
+it uses this same template.
 
 ## Code of Conduct
 

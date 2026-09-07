@@ -11,12 +11,19 @@ store, or a wrapper around an existing finished database or consensus
 library. See [`docs/vision.md`](docs/vision.md) for the full statement
 of intent and explicit non-goals.
 
-Current maturity: **OPEN-SOURCE READY**. Phase 11 (open-source
+Current maturity: **EXTERNAL-REVIEW READY**. Phase 11 (open-source
 packaging: license, contribution docs, release automation) is
-complete, and `v0.1.0` — the first tagged, versioned release — has
-been published, satisfying the roadmap's `OPEN-SOURCE READY` gate. See
-[`docs/roadmap.md`](docs/roadmap.md) §Maturity Model for exactly why
-that specific distinction matters here, and
+complete, `v0.1.0` — the first tagged, versioned release — has been
+published, and Phase 12 has now published a specific, documented
+invitation/process for external review
+([`docs/break-chronicledb.md`](docs/break-chronicledb.md)), satisfying
+the roadmap's `EXTERNAL-REVIEW READY` gate on top of `OPEN-SOURCE
+READY`. **No external review has actually occurred yet** — an external
+review process is now open; no review has concluded, and no maturity
+claim beyond `EXTERNAL-REVIEW READY` is made until one does (see
+[`docs/external-review-findings.md`](docs/external-review-findings.md),
+currently zero entries). See [`docs/roadmap.md`](docs/roadmap.md)
+§Maturity Model for exactly why that distinction matters here, and
 [`CHANGELOG.md`](CHANGELOG.md) for what `v0.1.0` contains.
 
 ## Quickstart
@@ -303,6 +310,20 @@ phase prepared (`docs/releasing.md`,
 why the maturity claim above advances to the roadmap's own predefined
 `OPEN-SOURCE READY` gate.
 
+Phase 12 — external review / "Break ChronicleDB" challenge — is now
+also open: [`docs/break-chronicledb.md`](docs/break-chronicledb.md)
+publishes a reviewer guide (guarantees in scope, explicit
+non-guarantees, reviewer personas, a 20-scenario challenge matrix, and
+build/test/deterministic-chaos reproduction commands, all pointing at
+existing, currently-true tests and tooling — no new mechanism was
+built), and
+[`docs/external-review-findings.md`](docs/external-review-findings.md)
+is the evidence ledger every report will be recorded against, starting
+with zero entries. Publishing this infrastructure is what advances the
+maturity claim above to `EXTERNAL-REVIEW READY`; it is not the same as
+a review having actually happened — no external review has concluded,
+and no further maturity claim is made until one does.
+
 ## Testing philosophy
 
 Every correctness claim above is gated on a passing test against a
@@ -382,6 +403,11 @@ documentation map. Key documents:
   10 adversarial correctness verification: reference model, model-based
   history suites, exact seed counts/commands, and correctness
   boundaries.
+- [`docs/break-chronicledb.md`](docs/break-chronicledb.md) — Phase 12's
+  public external-review guide: guarantees in scope, non-guarantees,
+  reviewer personas, the challenge matrix, and reproduction commands.
+- [`docs/external-review-findings.md`](docs/external-review-findings.md)
+  — the evidence ledger every Phase 12 report is recorded against.
 - [`docs/configuration.md`](docs/configuration.md) — the complete
   `chronicledb-node` flag reference.
 - [`docs/versioning.md`](docs/versioning.md) /

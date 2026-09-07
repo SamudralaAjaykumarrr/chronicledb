@@ -5,7 +5,10 @@ project (see [`docs/vision.md`](docs/vision.md)). Its current maturity
 is documented in [`README.md`](README.md) and
 [`docs/roadmap.md`](docs/roadmap.md) — please read the "Deployment
 assumptions" section below before relying on it for anything you did
-not build yourself.
+not build yourself. If you're reviewing ChronicleDB specifically to
+try to find correctness violations (not a security vulnerability), see
+[`docs/break-chronicledb.md`](docs/break-chronicledb.md) instead — the
+reporting process below is unchanged.
 
 ## Supported versions
 
