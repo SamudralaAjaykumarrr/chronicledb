@@ -5,10 +5,10 @@ maintainer follows to cut a ChronicleDB release. See
 [`docs/versioning.md`](versioning.md) for the version-number policy
 this process assumes.
 
-No release has been published from this process yet — see
+`v0.1.0` has been published from this process — see
 [`docs/roadmap.md`](roadmap.md) §Maturity Model's `OPEN-SOURCE READY`
 gate for why that specifically matters to this repository's maturity
-claim.
+claim, and [`CHANGELOG.md`](../CHANGELOG.md) for what it contains.
 
 ## Release checklist
 

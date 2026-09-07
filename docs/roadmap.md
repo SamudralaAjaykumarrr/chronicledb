@@ -1,17 +1,19 @@
 # Roadmap and Maturity Model
 
 Status: this document defines the phase sequence and the evidence
-gates that govern when a maturity claim is allowed. Phases 1-10 are
+gates that govern when a maturity claim is allowed. Phases 1-11 are
 complete (each at its own documented scope — see that phase's own
 section below for exactly what it does and does not claim); current
-maturity is `PORTFOLIO READY` (§Maturity Model below) — Phases 8 and 9
-together satisfy that gate, with the Authentication/TLS gap
-(`docs/non-goals.md` §Authentication and TLS) explicitly, prominently
-documented as a deployment prerequisite rather than resolved (the
-gate's own "resolved or explicitly, prominently documented" wording
-permits either). Phase 10 adds deeper adversarial correctness evidence
-on top of that same gate — no new named maturity level is defined for
-it in §Maturity Model below, so the claim remains `PORTFOLIO READY`.
+maturity is `OPEN-SOURCE READY` (§Maturity Model below) — Phases 8 and
+9 together satisfy the underlying `PORTFOLIO READY` gate, with the
+Authentication/TLS gap (`docs/non-goals.md` §Authentication and TLS)
+explicitly, prominently documented as a deployment prerequisite rather
+than resolved (the gate's own "resolved or explicitly, prominently
+documented" wording permits either), and Phase 11's packaging plus the
+actual publication of the `v0.1.0` tagged release satisfy
+`OPEN-SOURCE READY` on top of that. Phase 10 added deeper adversarial
+correctness evidence on top of the `PORTFOLIO READY` gate — no new
+named maturity level was defined for it in §Maturity Model below.
 
 ## Phase sequence
 
@@ -463,20 +465,20 @@ not guessed) with module caching explicitly disabled (there is no
 
 Per §Maturity Model below, `OPEN-SOURCE READY` requires "license,
 contribution docs, versioned release, no known unresolved correctness
-gaps." The first three items this phase's own scope can satisfy
-(license, contribution docs, and the *capability* to cut a versioned
-release) are done; the fourth is unaffected by packaging work either
-way. **This phase deliberately did not create or push a release
+gaps." This phase's own scope satisfied the first two (license,
+contribution docs) and built the *capability* to cut a versioned
+release; the fourth is unaffected by packaging work either way.
+**This phase itself deliberately did not create or push a release
 tag** — packaging infrastructure existing is not the same evidence as
 an actual published release existing (this document's own
 "a benchmark command existing does not prove performance" principle
 applies identically here: a release *workflow* existing does not prove
-a release). The maturity claim therefore remains `PORTFOLIO READY`
-until a maintainer actually completes
-[`docs/releasing.md`](releasing.md)'s checklist and publishes the
-first tag (`v0.1.0` per [`docs/versioning.md`](versioning.md)), at
-which point `OPEN-SOURCE READY` is warranted without further Phase 11
-work.
+a release). A maintainer subsequently completed
+[`docs/releasing.md`](releasing.md)'s checklist and published the
+first tag, `v0.1.0` (per [`docs/versioning.md`](versioning.md)), as a
+separate, later action — see [`CHANGELOG.md`](../CHANGELOG.md) for what
+that release contains. With that actual publication now in evidence,
+the maturity claim advances to `OPEN-SOURCE READY`.
 
 ### Phase 12 — External review / "Break ChronicleDB" challenge
 
@@ -522,7 +524,7 @@ interpretation guidance, not exhaustive:
 | `REPLICATED PROTOTYPE` | Phases 4-5 complete: §Raft/Replication scenarios pass in the deterministic simulator and in a real multi-process three-node deployment. See [`docs/scenario-corpus.md`](scenario-corpus.md)'s Phase 5 note for the specific per-scenario accounting: RF-1, RF-3 (log-catch-up leg), RF-4, RF-5, RF-6, RF-9 through RF-13 are proven against real disk/network/processes; RF-2, RF-7, RF-8, RF-14, and RF-15 remain proven only in the deterministic simulator, by deliberate, documented scope decisions ([`docs/raft.md`](raft.md) §10.2), not gaps in the wiring this gate is actually about. |
 | `STRONG DISTRIBUTED V1` | Phases 6-7 complete: §Snapshots scenarios pass; chaos/combined fault schedules run for a meaningful duration without an invariant violation. **This repository's current state** — see [`docs/scenario-corpus.md`](scenario-corpus.md)'s Phase 7 note and [`docs/testing-strategy.md`](testing-strategy.md) §6-7 for the specific evidence: seeded randomized chaos suites at `internal/fault` (raft-core layer, tens of thousands of seeds run clean locally during this phase), real-disk/real-TCP chaos at `internal/node`, and genuine real-process SIGKILL chaos at `cmd/chronicledb-node`, plus the two genuine bugs and one data race this work found and fixed, each with a deterministic regression test. |
 | `PORTFOLIO READY` | Phase 8-9 substantially complete: constrained SQL works end-to-end on the real engine; observability surfaces exist; auth/TLS gap from [`docs/non-goals.md`](non-goals.md) is resolved or explicitly, prominently documented as a deployment prerequisite. **This repository's current state** — Phase 8's real-cluster SQL evidence plus Phase 9's real, measured benchmarks ([`docs/benchmarks.md`](benchmarks.md)) and implemented/tested observability surfaces ([`docs/observability.md`](observability.md)); the Authentication/TLS gap remains explicitly, prominently documented ([`docs/non-goals.md`](non-goals.md) §Authentication and TLS) rather than resolved — this phase did not implement auth/TLS, which is out of Phase 9's own scope. |
-| `OPEN-SOURCE READY` | Phase 11 packaging complete on top of `PORTFOLIO READY`: license, contribution docs, versioned release, no known unresolved correctness gaps. |
+| `OPEN-SOURCE READY` | Phase 11 packaging complete on top of `PORTFOLIO READY`: license, contribution docs, versioned release, no known unresolved correctness gaps. **This repository's current state** — `v0.1.0` is the actual published, tagged release (see [`CHANGELOG.md`](../CHANGELOG.md)); the Authentication/TLS gap remains explicitly, prominently documented as a deployment prerequisite, per the same gate wording that already permitted this at `PORTFOLIO READY`. |
 | `EXTERNAL-REVIEW READY` | `OPEN-SOURCE READY` plus a specific, documented invitation/process for Phase 12 review is in place. |
 | `STAFF/PRINCIPAL DISCUSSION READY` | Phase 12 has actually occurred and its actual findings (not a prediction of findings) are documented and, where applicable, resolved. |
 

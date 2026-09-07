@@ -1,8 +1,9 @@
 # ChronicleDB Documentation
 
-Status: current maturity is **PORTFOLIO READY** (Phases 0-10 complete;
-Phase 11 — open-source packaging — is what added this page's grouped
-map and the packaging/release documents below). See
+Status: current maturity is **OPEN-SOURCE READY** (Phases 0-11
+complete, and `v0.1.0` — the first tagged, versioned release — has
+been published; Phase 11 added this page's grouped map and the
+packaging/release documents below). See
 [`roadmap.md`](roadmap.md) §Maturity Model for the evidence gate behind
 that claim and [`../README.md`](../README.md) for the project-level
 summary.
@@ -150,7 +151,8 @@ is implemented and proven, including through the SQL frontend (see
 by itself claim any resolved correctness or security gap — in
 particular, the authentication/TLS gap
 ([`non-goals.md`](non-goals.md) §Authentication and TLS) remains
-unresolved, and no version has been tagged/released yet (see
-[`releasing.md`](releasing.md)). See [`vision.md`](vision.md) and
+unresolved. `v0.1.0` — the first tagged, versioned release — has since
+been published (see [`releasing.md`](releasing.md) and
+[`../CHANGELOG.md`](../CHANGELOG.md)). See [`vision.md`](vision.md) and
 [`roadmap.md`](roadmap.md) §Maturity Model for how capability claims
 are gated on implementation evidence.

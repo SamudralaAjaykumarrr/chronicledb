@@ -11,12 +11,13 @@ store, or a wrapper around an existing finished database or consensus
 library. See [`docs/vision.md`](docs/vision.md) for the full statement
 of intent and explicit non-goals.
 
-Current maturity: **PORTFOLIO READY**. Phase 11 (open-source
+Current maturity: **OPEN-SOURCE READY**. Phase 11 (open-source
 packaging: license, contribution docs, release automation) is
-complete, but no version has actually been tagged/released yet, so the
-maturity claim does not yet advance to `OPEN-SOURCE READY` — see
+complete, and `v0.1.0` — the first tagged, versioned release — has
+been published, satisfying the roadmap's `OPEN-SOURCE READY` gate. See
 [`docs/roadmap.md`](docs/roadmap.md) §Maturity Model for exactly why
-that specific distinction matters here.
+that specific distinction matters here, and
+[`CHANGELOG.md`](CHANGELOG.md) for what `v0.1.0` contains.
 
 ## Quickstart
 
@@ -295,12 +296,12 @@ versioning policy, a tag-triggered release workflow, reproducible
 release builds, and this quickstart) — is now also complete, adding no
 product functionality on top of the unchanged Phases 1-10 engine. See
 [`docs/roadmap.md`](docs/roadmap.md)'s Phase 11 section for the
-complete account of what was added, and why the maturity claim above
-deliberately stays `PORTFOLIO READY` rather than advancing to the
-roadmap's own predefined `OPEN-SOURCE READY` gate: that gate requires
-an actual versioned release, and none has been tagged yet — this phase
-prepared the release process (`docs/releasing.md`,
-`.github/workflows/release.yml`) without executing it.
+complete account of what was added. `v0.1.0` — the first tagged,
+versioned release, built and published via the release process this
+phase prepared (`docs/releasing.md`,
+`.github/workflows/release.yml`) — has now been published, which is
+why the maturity claim above advances to the roadmap's own predefined
+`OPEN-SOURCE READY` gate.
 
 ## Testing philosophy
 
