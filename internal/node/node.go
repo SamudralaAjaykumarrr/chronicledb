@@ -214,6 +214,28 @@ type Node struct {
 	electionTicksLeft  int
 	heartbeatArmed     bool
 	heartbeatTicksLeft int
+	// electionTicksPaused, when set via PauseTicksForTest, freezes only
+	// the election side of this node's clock: electionTicksLeft stops
+	// counting down, so this node can never time out and start an
+	// election on its own. It is a test-only determinism seam, the
+	// tick-clock analogue of internal/transport.Transport.Block/Unblock
+	// (an existing seam of exactly this kind, baked into production code
+	// but only ever exercised by tests): a real-disk/real-TCP
+	// testCluster test that deliberately does NOT want to exercise
+	// election/failover behavior can freeze the clock that would
+	// otherwise drive one, instead of papering over a spurious
+	// host-scheduling-induced re-election with a bigger timeout or a
+	// retry. It never affects propose/replication correctness, which is
+	// entirely message-driven (handlePropose,
+	// handleAppendEntriesRequest/Response) and never waits on a tick.
+	// Heartbeat ticks are deliberately NOT paused: they are what keeps
+	// driving a leader's replication/catch-up retries to a peer once no
+	// further Propose calls occur (e.g. a follower reconnecting after a
+	// restart, as in SN-3's interrupted-snapshot-catchup tests) — pausing
+	// them too would starve exactly that liveness path instead of merely
+	// removing spurious elections. An atomic.Bool because it is written
+	// from a test goroutine but read from run()'s event-loop goroutine.
+	electionTicksPaused atomic.Bool
 
 	appliedIndex uint64
 	waiters      map[raft.Index]waiter
@@ -427,6 +449,20 @@ func (n *Node) Transport() *transport.Transport { return n.tr }
 // Propose.
 func (n *Node) FSM() *fsm.FSM { return n.fsmachine.Load() }
 
+// PauseTicksForTest freezes this node's election clock: it can no
+// longer time out and start an election on its own, until
+// ResumeTicksForTest is called. Heartbeat ticks are unaffected — see
+// Node.electionTicksPaused's doc comment for why. Test-only — never
+// called from production code, and never a dependency of any Raft
+// safety or liveness invariant (propose/replication is entirely
+// message-driven, not tick-driven, and proceeds normally while paused).
+// Safe to call from any goroutine.
+func (n *Node) PauseTicksForTest() { n.electionTicksPaused.Store(true) }
+
+// ResumeTicksForTest reverses PauseTicksForTest. Safe to call from any
+// goroutine.
+func (n *Node) ResumeTicksForTest() { n.electionTicksPaused.Store(false) }
+
 // Status returns a snapshot of the node's current diagnostic state.
 // Safe to call from any goroutine.
 func (n *Node) Status() Status {
@@ -584,7 +620,7 @@ func (n *Node) shutdown() {
 }
 
 func (n *Node) tick() {
-	if n.electionArmed {
+	if n.electionArmed && !n.electionTicksPaused.Load() {
 		n.electionTicksLeft--
 		if n.electionTicksLeft <= 0 {
 			n.electionArmed = false

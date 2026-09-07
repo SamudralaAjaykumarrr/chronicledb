@@ -474,6 +474,18 @@ func TestChaos_SnapshotFollowerCrashDuringCatchupResumesCleanly(t *testing.T) {
 	tc := newTestClusterWithSnapshotThreshold(t, 3, threshold)
 	leaderID := tc.awaitLeader(5 * time.Second)
 	leader := tc.node(leaderID)
+	// This test holds a reference to "the leader" across a long scripted
+	// sequence (isolate a follower, propose numKeys+filler entries,
+	// await a snapshot boundary) that itself never exercises
+	// election/failover on the leader or the still-connected third node
+	// — SN-3's interrupted-snapshot-catchup scenario only concerns the
+	// isolated follower. A legitimate re-election of the leader or third
+	// node mid-sequence (e.g. a host-scheduling stall blowing the timeout
+	// budget) would fail this test for a reason unrelated to what it is
+	// actually testing. See testCluster.pauseTicking's doc comment; the
+	// isolated/restarted follower is unaffected (restart opens a fresh,
+	// unpaused Node, exactly as SN-3 needs).
+	tc.pauseTicking()
 
 	var follower raft.NodeID
 	for _, id := range tc.ids {

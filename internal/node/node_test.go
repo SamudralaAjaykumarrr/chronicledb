@@ -209,6 +209,35 @@ func (tc *testCluster) leaderNode(timeout time.Duration) *Node {
 	return tc.node(tc.awaitLeader(timeout))
 }
 
+// pauseTicking freezes every currently-live node's election clock
+// (Node.PauseTicksForTest) so none of them can time out and start a
+// spontaneous election; heartbeat ticks keep running, so ongoing
+// replication/catch-up retries toward any peer are unaffected. Real
+// end-to-end tests run over a real TCP/disk stack with deliberately
+// tight-ish election timeouts (see configFor); a test whose script does
+// not itself intend to exercise election/failover behavior in a given
+// stretch (a plain sequence of Propose calls, say) has no way to
+// distinguish "a legitimate re-election happened because a
+// host-scheduling stall exceeded the timeout budget" from a real bug —
+// it just sees a leader it was holding a reference to unexpectedly stop
+// being leader. Freezing the election clock removes that source of
+// nondeterminism outright instead of papering over it with a bigger
+// timeout, a sleep, or a retry: propose/replication itself is
+// message-driven (see Node.electionTicksPaused's doc comment) and
+// proceeds normally regardless.
+func (tc *testCluster) pauseTicking() {
+	for _, n := range tc.nodes {
+		n.PauseTicksForTest()
+	}
+}
+
+// resumeTicking reverses pauseTicking for every currently-live node.
+func (tc *testCluster) resumeTicking() {
+	for _, n := range tc.nodes {
+		n.ResumeTicksForTest()
+	}
+}
+
 // awaitCondition polls cond until it returns true or timeout elapses.
 func awaitCondition(t *testing.T, timeout time.Duration, msg string, cond func() bool) {
 	t.Helper()

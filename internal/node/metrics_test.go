@@ -47,6 +47,14 @@ func TestMetricsProposalsCountedByOutcome(t *testing.T) {
 	if follower == leader {
 		follower = tc.node(tc.ids[1])
 	}
+	// This test asserts on before/after metrics deltas for one specific
+	// node across a fixed sequence of Propose calls; it never itself
+	// exercises election/failover behavior, so any leadership change
+	// mid-sequence (even a legitimate one caused by a host-scheduling
+	// stall blowing the real testCluster's timeout budget) would attribute
+	// its proposals to the wrong node's counters. See
+	// testCluster.pauseTicking's doc comment.
+	tc.pauseTicking()
 
 	before := leader.Metrics()
 
