@@ -10,6 +10,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/SamudralaAjaykumarrr/chronicledb/internal/backup"
 	"github.com/SamudralaAjaykumarrr/chronicledb/internal/fsm"
 	"github.com/SamudralaAjaykumarrr/chronicledb/internal/identity"
 	"github.com/SamudralaAjaykumarrr/chronicledb/internal/mvcc"
@@ -179,6 +180,18 @@ type readIndexReq struct {
 	resultCh chan readResult
 }
 
+type backupResult struct {
+	manifest backup.Manifest
+	err      error
+}
+
+type backupReq struct {
+	outDir     string
+	continuous bool
+	clusterID  string
+	resultCh   chan backupResult
+}
+
 type pendingRead struct {
 	term raft.Term
 	// target is the log index a majority of peers must freshly
@@ -302,6 +315,7 @@ type Node struct {
 
 	proposeCh   chan proposeReq
 	readIndexCh chan readIndexReq
+	backupCh    chan backupReq
 	stopCh      chan struct{}
 	doneCh      chan struct{}
 	stopOnce    sync.Once
@@ -467,6 +481,7 @@ func Open(cfg Config) (*Node, error) {
 		ackSeq:         make(map[raft.NodeID]uint64, len(cfg.Peers)),
 		proposeCh:      make(chan proposeReq),
 		readIndexCh:    make(chan readIndexReq),
+		backupCh:       make(chan backupReq),
 		stopCh:         make(chan struct{}),
 		doneCh:         make(chan struct{}),
 	}
@@ -653,6 +668,55 @@ func (n *Node) BeginReadIndex(ctx context.Context) (uint64, error) {
 	}
 }
 
+// Backup exports a self-contained backup.Manifest-described backup of
+// this node's currently-durable committed state to outDir
+// (docs/enterprise-v1-plan.md §6): the node's own currently-adopted
+// snapshot boundary (or the empty, never-snapshotted boundary) as the
+// base, plus — when continuous is true — every WAL entry currently
+// durable beyond that boundary ("continuous WAL archiving," RPO bounded
+// only by "time since this call ran"); when continuous is false, no
+// trailing suffix at all ("snapshot-only," RPO bounded by "time since
+// the node's own last snapshot boundary" — docs/enterprise-v1-plan.md
+// §6's RPO/RTO model). This boolean, rather than a caller-supplied
+// index, is deliberate: a caller cannot know this node's current
+// baseIndex in advance to ask for "exactly that" by number.
+//
+// Like Propose/BeginReadIndex, the actual work is dispatched to and
+// performed entirely on run's own event-loop goroutine (handleBackup) so
+// it reads a genuinely consistent snapshot of
+// n.core/n.walog/n.snapMgr/n.fsmachine — never a torn view racing a
+// concurrent Propose or the node's own maybeSnapshot compaction cycle.
+//
+// Backup never mutates this node's own retained WAL/snapshot state (no
+// compaction, no pointer update, no interaction with maybeSnapshot's
+// threshold) — it only reads what is already durable and copies it
+// through internal/backup.Export into an independent directory
+// (docs/enterprise-v1-plan.md §6: "backup semantics clearly separated
+// from Raft snapshot/compaction semantics"). Like maybeSnapshot, the
+// export itself runs synchronously on the event-loop goroutine, briefly
+// blocking ticks/heartbeats/proposals for its duration — an accepted,
+// pre-existing tradeoff this phase inherits rather than introduces (see
+// maybeSnapshot's identical characteristic); docs/backup.md documents
+// this operationally.
+func (n *Node) Backup(ctx context.Context, outDir string, continuous bool, clusterID string) (backup.Manifest, error) {
+	req := backupReq{outDir: outDir, continuous: continuous, clusterID: clusterID, resultCh: make(chan backupResult, 1)}
+	select {
+	case n.backupCh <- req:
+	case <-ctx.Done():
+		return backup.Manifest{}, ctx.Err()
+	case <-n.doneCh:
+		return backup.Manifest{}, ErrNodeStopped
+	}
+	select {
+	case res := <-req.resultCh:
+		return res.manifest, res.err
+	case <-ctx.Done():
+		return backup.Manifest{}, ctx.Err()
+	case <-n.doneCh:
+		return backup.Manifest{}, ErrNodeStopped
+	}
+}
+
 // run is the node's single event-loop goroutine: every Core.Step call,
 // every WALStorage/fsm.FSM mutation, and every waiter resolution
 // happens here, avoiding locking cycles across raft/wal/fsm/transport
@@ -678,6 +742,8 @@ func (n *Node) run() {
 			n.handlePropose(req)
 		case req := <-n.readIndexCh:
 			n.handleReadIndex(req)
+		case req := <-n.backupCh:
+			n.handleBackup(req)
 		case <-n.stopCh:
 			return
 		}
@@ -1049,6 +1115,51 @@ func (n *Node) maybeSnapshot() {
 	}
 	n.metrics.SnapshotsCreatedTotal.Inc()
 	n.logf("node %s: created snapshot at index %d, compacted log", n.cfg.ID, meta.LastIncludedIndex)
+}
+
+// handleBackup runs entirely on the event-loop goroutine (see Backup's
+// doc comment): it reads this node's currently-adopted snapshot boundary
+// (n.core.SnapshotIndex(), already durable via n.snapMgr — or, if this
+// node has never snapshotted, the empty boundary at index 0) and this
+// node's own live n.walog as the source for internal/backup.Export,
+// exactly the same (already-durable, already-validated) state a restart
+// would recover from — Backup invents nothing beyond what is already on
+// disk.
+func (n *Node) handleBackup(req backupReq) {
+	baseIndex := uint64(n.core.SnapshotIndex())
+	var baseFSM *fsm.FSM
+	if baseIndex == 0 {
+		baseFSM = fsm.New(mvcc.NewStore())
+	} else {
+		snap, ok, err := n.snapMgr.Load(baseIndex)
+		if err != nil || !ok {
+			req.resultCh <- backupResult{err: fmt.Errorf("node: backup: loading this node's own adopted snapshot at %d: ok=%v err=%w", baseIndex, ok, err)}
+			return
+		}
+		baseFSM = snap.FSM
+	}
+	baseTerm := n.core.SnapshotTerm()
+	if baseIndex == 0 {
+		baseTerm = 0
+	}
+
+	src := backup.Source{
+		BaseMeta: snapshot.Meta{LastIncludedIndex: baseIndex, LastIncludedTerm: uint64(baseTerm)},
+		BaseFSM:  baseFSM,
+		WAL:      n.walog,
+	}
+	until := baseIndex
+	if req.continuous {
+		until = backup.UntilLatest
+	}
+	m, err := backup.Export(src, req.outDir, backup.ExportOptions{UntilIndex: until, ClusterID: req.clusterID})
+	if err != nil {
+		n.metrics.BackupsFailedTotal.Inc()
+		req.resultCh <- backupResult{err: fmt.Errorf("node: backup: %w", err)}
+		return
+	}
+	n.metrics.BackupsTotal.Inc()
+	req.resultCh <- backupResult{manifest: m}
 }
 
 // termAtApplied returns the Raft term of the log entry at n.appliedIndex

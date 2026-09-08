@@ -6,6 +6,52 @@ follows [`docs/versioning.md`](docs/versioning.md) (SemVer, pre-1.0).
 
 ## [Unreleased]
 
+Backup / Disaster Recovery / PITR — the second phase of the
+`docs/enterprise-v1-plan.md` Enterprise V1 roadmap (§6, target release
+`v0.3.0`, not yet tagged). See that document and
+`docs/adr/0016-backup-disaster-recovery-and-pitr.md` for the complete
+design and `docs/backup.md` for the operational guide this work adds.
+This is **implementation work toward `v0.3.0`, not a release** — no
+maturity claim changes, nothing here is tagged, and Enterprise V1 is not
+claimed complete.
+
+### Added
+
+- **Backup / Disaster Recovery / PITR** (`docs/enterprise-v1-plan.md`
+  §6): a new `internal/backup` package — a self-describing, versioned,
+  checksummed export of a consistent snapshot boundary plus a selectable
+  WAL log suffix, built entirely on the existing `internal/snapshot`/
+  `internal/wal` formats (never a second, independently-evolving
+  format); `Export` (snapshot-only or continuous-WAL-archiving
+  schedules) and `Restore` (checksum/consistency validation before any
+  write, atomic staging-directory promotion, PITR to an arbitrary
+  committed log-index boundary, destructive-restore isolation with an
+  explicit force flag).
+- `internal/node.Node.Backup`: live-node backup export, dispatched
+  through the node's own event-loop goroutine for a consistent,
+  non-racing read of its currently-durable state; never mutates the
+  node's own retained WAL/snapshot state (backup is architecturally
+  separate from Raft snapshot/compaction).
+- New admin/operator-gated, audited HTTP endpoint `/admin/backup` on
+  `cmd/chronicledb-node`.
+- New CLI flags: `-restore-from`, `-restore-until`, `-force-overwrite`
+  — see `docs/configuration.md`.
+- New invariants (`docs/invariants.md`): `BACKUP INTEGRITY`, `BACKUP
+  CONSISTENCY`, `DESTRUCTIVE RESTORE ISOLATION`.
+- New doc `docs/backup.md` (format, RPO/RTO model measured via
+  `internal/backup/bench_test.go`, restore runbook, non-goals,
+  documented deviations from the plan's literal CLI text).
+- `docs/failure-model.md` §5 gains §5.1, narrowing "simultaneous
+  majority storage loss" to name backup/restore as its resolution path.
+- A real destructive disaster-recovery drill, proven at both the
+  in-process real-disk/real-TCP level
+  (`internal/node/backup_test.go`) and the real-OS-subprocess level
+  (`cmd/chronicledb-node/backup_integration_test.go`, `integration`
+  build tag): back up a live three-node cluster, delete every node's
+  data directory entirely, restore three brand-new directories from the
+  backup alone, and confirm the restored cluster reaches a state
+  consistent with everything backed up and accepts new writes normally.
+
 ## [0.2.0] - 2026-09-08
 
 Security Foundation — the first phase of the `docs/enterprise-v1-plan.md`

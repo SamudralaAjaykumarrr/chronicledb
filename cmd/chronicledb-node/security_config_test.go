@@ -246,7 +246,7 @@ func TestDefaultInsecureStartup_PlaintextModeFunctional(t *testing.T) {
 	}
 
 	n := openSingleNodeForControlTest(t)
-	srv := newControlServer(n, nil, sec, nil, defaults.enableFault)
+	srv := newControlServer(n, nil, sec, nil, defaults.enableFault, "test-cluster")
 
 	// GET /status with no credential at all must succeed.
 	statusReq := httptest.NewRequest("GET", "/status", nil)

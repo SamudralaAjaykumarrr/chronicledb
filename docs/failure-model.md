@@ -262,11 +262,43 @@ Full worked scenario in [`docs/replication.md`](replication.md) §5.
   practical system's guarantee scope.
 - Simultaneous loss of a majority of nodes' persistent storage in
   replicated mode, or the single node's storage in standalone mode
-  (see [`docs/replication.md`](replication.md) §2).
+  (see [`docs/replication.md`](replication.md) §2) — **narrowed as of
+  `v0.3.0`, see §5.1 below**: ChronicleDB's own live-replication
+  guarantee still does not cover this scenario (Raft cannot recover
+  committed history no surviving node holds), but a documented, tested
+  resolution path now exists outside that guarantee.
 - Clock-skew-dependent optimizations (lease reads) — not used in V1
   (see [`docs/replication.md`](replication.md) §4.2), so clock skew
   across nodes is not a correctness dependency for V1's guarantees.
 - WAN-scale network behavior (see [`docs/non-goals.md`](non-goals.md)).
+
+### 5.1 Simultaneous majority storage loss — resolution path (`v0.3.0`)
+
+As of `v0.3.0` (Backup / Disaster Recovery / PITR,
+[`docs/enterprise-v1-plan.md`](enterprise-v1-plan.md) §6, not yet
+tagged/released; [`ADR-0016`](adr/0016-backup-disaster-recovery-and-pitr.md)),
+this scenario is no longer *unrecoverable* — it is recoverable **up to
+whichever backup's boundary an operator last took**, via
+[`docs/backup.md`](backup.md)'s restore path. This is a deliberate,
+explicit narrowing of the bullet above, not a silent one:
+
+- Raft/replication itself still cannot recover from this scenario on
+  its own — nothing here changes `internal/raft`, `internal/wal`, or
+  quorum semantics. A majority of nodes losing their storage
+  simultaneously, with no backup ever taken, remains permanently
+  unrecoverable, exactly as before.
+- The resolution is external to live replication: an operator-taken
+  backup (`docs/backup.md` §6), stored somewhere the cluster's own
+  storage loss does not also destroy, restored into brand-new data
+  directories (`docs/backup.md` §5) once replacement storage/hosts are
+  available.
+- The RPO this buys back is bounded by the backup schedule actually run
+  — see `docs/backup.md` §7's RPO/RTO model. A cluster with no backup
+  ever taken, or one restored from a stale backup, still loses every
+  commit after that backup's own boundary; this is a documented
+  tradeoff, not a claim of zero data loss.
+- This narrowing applies only to the *storage-loss* scenario. Every
+  other bullet in §5 above is unchanged by this phase.
 
 ## 6. Security and Safety Expectations
 

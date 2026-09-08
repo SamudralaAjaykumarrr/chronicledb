@@ -604,3 +604,117 @@ tamper-detection test, forged-but-internally-consistent-record
 detection, and `FuzzDecodeFrame`; `cmd/chronicledb-node/auth_test.go`'s
 `TestAudit_ExactlyOneRecordPerDecision` and
 `TestAudit_WriteFailureBlocksAction`.
+
+## Backup / Disaster Recovery invariants (`v0.3.0`, `docs/enterprise-v1-plan.md` §6)
+
+See [`docs/backup.md`](backup.md) and
+[`ADR-0016`](adr/0016-backup-disaster-recovery-and-pitr.md) for the full
+architecture. These invariants govern `internal/backup`,
+`internal/node.Node.Backup`, and `cmd/chronicledb-node`'s
+`/admin/backup`/`-restore-from` surfaces.
+
+### BACKUP INTEGRITY
+
+**Statement**: A restore never trusts a backup whose manifest checksum,
+per-component (snapshot/WAL-segment) checksum, or internal
+snapshot-consistency check fails validation; corruption is rejected
+outright, before any byte reaches the target data directory.
+
+**Scope**: `internal/backup.Restore`, and every caller of it
+(`cmd/chronicledb-node`'s `-restore-from` preflight).
+
+**Why it matters**: A backup is, by construction, an external input —
+mirrors `RECOVERY NON-INVENTION`'s "never trust local disk beyond what
+validates" discipline, applied to a portable artifact that may have
+been copied, transferred, or stored by means entirely outside
+ChronicleDB's own control.
+
+**Mechanism**: `readManifest` validates the manifest's own trailing
+CRC32 and format version before parsing its JSON body;
+`verifySnapshotComponent`/`verifyWALSegmentComponents` check every
+referenced file's size and CRC32 against the manifest's own recorded
+values, then `internal/snapshot.Decode`'s own internal-consistency
+check, all before `Restore` ever creates or writes into a staging
+directory.
+
+**Threatened by**: Trusting a component's bytes because the manifest
+merely *names* it, without also checking its recorded checksum; writing
+to the target directory before every component has passed validation.
+
+**Proof/test obligations**: `internal/backup`'s corrupted/truncated/
+missing-manifest, corrupted/missing-snapshot, and corrupted/missing-
+WAL-segment tests, each asserting the target directory is left absent
+or empty; `FuzzRestoreManifest`.
+
+### BACKUP CONSISTENCY
+
+**Statement**: A restored data directory's state is exactly the state a
+legitimate node would reach by replaying the identical committed
+history through the same boundary — no partial-transaction, no
+reordered-command, and no post-boundary-transaction restore is ever
+possible.
+
+**Scope**: `internal/backup.Export`/`Restore`'s WAL-suffix copy/replay
+loop.
+
+**Why it matters**: Mirrors `ATOMICITY`/`RECOVERY NON-INVENTION` for the
+backup/restore path specifically — a backup that silently reordered,
+dropped, or fabricated a committed entry would be worse than no backup
+at all, since it would appear to succeed.
+
+**Mechanism**: Every WAL entry is copied through
+`internal/wal.WAL.AppendLogEntry`'s own strictly-sequential index
+assignment, with an explicit assigned-index-equals-source-index check
+on every entry (`copyWALSuffix`); a PITR boundary stops the copy/replay
+loop strictly after the requested index, so the resulting WAL's own
+`NextIndex()` is provably `boundary+1`.
+
+**Threatened by**: Copying WAL segment files as raw bytes instead of
+through `AppendLogEntry`'s own index assignment (a source segment's
+physical layout has no necessary relationship to a backup's chosen
+range); an off-by-one in the PITR boundary check letting one
+post-boundary entry through.
+
+**Proof/test obligations**: `TestExportRestore_ContinuousPITRRoundTrip`
+(restored to every boundary in a 10-entry history, each asserting
+`NextIndex() == boundary+1`); `internal/node`'s
+`TestBackup_DestructiveDisasterRecoveryDrill` (a real, live, three-node
+restore proving every pre-loss commit's outcome survives and a
+post-recovery write commits normally).
+
+### DESTRUCTIVE RESTORE ISOLATION
+
+**Statement**: Restoring into a data directory never silently overwrites
+an existing, live cluster's data; restore targets an explicitly clean
+(empty or absent) data directory only, refusing to run against one
+containing existing WAL/snapshot state without an explicit force flag
+that itself produces an audit record.
+
+**Scope**: `internal/backup.Restore` (`RestoreOptions.Force`) and
+`cmd/chronicledb-node`'s `-restore-from`/`-force-overwrite` startup
+preflight.
+
+**Why it matters**: A restore that could accidentally target a live
+node's own in-use data directory would be one of the most destructive
+possible operator mistakes this feature could introduce.
+
+**Mechanism**: `dataDirIsClean` treats any existing directory entry at
+all as "not clean"; `Restore` returns `ErrTargetNotClean` unless
+`Force` is set. `cmd/chronicledb-node` additionally requires
+`-force-overwrite` to be passed explicitly for that case, and treats a
+failure to write the resulting audit record as fatal to startup
+(mirroring `AUDIT COMPLETENESS`'s fail-closed discipline) — a
+non-destructive restore into an already-clean directory logs a warning,
+rather than failing startup, on an audit-write failure, since blocking
+a legitimate disaster-recovery restore over a diagnostic-log issue would
+itself be a worse availability tradeoff.
+
+**Threatened by**: Checking "is the directory clean" only once, long
+before the actual destructive `os.RemoveAll`, with other state changes
+possible in between (`internal/backup.Restore` re-derives nothing else
+in between: the check and the destructive removal are both inside one
+synchronous call with no other actor able to interleave).
+
+**Proof/test obligations**: `TestRestore_TargetNotCleanRequiresForce`;
+`cmd/chronicledb-node`'s `TestRunRestore_NonCleanTargetRequiresForce`
+and `TestRecordRestoreAudit_WritesVerifiableEntry`.

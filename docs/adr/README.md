@@ -28,3 +28,4 @@ skeleton.
 | [0013](0013-sql-boundary-and-deferred-functionality.md) | SQL boundary and deferred functionality |
 | [0014](0014-election-no-op-for-readindex-liveness.md) | Election no-op entry for `ReadIndex` liveness |
 | [0015](0015-security-foundation.md) | Security Foundation architecture |
+| [0016](0016-backup-disaster-recovery-and-pitr.md) | Backup / Disaster Recovery / PITR architecture |

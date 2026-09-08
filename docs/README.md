@@ -113,6 +113,18 @@ terminology every other document depends on.
 - [`support-matrix.md`](support-matrix.md) — which platforms are
   actually developed/tested against vs. cross-compiled only.
 
+### Enterprise V1 (`docs/enterprise-v1-plan.md`)
+
+- [`enterprise-v1-plan.md`](enterprise-v1-plan.md) — the dependency-
+  ordered engineering plan from `EXTERNAL-REVIEW READY` to
+  `ENTERPRISE-GRADE` (`v1.0.0`); planning only until each phase's own
+  implementation lands.
+- [`security.md`](security.md) — `v0.2.0` Security Foundation: TLS/mTLS,
+  authentication, RBAC, audit logging, certificate rotation.
+- [`backup.md`](backup.md) — `v0.3.0` Backup / Disaster Recovery / PITR:
+  format, RPO/RTO model, restore runbook (implementation in progress
+  toward `v0.3.0`, not yet tagged).
+
 ### Packaging and releases (Phase 11)
 
 - [`versioning.md`](versioning.md) — SemVer policy and what pre-1.0

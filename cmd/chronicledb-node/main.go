@@ -64,6 +64,15 @@ func main() {
 		rbacMappingFile = flag.String("rbac-mapping-file", "", "JSON file mapping principal name to role (admin|operator|read-only); required when -auth-mode is not none")
 		auditLogDir     = flag.String("audit-log-dir", "", "directory for the hash-chained administrative audit log (default: <datadir>/audit)")
 		enableFault     = flag.Bool("enable-fault-endpoint", false, "register the /fault fault-injection endpoint (off by default; also requires admin auth when -auth-mode is not none)")
+
+		// Backup / Disaster Recovery / PITR flags (docs/enterprise-v1-plan.md
+		// §6). Restore is a startup-only preflight: it runs, and must
+		// complete, entirely before node.Open ever touches -datadir (see
+		// the restore preflight block below and DESTRUCTIVE RESTORE
+		// ISOLATION in docs/backup.md).
+		restoreFrom    = flag.String("restore-from", "", "restore -datadir from the backup at this directory before starting (must be empty/absent unless -force-overwrite is also set); the process exits after a successful restore is not required — normal startup continues against the now-restored data directory")
+		restoreUntil   = flag.String("restore-until", "", "PITR boundary log index to restore up to (empty = everything the backup includes); only meaningful with -restore-from")
+		forceOverwrite = flag.Bool("force-overwrite", false, "required in addition to -restore-from to restore over a -datadir that already contains WAL/snapshot state (DESTRUCTIVE RESTORE ISOLATION: this destroys that existing state)")
 	)
 	flag.Parse()
 
@@ -118,6 +127,30 @@ func main() {
 	logger := log.New(os.Stderr, fmt.Sprintf("[%s] ", *id), log.LstdFlags|log.Lmicroseconds)
 	logger.Printf("starting %s", version.String())
 
+	// Restore preflight (docs/enterprise-v1-plan.md §6): must complete,
+	// successfully, entirely before node.Open ever opens -datadir —
+	// restore only ever targets a not-yet-opened data directory, never a
+	// live node's own in-use one.
+	if *restoreFrom != "" {
+		res, err := runRestore(*restoreFrom, *dataDir, *restoreUntil, *forceOverwrite)
+		if err != nil {
+			logger.Fatalf("restore from %s into %s failed: %v", *restoreFrom, *dataDir, err)
+		}
+		logger.Printf("restored %s from backup %s: manifest range [%d,%d], restored up to index %d (force-overwrite=%v)",
+			*dataDir, *restoreFrom, res.Manifest.LastIncludedIndex, res.Manifest.WALUntilIndex, res.RestoredUntilIndex, *forceOverwrite)
+		if err := recordRestoreAudit(secFlags.auditLogDir, *restoreFrom, *dataDir, *forceOverwrite, res); err != nil {
+			if *forceOverwrite {
+				// DESTRUCTIVE RESTORE ISOLATION: a forced restore that
+				// destroyed pre-existing state must not proceed without
+				// its required audit record — fail closed exactly like
+				// the HTTP admin middleware chain does for every other
+				// administrative action (AUDIT COMPLETENESS).
+				logger.Fatalf("forced restore succeeded but its required audit record could not be written: %v", err)
+			}
+			logger.Printf("warning: restore audit record could not be written (restore itself succeeded, target was already clean): %v", err)
+		}
+	}
+
 	cfg := node.Config{
 		ID:                         raft.NodeID(*id),
 		Peers:                      peers,
@@ -157,7 +190,7 @@ func main() {
 		}
 	}
 
-	srv := newControlServer(n, logger, sec, clientTLSHolder, secFlags.enableFault)
+	srv := newControlServer(n, logger, sec, clientTLSHolder, secFlags.enableFault, *allFlag)
 	httpSrv := &http.Server{Addr: *httpAddr, Handler: srv}
 
 	if clientTLSHolder != nil {
@@ -251,6 +284,11 @@ type controlServer struct {
 	mux             *http.ServeMux
 	sec             *security
 	clientTLSHolder *identity.Holder
+	// clusterID is recorded, diagnostically only, in every backup this
+	// node's /admin/backup produces (docs/enterprise-v1-plan.md §6's
+	// manifest "cluster ID" field) — see backup.Manifest.ClusterID's doc
+	// comment for why it is never validated by Restore.
+	clusterID string
 }
 
 // newControlServer wires every route through the Security Foundation
@@ -259,14 +297,15 @@ type controlServer struct {
 // (docs/enterprise-v1-plan.md §5 layer 8, FAULT SURFACE OFF BY DEFAULT:
 // "the flag's absence must make the handler structurally unreachable
 // (registered conditionally, not just checked-and-rejected)").
-func newControlServer(n *node.Node, logger *log.Logger, sec *security, clientTLSHolder *identity.Holder, enableFault bool) *controlServer {
-	s := &controlServer{n: n, logger: logger, mux: http.NewServeMux(), sec: sec, clientTLSHolder: clientTLSHolder}
+func newControlServer(n *node.Node, logger *log.Logger, sec *security, clientTLSHolder *identity.Holder, enableFault bool, clusterID string) *controlServer {
+	s := &controlServer{n: n, logger: logger, mux: http.NewServeMux(), sec: sec, clientTLSHolder: clientTLSHolder, clusterID: clusterID}
 	s.mux.HandleFunc("/status", sec.wrap(authz.EndpointStatus, s.handleStatus))
 	s.mux.HandleFunc("/propose", sec.wrap(authz.EndpointPropose, s.handlePropose))
 	s.mux.HandleFunc("/outcome", sec.wrap(authz.EndpointOutcome, s.handleOutcome))
 	s.mux.HandleFunc("/metrics", sec.wrap(authz.EndpointMetrics, s.handleMetrics))
 	s.mux.HandleFunc("/health", sec.wrap(authz.EndpointHealth, s.handleHealth))
 	s.mux.HandleFunc("/admin/reload-tls", sec.wrap(authz.EndpointReloadTLS, s.handleReloadTLS))
+	s.mux.HandleFunc("/admin/backup", sec.wrap(authz.EndpointBackup, s.handleBackup))
 	if enableFault {
 		s.mux.HandleFunc("/fault", sec.wrap(authz.EndpointFault, s.handleFault))
 	}

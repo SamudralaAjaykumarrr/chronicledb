@@ -9,6 +9,7 @@ package main
 
 import (
 	"net/http/httptest"
+	"os"
 	"strings"
 	"testing"
 
@@ -16,6 +17,21 @@ import (
 	"github.com/SamudralaAjaykumarrr/chronicledb/internal/authn"
 	"github.com/SamudralaAjaykumarrr/chronicledb/internal/authz"
 )
+
+// rbacTestBackupDir is a scratch directory /admin/backup's RBAC-decision-
+// table exercise writes into when a role/endpoint combination is
+// expected to reach the handler — a fixed package-level path (rather
+// than a per-test t.TempDir()) because endpointHTTP below is itself a
+// package-level table shared by several tests.
+var rbacTestBackupDir = mustMkdirTemp("chronicledb-rbac-backup-")
+
+func mustMkdirTemp(prefix string) string {
+	dir, err := os.MkdirTemp("", prefix)
+	if err != nil {
+		panic(err)
+	}
+	return dir
+}
 
 // newTokenSecurityForTest builds a *security in token auth mode with
 // three principals, one per fixed role, plus a dedicated audit log
@@ -66,12 +82,13 @@ var endpointHTTP = map[string]struct {
 	authz.EndpointOutcome:   {"GET", "/outcome?requestId=nonexistent"},
 	authz.EndpointFault:     {"POST", "/fault?action=block&peer=ghost"},
 	authz.EndpointReloadTLS: {"POST", "/admin/reload-tls"},
+	authz.EndpointBackup:    {"POST", "/admin/backup?dir=" + rbacTestBackupDir},
 }
 
 func TestRBAC_DecisionTable_HTTPLayer_EveryRoleEveryEndpoint(t *testing.T) {
 	n := openSingleNodeForControlTest(t)
 	sec, _, tokenFor := newTokenSecurityForTest(t)
-	srv := newControlServer(n, nil, sec, nil, true) // enableFault=true so /fault's RBAC (not merely registration) is exercised here
+	srv := newControlServer(n, nil, sec, nil, true, "test-cluster") // enableFault=true so /fault's RBAC (not merely registration) is exercised here
 
 	for _, ep := range authz.AllEndpoints {
 		hh := endpointHTTP[ep]
@@ -117,7 +134,7 @@ func TestRBAC_DecisionTable_HTTPLayer_EveryRoleEveryEndpoint(t *testing.T) {
 func TestRBAC_UnauthenticatedRequestDeniedForEveryEndpoint(t *testing.T) {
 	n := openSingleNodeForControlTest(t)
 	sec, _, _ := newTokenSecurityForTest(t)
-	srv := newControlServer(n, nil, sec, nil, true)
+	srv := newControlServer(n, nil, sec, nil, true, "test-cluster")
 
 	for _, ep := range authz.AllEndpoints {
 		hh := endpointHTTP[ep]
@@ -135,7 +152,7 @@ func TestRBAC_UnauthenticatedRequestDeniedForEveryEndpoint(t *testing.T) {
 func TestAuth_GenericErrorMessages_NoInformationLeak(t *testing.T) {
 	n := openSingleNodeForControlTest(t)
 	sec, _, tokenFor := newTokenSecurityForTest(t)
-	srv := newControlServer(n, nil, sec, nil, true)
+	srv := newControlServer(n, nil, sec, nil, true, "test-cluster")
 
 	call := func(token string) (int, string) {
 		req := httptest.NewRequest("GET", "/status", nil)
@@ -178,7 +195,7 @@ func TestAuth_GenericErrorMessages_NoInformationLeak(t *testing.T) {
 // does not exist" from "route exists but returned an error."
 func TestFaultEndpoint_UnregisteredByDefault(t *testing.T) {
 	n := openSingleNodeForControlTest(t)
-	srv := newControlServer(n, nil, nil, nil, false)
+	srv := newControlServer(n, nil, nil, nil, false, "test-cluster")
 
 	req := httptest.NewRequest("POST", "/fault?action=block&peer=ghost", nil)
 	_, pattern := srv.mux.Handler(req)
@@ -219,7 +236,7 @@ func TestFaultEndpoint_RegisteredFlagCombinations(t *testing.T) {
 			if tc.withAuth {
 				sec, _, tokenFor = newTokenSecurityForTest(t)
 			}
-			srv := newControlServer(n, nil, sec, nil, tc.enableFault)
+			srv := newControlServer(n, nil, sec, nil, tc.enableFault, "test-cluster")
 
 			req := httptest.NewRequest("POST", "/fault?action=block&peer=ghost", nil)
 			if tc.withAuth {
@@ -251,7 +268,7 @@ func TestFaultEndpoint_RegisteredFlagCombinations(t *testing.T) {
 func TestAudit_ExactlyOneRecordPerDecision(t *testing.T) {
 	n := openSingleNodeForControlTest(t)
 	sec, auditDir, tokenFor := newTokenSecurityForTest(t)
-	srv := newControlServer(n, nil, sec, nil, false)
+	srv := newControlServer(n, nil, sec, nil, false, "test-cluster")
 
 	do := func(token string) {
 		req := httptest.NewRequest("GET", "/status", nil)
@@ -288,7 +305,7 @@ func TestAudit_ExactlyOneRecordPerDecision(t *testing.T) {
 func TestMetrics_ExposesSecurityCounters(t *testing.T) {
 	n := openSingleNodeForControlTest(t)
 	sec, _, tokenFor := newTokenSecurityForTest(t)
-	srv := newControlServer(n, nil, sec, nil, false)
+	srv := newControlServer(n, nil, sec, nil, false, "test-cluster")
 
 	// One success, one failure, to populate both counters.
 	ok := httptest.NewRequest("GET", "/status", nil)
@@ -318,7 +335,7 @@ func TestMetrics_ExposesSecurityCounters(t *testing.T) {
 func TestAudit_WriteFailureBlocksAction(t *testing.T) {
 	n := openSingleNodeForControlTest(t)
 	sec, _, tokenFor := newTokenSecurityForTest(t)
-	srv := newControlServer(n, nil, sec, nil, false)
+	srv := newControlServer(n, nil, sec, nil, false, "test-cluster")
 
 	// Simulate an unwritable audit log (disk full / permission error /
 	// any I/O failure) by closing its underlying file handle out from

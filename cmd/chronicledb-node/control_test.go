@@ -59,7 +59,7 @@ func openSingleNodeForControlTest(t *testing.T) *node.Node {
 
 func TestControlServerMetricsExposesExpectedNames(t *testing.T) {
 	n := openSingleNodeForControlTest(t)
-	srv := newControlServer(n, nil, nil, nil, false)
+	srv := newControlServer(n, nil, nil, nil, false, "test-cluster")
 
 	rec := httptest.NewRecorder()
 	req := httptest.NewRequest("GET", "/metrics", nil)
@@ -95,7 +95,7 @@ func TestControlServerMetricsExposesExpectedNames(t *testing.T) {
 
 func TestControlServerHealthNeverClaimsQuorumForFollower(t *testing.T) {
 	n := openSingleNodeForControlTest(t)
-	srv := newControlServer(n, nil, nil, nil, false)
+	srv := newControlServer(n, nil, nil, nil, false, "test-cluster")
 
 	rec := httptest.NewRecorder()
 	req := httptest.NewRequest("GET", "/health", nil)

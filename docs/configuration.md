@@ -46,6 +46,27 @@ behavior — none of them are required.
 There is no flag to disable durability (fsync) — durability is this
 project's core correctness property, never configurable off.
 
+### Backup / Disaster Recovery / PITR flags (`v0.3.0`, `docs/enterprise-v1-plan.md` §6)
+
+See [`docs/backup.md`](backup.md) for the full format, RPO/RTO model,
+and restore runbook. Taking a backup of a *running* node is an
+admin/operator-gated HTTP action (`POST /admin/backup?dir=<path>&continuous=<true|false>`,
+audited per [`docs/security.md`](security.md)), not a flag — there is
+no `-backup-to` flag: this phase's plan itself left the exact CLI shape
+open ("or a new `chronicledb-ctl backup` subcommand"), and only the
+already-live, already-authenticated node process can safely read a
+consistent point of its own in-memory/durable state; see
+[`docs/backup.md`](backup.md) §Deviations for the full reasoning.
+Restore, by contrast, is a startup-only flag: it only ever targets a
+not-yet-opened data directory, run once, before the node ever joins a
+cluster.
+
+| Flag | Required | Meaning |
+|---|---|---|
+| `-restore-from` | No | Before opening `-datadir`, restore it from the backup at this directory. Refuses to run against a non-empty `-datadir` unless `-force-overwrite` is also set. Startup continues normally (opens the now-restored data directory, joins/forms Raft) once restore succeeds. |
+| `-restore-until` | No (default: everything the backup includes) | A PITR boundary: the last committed log index to restore up to. Only meaningful together with `-restore-from`. Must name a real committed log index — there is no wall-clock/timestamp form (see [`docs/backup.md`](backup.md) §PITR boundary model for why). |
+| `-force-overwrite` | No (default `false`) | Required, together with `-restore-from`, to restore over a `-datadir` that already contains WAL/snapshot state — this destroys that existing state (DESTRUCTIVE RESTORE ISOLATION). Produces an audit record; a failure to write that record aborts startup. |
+
 ## Example: a real three-node cluster on one machine
 
 Three separate `-datadir` values and three separate ports, run as

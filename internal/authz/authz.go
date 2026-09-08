@@ -50,6 +50,10 @@ const (
 	EndpointOutcome   = "outcome"
 	EndpointFault     = "fault"
 	EndpointReloadTLS = "admin.reload-tls"
+	// EndpointBackup gates /admin/backup (docs/enterprise-v1-plan.md §6,
+	// §5's own RBAC section: "operator may call operational
+	// endpoints... (future backup-trigger)").
+	EndpointBackup = "admin.backup"
 )
 
 // AllEndpoints lists every endpoint the decision table below covers —
@@ -61,6 +65,7 @@ var AllEndpoints = []string{
 	EndpointStatus, EndpointMetrics, EndpointHealth,
 	EndpointPropose, EndpointOutcome,
 	EndpointFault, EndpointReloadTLS,
+	EndpointBackup,
 }
 
 // AllRoles lists every fixed V1 role.
@@ -85,6 +90,10 @@ var decisionTable = map[string]map[Role]bool{
 	// comment on Allowed).
 	EndpointFault:     {RoleAdmin: true, RoleOperator: false, RoleReadOnly: false},
 	EndpointReloadTLS: {RoleAdmin: true, RoleOperator: false, RoleReadOnly: false},
+	// docs/enterprise-v1-plan.md §5's own RBAC layer description names
+	// backup triggering explicitly as an operator-permitted operational
+	// action, unlike /fault or membership changes.
+	EndpointBackup: {RoleAdmin: true, RoleOperator: true, RoleReadOnly: false},
 }
 
 // Allowed reports whether role may call endpoint, per the fixed V1 RBAC

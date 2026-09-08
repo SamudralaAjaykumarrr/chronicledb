@@ -60,6 +60,12 @@ type Metrics struct {
 	// node's event loop.
 	RaftMessagesSentTotal     metrics.Counter
 	RaftMessagesReceivedTotal metrics.Counter
+
+	// BackupsTotal/BackupsFailedTotal count every Node.Backup call this
+	// node has completed/failed (docs/enterprise-v1-plan.md §6
+	// Observability: "duration, size, and success/failure counters").
+	BackupsTotal       metrics.Counter
+	BackupsFailedTotal metrics.Counter
 }
 
 // MetricsSnapshot is a point-in-time, safe-to-read-anywhere copy of a
@@ -77,6 +83,8 @@ type MetricsSnapshot struct {
 	SnapshotsInstalledTotal   uint64
 	RaftMessagesSentTotal     uint64
 	RaftMessagesReceivedTotal uint64
+	BackupsTotal              uint64
+	BackupsFailedTotal        uint64
 }
 
 // Metrics returns a snapshot of this node's current diagnostic
@@ -96,5 +104,7 @@ func (n *Node) Metrics() MetricsSnapshot {
 		SnapshotsInstalledTotal:   m.SnapshotsInstalledTotal.Value(),
 		RaftMessagesSentTotal:     m.RaftMessagesSentTotal.Value(),
 		RaftMessagesReceivedTotal: m.RaftMessagesReceivedTotal.Value(),
+		BackupsTotal:              m.BackupsTotal.Value(),
+		BackupsFailedTotal:        m.BackupsFailedTotal.Value(),
 	}
 }
