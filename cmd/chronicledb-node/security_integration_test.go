@@ -88,10 +88,13 @@ func newSecureRealCluster(t *testing.T, bin string, n int) (nodes []*realNode, c
 	dir := t.TempDir()
 
 	ids := make([]string, n)
+	ports := freePorts(t, 2*n)
 	raftAddrs := make(map[string]string, n)
+	httpAddrs := make(map[string]string, n)
 	for i := 0; i < n; i++ {
 		ids[i] = fmt.Sprintf("s%d", i+1)
-		raftAddrs[ids[i]] = freePort(t)
+		raftAddrs[ids[i]] = ports[i]
+		httpAddrs[ids[i]] = ports[n+i]
 	}
 	caFile, tokenFile, rbacFile, certFor := writeSecurityFixtures(t, ca, dir, ids)
 	certFiles = certFor
@@ -109,7 +112,7 @@ func newSecureRealCluster(t *testing.T, bin string, n int) (nodes []*realNode, c
 		nodes[i] = &realNode{
 			id:       id,
 			raftAddr: raftAddrs[id],
-			httpAddr: freePort(t),
+			httpAddr: httpAddrs[id],
 			dataDir:  t.TempDir(),
 			args: []string{
 				"-id=" + id,

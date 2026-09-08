@@ -157,6 +157,7 @@ func TestRealBackup_DestructiveDisasterRecoveryDrill(t *testing.T) {
 	}
 	clusterFlag := strings.Join(ids, ",")
 
+	httpPorts := freePorts(t, len(nodes))
 	restored := make([]*realNode, len(nodes))
 	for i, rn := range nodes {
 		var peerParts []string
@@ -168,7 +169,7 @@ func TestRealBackup_DestructiveDisasterRecoveryDrill(t *testing.T) {
 		restored[i] = &realNode{
 			id:       rn.id,
 			raftAddr: rn.raftAddr,
-			httpAddr: freePort(t),
+			httpAddr: httpPorts[i],
 			dataDir:  newDirs[rn.id],
 			args: []string{
 				"-id=" + rn.id,

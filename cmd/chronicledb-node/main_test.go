@@ -28,20 +28,95 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
 	"syscall"
 	"testing"
 	"time"
 )
 
-func freePort(t *testing.T) string {
+// freePorts reserves n distinct available TCP ports on 127.0.0.1 for a
+// single cluster's worth of nodes. A naive "reserve one, release it,
+// reserve the next" loop leaves a real window where the OS hands the
+// just-freed port straight back to the very next reservation (the same
+// release-then-reacquire race internal/node/node_test.go's freeAddrs
+// was added to fix for the in-process testCluster harness; this
+// real-OS-process harness had the identical one-at-a-time
+// reserve-then-release-in-a-loop pattern and was never updated to
+// match — see the fix that replaced it here). This holds every
+// reservation open simultaneously so the OS cannot hand out the same
+// port twice, and only releases all of them, together, immediately
+// before the caller starts its real processes.
+func freePorts(t *testing.T, n int) []string {
 	t.Helper()
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatalf("reserving port: %v", err)
+	lns := make([]net.Listener, 0, n)
+	defer func() {
+		for _, ln := range lns {
+			ln.Close()
+		}
+	}()
+	addrs := make([]string, n)
+	for i := 0; i < n; i++ {
+		ln, err := net.Listen("tcp", "127.0.0.1:0")
+		if err != nil {
+			t.Fatalf("reserving free port %d/%d: %v", i+1, n, err)
+		}
+		lns = append(lns, ln)
+		addrs[i] = ln.Addr().String()
 	}
-	addr := ln.Addr().String()
-	ln.Close()
-	return addr
+	return addrs
+}
+
+// TestFreePorts_NoDuplicatesUnderConcurrentPortContention is a
+// deterministic regression test for the release-then-reacquire port
+// collision class fixed by freePorts (previously: this package's
+// cluster builders called a freePort(t)-in-a-loop pattern identical to
+// the one internal/node/node_test.go's freeAddrs already had to
+// replace for the in-process testCluster harness). It does not rely on
+// timing or a lucky reproduction: freePorts holds every reservation in
+// a batch open simultaneously, so the OS cannot hand out the same port
+// to two reservations in the same batch — a guarantee, not a
+// probability — proven here across many batches, sized like a real
+// 3-node cluster's raftAddrs+httpAddrs reservation (2*3=6), while
+// background goroutines concurrently open and close unrelated
+// ephemeral ports on the same host to reproduce the contention that
+// makes the old release-then-reacquire pattern collide in practice.
+func TestFreePorts_NoDuplicatesUnderConcurrentPortContention(t *testing.T) {
+	stop := make(chan struct{})
+	var wg sync.WaitGroup
+	for w := 0; w < 8; w++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for {
+				select {
+				case <-stop:
+					return
+				default:
+				}
+				ln, err := net.Listen("tcp", "127.0.0.1:0")
+				if err == nil {
+					ln.Close()
+				}
+			}
+		}()
+	}
+	t.Cleanup(func() {
+		close(stop)
+		wg.Wait()
+	})
+
+	const trials = 500
+	const perBatch = 6
+	for i := 0; i < trials; i++ {
+		addrs := freePorts(t, perBatch)
+		seen := make(map[string]bool, perBatch)
+		for _, a := range addrs {
+			if seen[a] {
+				t.Fatalf("trial %d: freePorts returned duplicate address %q in batch %v", i, a, addrs)
+			}
+			seen[a] = true
+		}
+	}
 }
 
 // realNode wraps one real chronicledb-node OS process.
@@ -71,10 +146,13 @@ func buildBinary(t *testing.T) string {
 func newRealCluster(t *testing.T, bin string, n int) []*realNode {
 	t.Helper()
 	ids := make([]string, n)
+	ports := freePorts(t, 2*n)
 	raftAddrs := make(map[string]string, n)
+	httpAddrs := make(map[string]string, n)
 	for i := 0; i < n; i++ {
 		ids[i] = fmt.Sprintf("n%d", i+1)
-		raftAddrs[ids[i]] = freePort(t)
+		raftAddrs[ids[i]] = ports[i]
+		httpAddrs[ids[i]] = ports[n+i]
 	}
 	clusterFlag := strings.Join(ids, ",")
 
@@ -89,7 +167,7 @@ func newRealCluster(t *testing.T, bin string, n int) []*realNode {
 		nodes[i] = &realNode{
 			id:       id,
 			raftAddr: raftAddrs[id],
-			httpAddr: freePort(t),
+			httpAddr: httpAddrs[id],
 			dataDir:  t.TempDir(),
 			args: []string{
 				"-id=" + id,

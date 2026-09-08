@@ -31,10 +31,13 @@ import (
 func newRealClusterWithSnapshotThreshold(t *testing.T, bin string, n int, threshold uint64) []*realNode {
 	t.Helper()
 	ids := make([]string, n)
+	ports := freePorts(t, 2*n)
 	raftAddrs := make(map[string]string, n)
+	httpAddrs := make(map[string]string, n)
 	for i := 0; i < n; i++ {
 		ids[i] = fmt.Sprintf("n%d", i+1)
-		raftAddrs[ids[i]] = freePort(t)
+		raftAddrs[ids[i]] = ports[i]
+		httpAddrs[ids[i]] = ports[n+i]
 	}
 	clusterFlag := strings.Join(ids, ",")
 
@@ -49,7 +52,7 @@ func newRealClusterWithSnapshotThreshold(t *testing.T, bin string, n int, thresh
 		nodes[i] = &realNode{
 			id:       id,
 			raftAddr: raftAddrs[id],
-			httpAddr: freePort(t),
+			httpAddr: httpAddrs[id],
 			dataDir:  t.TempDir(),
 			args: []string{
 				"-id=" + id,
