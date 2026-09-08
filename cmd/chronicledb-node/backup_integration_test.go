@@ -200,4 +200,54 @@ func TestRealBackup_DestructiveDisasterRecoveryDrill(t *testing.T) {
 	if err != nil || status != http.StatusOK || resp.Status != "committed" {
 		t.Fatalf("post-recovery propose: resp=%+v status=%d err=%v", resp, status, err)
 	}
+
+	// Criterion: the restored cluster itself survives a further real
+	// restart/recovery cycle — a restored data directory must be a
+	// fully valid, durable directory that node.Open's ordinary recovery
+	// path can reopen after a real SIGKILL, indistinguishable from one
+	// that grew organically, not merely openable the one time Restore
+	// itself produced it.
+	var victim *realNode
+	for _, rn := range restored {
+		if rn.id != newLeader.id {
+			victim = rn
+			break
+		}
+	}
+	victim.crash()
+	// A real restart after the initial disaster recovery does not
+	// re-pass -restore-from: the data directory is now this node's own
+	// ordinary, already-populated directory, and node.Open's normal
+	// recovery path is what must reopen it. Re-passing -restore-from
+	// here would (correctly) be refused by DESTRUCTIVE RESTORE
+	// ISOLATION, since the directory is no longer clean/empty — that is
+	// not what this criterion is testing.
+	restartArgs := make([]string, 0, len(victim.args))
+	for _, a := range victim.args {
+		if !strings.HasPrefix(a, "-restore-from=") {
+			restartArgs = append(restartArgs, a)
+		}
+	}
+	victim.args = restartArgs
+	victim.restart(t, bin)
+	deadline := time.Now().Add(15 * time.Second)
+	caught := false
+	for time.Now().Before(deadline) {
+		st, err := victim.status()
+		if err == nil && st.AppliedIndex >= uint64(n)+1 {
+			caught = true
+			break
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	if !caught {
+		t.Fatalf("restarted restored node %s never caught back up after a real SIGKILL+restart post-recovery", victim.id)
+	}
+
+	// The restored-then-restarted cluster still accepts new writes.
+	postRestartLeader := awaitLeader(t, restored, 15*time.Second)
+	resp2, status2, err2 := propose(postRestartLeader, "after-restart-of-restored", "after-restart-key", "after-restart-val")
+	if err2 != nil || status2 != http.StatusOK || resp2.Status != "committed" {
+		t.Fatalf("propose after restarting a restored node: resp=%+v status=%d err=%v", resp2, status2, err2)
+	}
 }

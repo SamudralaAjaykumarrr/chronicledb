@@ -346,13 +346,24 @@ untested.
 ## Known limitations
 
 - **Authentication/TLS are supported but not on by default** (as of
-  `v0.2.0`, not yet tagged/released) — peer mTLS, client TLS, static-
-  token/mTLS authentication, RBAC, and audit logging all exist
-  (`docs/security.md`) but every relevant flag defaults to `v0.1.0`'s
-  plaintext/unauthenticated behavior. See [`SECURITY.md`](SECURITY.md)
-  and [`docs/non-goals.md`](docs/non-goals.md) §Authentication and TLS.
+  `v0.2.0`) — peer mTLS, client TLS, static-token/mTLS authentication,
+  RBAC, and audit logging all exist (`docs/security.md`) but every
+  relevant flag defaults to `v0.1.0`'s plaintext/unauthenticated
+  behavior. See [`SECURITY.md`](SECURITY.md) and
+  [`docs/non-goals.md`](docs/non-goals.md) §Authentication and TLS.
   Do not deploy ChronicleDB outside a trusted network without
   explicitly configuring these.
+- **Backup, disaster recovery, and point-in-time recovery are
+  implemented** (as of `v0.3.0`, not yet tagged/released) — a
+  self-describing, checksummed backup format built entirely on the
+  existing snapshot/WAL formats (`internal/backup`,
+  [`docs/backup.md`](docs/backup.md)), an `admin`/`operator`-gated
+  `/admin/backup` endpoint, and `-restore-from`/`-restore-until`/
+  `-force-overwrite` CLI flags for restoring into a clean data
+  directory, including PITR to an arbitrary committed log-index
+  boundary. Backup artifacts are not encrypted at rest and there is no
+  built-in cloud object-store integration — see
+  [`docs/backup.md`](docs/backup.md) §9.
 - **Snapshot Isolation, not Serializable** — see
   [`docs/mvcc.md`](docs/mvcc.md) §1.1.
 - **No joins, subqueries, secondary indexes, or PostgreSQL wire

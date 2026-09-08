@@ -221,6 +221,104 @@ func TestExportRestore_ContinuousPITRRoundTrip(t *testing.T) {
 	}
 }
 
+// TestExportRestore_MVCCTombstonesAndAtomicMultiKeyMutationsPreserved
+// closes a specific v0.3.0 acceptance-criterion gap: testHistory (used
+// by every other round-trip test in this file) only ever writes one
+// fresh key per commit, so no existing test here actually exercises a
+// tombstone (delete) surviving a backup/restore round trip, nor a
+// single transaction's multiple key mutations restoring atomically
+// together. docs/enterprise-v1-plan.md §6 and docs/backup.md §2 both
+// state a backup captures "every key's MVCC version chain, including
+// tombstones" — this test is the direct proof of that specific claim,
+// not an inference from the generic snapshot-only/PITR round-trip
+// tests above.
+func TestExportRestore_MVCCTombstonesAndAtomicMultiKeyMutationsPreserved(t *testing.T) {
+	srcDir := t.TempDir()
+	w, _, err := wal.Open(srcDir, wal.Options{})
+	if err != nil {
+		t.Fatalf("opening source WAL: %v", err)
+	}
+	defer w.Close()
+
+	cmds := []fsm.CommitTxnCommand{
+		// Atomic multi-key write: a single transaction writing two
+		// distinct keys together.
+		{
+			RequestID: "r1", TxnID: 1, StartSeq: 0,
+			Mutations: []mvcc.Mutation{
+				{Key: "a", Value: []byte("a-v1")},
+				{Key: "b", Value: []byte("b-v1")},
+			},
+		},
+		// Tombstone: deletes "a".
+		{
+			RequestID: "r2", TxnID: 2, StartSeq: 1,
+			Mutations: []mvcc.Mutation{{Key: "a", Tombstone: true}},
+		},
+		// Atomic multi-key again: a fresh key "c" written in the same
+		// transaction that tombstones "b".
+		{
+			RequestID: "r3", TxnID: 3, StartSeq: 2,
+			Mutations: []mvcc.Mutation{
+				{Key: "c", Value: []byte("c-v1")},
+				{Key: "b", Tombstone: true},
+			},
+		},
+	}
+	for i, cmd := range cmds {
+		idx, err := w.AppendLogEntry(fsm.EncodeCommitTxn(cmd))
+		if err != nil {
+			t.Fatalf("appending entry %d: %v", i+1, err)
+		}
+		if idx != uint64(i+1) {
+			t.Fatalf("entry %d assigned index %d", i+1, idx)
+		}
+	}
+	if err := w.Sync(); err != nil {
+		t.Fatalf("syncing source WAL: %v", err)
+	}
+
+	src := backup.Source{
+		BaseMeta: snapshot.Meta{LastIncludedIndex: 0, LastIncludedTerm: 1},
+		BaseFSM:  fsm.New(mvcc.NewStore()),
+		WAL:      w,
+	}
+	backupDir := filepath.Join(t.TempDir(), "backup")
+	if _, err := backup.Export(src, backupDir, backup.ExportOptions{UntilIndex: backup.UntilLatest, ClusterID: "test-cluster"}); err != nil {
+		t.Fatalf("Export: %v", err)
+	}
+
+	dataDir := filepath.Join(t.TempDir(), "restored")
+	if _, err := backup.Restore(backupDir, dataDir, backup.RestoreOptions{UntilIndex: backup.UntilLatest}); err != nil {
+		t.Fatalf("Restore: %v", err)
+	}
+
+	got := applyRestoredWAL(t, dataDir)
+	requireSameState(t, got, fsmAtBoundary(t, cmds, uint64(len(cmds))))
+
+	// Directly assert the tombstone/multi-key shape survived, not just
+	// structural equality with the reference model (which would also
+	// pass if both sides shared the same bug).
+	chains := got.Store().Export()
+	byKey := make(map[string][]mvcc.Version, len(chains))
+	for _, kc := range chains {
+		byKey[kc.Key] = kc.Versions
+	}
+
+	a := byKey["a"]
+	if len(a) != 2 || a[0].Tombstone || string(a[0].Value) != "a-v1" || !a[1].Tombstone {
+		t.Fatalf("key %q restored chain = %+v, want [write(a-v1), tombstone]", "a", a)
+	}
+	b := byKey["b"]
+	if len(b) != 2 || b[0].Tombstone || string(b[0].Value) != "b-v1" || !b[1].Tombstone {
+		t.Fatalf("key %q restored chain = %+v, want [write(b-v1), tombstone]", "b", b)
+	}
+	c := byKey["c"]
+	if len(c) != 1 || c[0].Tombstone || string(c[0].Value) != "c-v1" {
+		t.Fatalf("key %q restored chain = %+v, want [write(c-v1)]", "c", c)
+	}
+}
+
 func TestRestore_UntilIndexOutOfRangeRejected(t *testing.T) {
 	srcDir := t.TempDir()
 	w, cmds := testHistory(t, srcDir, 5)

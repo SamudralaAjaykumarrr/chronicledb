@@ -210,6 +210,94 @@ func TestBackup_DestructiveDisasterRecoveryDrill(t *testing.T) {
 	}
 }
 
+// TestBackup_AfterRealSnapshotCompactionCombinesBaseAndSuffixCorrectly
+// closes a specific v0.3.0 acceptance-criterion gap: neither backup
+// test above ever drives its cluster past its (effectively disabled,
+// newTestCluster's default threshold=0 meaning "never") snapshot
+// threshold, so neither actually proves docs/enterprise-v1-plan.md
+// §6's "backup/restore interaction with snapshot/compaction remains
+// correct" — specifically, that Node.Backup reads whatever snapshot
+// boundary internal/snapshot.Manager has *actually, currently* adopted
+// (after a real create+install compaction has moved it away from
+// zero and the live WAL has already had its compacted prefix
+// reclaimed) and correctly captures only the WAL suffix that still
+// exists beyond it, never assuming the boundary is still zero.
+func TestBackup_AfterRealSnapshotCompactionCombinesBaseAndSuffixCorrectly(t *testing.T) {
+	const threshold = 5
+	tc := newTestClusterWithSnapshotThreshold(t, 3, threshold)
+	leaderID := tc.awaitLeader(5 * time.Second)
+	leader := tc.node(leaderID)
+
+	const preSnapshot = 8 // > threshold, forces a real create+install compaction
+	for i := 1; i <= preSnapshot; i++ {
+		reqID := fmt.Sprintf("presnap-%d", i)
+		outcome, err := propose(t, leader, cmd(reqID, uint64(i), 0, fmt.Sprintf("presnap-key-%d", i), fmt.Sprintf("v%d", i)), 5*time.Second)
+		if err != nil || outcome.Status != fsm.StatusCommitted {
+			t.Fatalf("seeding pre-snapshot commit %d: outcome=%+v err=%v", i, outcome, err)
+		}
+	}
+	awaitCondition(t, 5*time.Second, "leader has actually compacted (SnapshotIndex > 0)", func() bool {
+		return leader.Status().SnapshotIndex > 0
+	})
+
+	const postSnapshot = 4 // committed only after real compaction, forming the WAL suffix backup must still capture
+	for i := preSnapshot + 1; i <= preSnapshot+postSnapshot; i++ {
+		reqID := fmt.Sprintf("postsnap-%d", i)
+		outcome, err := propose(t, leader, cmd(reqID, uint64(i), 0, fmt.Sprintf("postsnap-key-%d", i), fmt.Sprintf("v%d", i)), 5*time.Second)
+		if err != nil || outcome.Status != fsm.StatusCommitted {
+			t.Fatalf("seeding post-snapshot commit %d: outcome=%+v err=%v", i, outcome, err)
+		}
+	}
+	total := preSnapshot + postSnapshot
+	awaitCondition(t, 5*time.Second, "leader applied every commit", func() bool {
+		return leader.Status().AppliedIndex >= uint64(total)
+	})
+
+	outDir := filepath.Join(t.TempDir(), "backup")
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	m, err := leader.Backup(ctx, outDir, true, "snap-cluster")
+	if err != nil {
+		t.Fatalf("Backup after real compaction: %v", err)
+	}
+	// The exact boundary the automatic compactor lands on by the moment
+	// Backup runs is not pinned by this test (it may re-trigger again
+	// past the first compaction as postSnapshot commits land) — the
+	// property under test is that Backup builds on whatever boundary is
+	// *actually currently adopted* (never zero, since a real compaction
+	// already happened) and still restores every commit correctly.
+	if m.LastIncludedIndex == 0 {
+		t.Fatalf("backup base boundary = 0, want nonzero: a real compaction already moved the node's snapshot boundary away from zero before Backup ran, so Backup must not have assumed it was still zero")
+	}
+	if m.WALUntilIndex < uint64(total) {
+		t.Fatalf("backup captured up to %d, want at least %d", m.WALUntilIndex, total)
+	}
+
+	dataDir := filepath.Join(t.TempDir(), "restored")
+	if _, err := backup.Restore(outDir, dataDir, backup.RestoreOptions{UntilIndex: backup.UntilLatest}); err != nil {
+		t.Fatalf("Restore: %v", err)
+	}
+	restoredFSM := recoverFSMForTest(t, dataDir)
+
+	// Every commit survives — both the ones folded into the base
+	// snapshot by real compaction and the ones that only ever existed
+	// as WAL suffix entries beyond it.
+	for i := 1; i <= preSnapshot; i++ {
+		reqID := fmt.Sprintf("presnap-%d", i)
+		outcome, ok := restoredFSM.GetOutcome(fsm.RequestID(reqID))
+		if !ok || outcome.Status != fsm.StatusCommitted {
+			t.Fatalf("restored state missing pre-snapshot (base-snapshot-captured) commit %s: ok=%v outcome=%+v", reqID, ok, outcome)
+		}
+	}
+	for i := preSnapshot + 1; i <= total; i++ {
+		reqID := fmt.Sprintf("postsnap-%d", i)
+		outcome, ok := restoredFSM.GetOutcome(fsm.RequestID(reqID))
+		if !ok || outcome.Status != fsm.StatusCommitted {
+			t.Fatalf("restored state missing post-snapshot (WAL-suffix-captured) commit %s: ok=%v outcome=%+v", reqID, ok, outcome)
+		}
+	}
+}
+
 // recoverFSMForTest reconstructs the state a real node.Open's recovery
 // sequence would arrive at from dataDir alone — base snapshot (if any)
 // plus every WAL entry beyond it, applied in order — without paying for

@@ -4,16 +4,14 @@ All notable changes to ChronicleDB are documented here. Format loosely
 follows [Keep a Changelog](https://keepachangelog.com/); versioning
 follows [`docs/versioning.md`](docs/versioning.md) (SemVer, pre-1.0).
 
-## [Unreleased]
+## [0.3.0] - 2026-09-08
 
 Backup / Disaster Recovery / PITR — the second phase of the
 `docs/enterprise-v1-plan.md` Enterprise V1 roadmap (§6, target release
-`v0.3.0`, not yet tagged). See that document and
+`v0.3.0`). See that document and
 `docs/adr/0016-backup-disaster-recovery-and-pitr.md` for the complete
-design and `docs/backup.md` for the operational guide this work adds.
-This is **implementation work toward `v0.3.0`, not a release** — no
-maturity claim changes, nothing here is tagged, and Enterprise V1 is not
-claimed complete.
+design and `docs/backup.md` for the operational guide this release
+adds.
 
 ### Added
 
@@ -51,6 +49,81 @@ claimed complete.
   data directory entirely, restore three brand-new directories from the
   backup alone, and confirm the restored cluster reaches a state
   consistent with everything backed up and accepts new writes normally.
+- Release-qualification test evidence added while auditing this phase's
+  acceptance criteria: an explicit MVCC-tombstone/atomic-multi-key
+  backup-restore round-trip proof against an independent reference
+  model (`TestExportRestore_MVCCTombstonesAndAtomicMultiKeyMutationsPreserved`,
+  `internal/backup`); a real-compaction backup/restore proof — driving a
+  cluster past its snapshot threshold so `Node.Backup` runs against a
+  nonzero, already-compacted boundary, then restoring and confirming
+  both the pre- and post-compaction commits survive
+  (`TestBackup_AfterRealSnapshotCompactionCombinesBaseAndSuffixCorrectly`,
+  `internal/node`); a real-OS-process proof that a restored cluster
+  survives a further SIGKILL + restart cycle, not merely the one
+  `node.Open` `Restore` itself performs
+  (extends `TestRealBackup_DestructiveDisasterRecoveryDrill`,
+  `cmd/chronicledb-node`, `integration` build tag).
+
+### Compatibility
+
+Additive, non-breaking. The backup format is new and independent of
+the existing WAL/snapshot on-disk formats (it reuses them by copying
+through their own existing encode paths, never a new encoding) — this
+release does not change or version-bump either format, and does not
+affect a `v0.1.0`/`v0.2.0` node's own on-disk data directory in any
+way. `v0.2.0`'s Security Foundation behavior (TLS, auth, RBAC, audit)
+is unchanged and re-verified: the full `cmd/chronicledb-node`
+`integration`-tagged security suite
+(`security_integration_test.go`) passes unchanged alongside the new
+backup suite, and `/admin/backup` is gated through the same RBAC
+decision table and audit log as every other administrative endpoint
+(`TestRBAC_DecisionTable_HTTPLayer_EveryRoleEveryEndpoint`'s
+`admin.backup` case).
+
+### Known limitations at this point
+
+- Backup artifacts are not encrypted at rest — operators must apply
+  their own access control/encryption for wherever a backup directory
+  is stored. See `docs/backup.md` §9.
+- No built-in cloud object-store integration — backup/restore operate
+  on local filesystem paths only.
+- No continuous/streaming replication to a warm standby, and no
+  in-process backup scheduler — operators drive `/admin/backup` on
+  their own schedule (`cron` or equivalent).
+- No cross-version compatibility guarantee for the backup format yet
+  (`chronicledbVersion` in the manifest is diagnostic only) —
+  deferred to `docs/enterprise-v1-plan.md` §7 (Compatibility / Rolling
+  Upgrades, target `v0.4.0`).
+- PITR boundaries are committed log indices only, never wall-clock
+  timestamps — ChronicleDB has no commit-timestamp concept anywhere in
+  its design. See `docs/backup.md` §8.
+- Every other `v0.2.0` known limitation (security opt-in not
+  on-by-default, Snapshot Isolation not Serializable, no SQL joins/
+  subqueries/secondary indexes, single static shard, Linux amd64 only
+  actually tested) is unchanged — see the `v0.2.0` entry below.
+
+### Fixed
+
+- Real-OS-process integration test harness (`cmd/chronicledb-node`):
+  `newRealCluster`/`newRealClusterWithSnapshotThreshold`/
+  `newSecureRealCluster` and the destructive-restore-drill's own
+  restore-cluster construction each reserved a cluster's TCP ports one
+  at a time (reserve, release, reserve the next), leaving a real window
+  where the OS could hand the just-freed port straight back to the very
+  next reservation and give two nodes the same port — the identical
+  release-then-reacquire race `internal/node/node_test.go`'s
+  `freeAddrs` was already fixed for the in-process `testCluster`
+  harness, but never applied to this real-process harness. Measured
+  directly (20,000-trial stress harness isolating just the port-
+  reservation pattern): 0.215% collision rate for the one-at-a-time
+  pattern vs. 0% for a batch-hold pattern across the same trials —
+  a deterministic test-harness defect, not a ChronicleDB defect.
+  Replaced with `freePorts`, which holds every reservation in a batch
+  open simultaneously before releasing any (mirroring `freeAddrs`),
+  plus a deterministic regression test
+  (`TestFreePorts_NoDuplicatesUnderConcurrentPortContention`) that
+  proves the batch-hold property under concurrent port contention.
+  Test-harness-only; no production code changed.
 
 ## [0.2.0] - 2026-09-08
 
