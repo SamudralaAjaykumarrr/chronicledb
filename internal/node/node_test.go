@@ -82,6 +82,17 @@ type testCluster struct {
 	// handful of proposals rather than Config's much larger production
 	// default.
 	snapshotThreshold uint64
+
+	// peerTLS, when non-nil, configures every node this cluster opens
+	// with peer mTLS (docs/enterprise-v1-plan.md §5 layer 2) instead of
+	// plaintext transport — see tls_test.go.
+	peerTLS map[raft.NodeID]peerTLSFiles
+}
+
+// peerTLSFiles names one node's peer-TLS certificate/key/CA file paths
+// (see tls_test.go).
+type peerTLSFiles struct {
+	CertFile, KeyFile, CAFile string
 }
 
 func newTestCluster(t *testing.T, n int) *testCluster {
@@ -140,7 +151,7 @@ func (tc *testCluster) configFor(id raft.NodeID) Config {
 	if tc.snapshotThreshold != 0 {
 		electionTicks, heartbeatTicks = 30, 3
 	}
-	return Config{
+	cfg := Config{
 		ID:                         id,
 		Peers:                      append([]raft.NodeID(nil), tc.ids...),
 		PeerAddrs:                  peerAddrs,
@@ -152,6 +163,13 @@ func (tc *testCluster) configFor(id raft.NodeID) Config {
 		TickInterval:               10 * time.Millisecond,
 		SnapshotThreshold:          tc.snapshotThreshold,
 	}
+	if tc.peerTLS != nil {
+		files := tc.peerTLS[id]
+		cfg.PeerTLSCertFile = files.CertFile
+		cfg.PeerTLSKeyFile = files.KeyFile
+		cfg.PeerTLSCAFile = files.CAFile
+	}
+	return cfg
 }
 
 func (tc *testCluster) mustOpen(id raft.NodeID) *Node {

@@ -125,17 +125,32 @@ what would trigger revisiting it.
 
 ## Authentication and TLS
 
-- **Deferred**: V1 assumes a trusted network between client and
-  cluster and among cluster nodes; see
-  [`docs/failure-model.md`](failure-model.md) §6.
-- **Why**: correctness of the transactional/consensus core is the
-  priority for the phases leading up to a distributed prototype;
-  authentication/transport security is an orthogonal, well-understood
-  problem best layered on once the core is proven.
-- **Revisit when**: before any claim of production-readiness or any
-  deployment outside a trusted network (must be resolved no later than
-  `PORTFOLIO READY`/`OPEN-SOURCE READY`, see
-  [`docs/roadmap.md`](roadmap.md)).
+- **Resolved** (as of `v0.2.0`, Security Foundation,
+  `docs/enterprise-v1-plan.md` §5; not yet tagged/released) — see
+  [`docs/security.md`](security.md) for the full operational guide.
+  Client TLS, peer mTLS, static-token and mTLS-identity authentication,
+  fixed-role RBAC, and hash-chained audit logging are implemented in
+  `internal/identity`, `internal/transport`, `internal/authn`,
+  `internal/authz`, and `internal/audit`. **Not on by default**: every
+  relevant flag defaults to `v0.1.0`'s exact plaintext/unauthenticated
+  behavior (secure-by-configuration, not yet secure-by-default —
+  flipping the default is a separate, explicitly evidenced `v1.0.0`
+  gate requirement, `docs/enterprise-v1-plan.md` §13.2).
+- **Still deferred, by explicit V1 scope decision** (see
+  `docs/enterprise-v1-plan.md` §5's own Non-goals): OIDC/SSO/LDAP/SAML
+  integration; a built-in certificate authority/PKI service
+  (operators bring their own CA); per-row/per-column SQL-level
+  authorization; HSM-backed private key storage; a built-in external
+  secret-manager integration.
+- **Why originally deferred through `v0.1.0`**: correctness of the
+  transactional/consensus core was the priority for the phases leading
+  up to a distributed prototype; authentication/transport security is
+  an orthogonal, well-understood problem, layered on once the core was
+  proven — exactly the trigger `docs/enterprise-v1-plan.md` names for
+  starting this phase.
+- **Revisit when** (for the remaining still-deferred items above): a
+  specific, evidenced need is scoped with its own ADR, per this
+  document's general policy.
 
 ## MVCC version garbage collection (implementation, not the rule)
 

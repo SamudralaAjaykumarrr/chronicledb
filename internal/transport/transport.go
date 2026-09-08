@@ -25,6 +25,7 @@ package transport
 import (
 	"bufio"
 	"bytes"
+	"crypto/tls"
 	"encoding/binary"
 	"encoding/gob"
 	"fmt"
@@ -108,17 +109,36 @@ type Transport struct {
 	// readLoop goroutine blocked in a read forever and deadlock Close's
 	// wg.Wait.
 	inbound map[net.Conn]struct{}
+
+	// tlsSrc is non-nil only for a Transport created via NewTLS
+	// (tls.go): peer mTLS is then mandatory on every connection, inbound
+	// and outbound, with no plaintext fallback (docs/enterprise-v1-plan.md
+	// §5 "NO PLAINTEXT PEER REPLICATION").
+	tlsSrc TLSMaterialSource
 }
 
 // New creates a Transport for node id, listening on listenAddr, with
 // peerAddrs giving every other cluster member's dial address (id ->
 // "host:port"). New starts accepting inbound connections immediately;
-// received messages are delivered via Recv.
+// received messages are delivered via Recv. Connections are plaintext —
+// see NewTLS for peer mTLS.
 func New(id raft.NodeID, listenAddr string, peerAddrs map[raft.NodeID]string) (*Transport, error) {
 	ln, err := net.Listen("tcp", listenAddr)
 	if err != nil {
 		return nil, fmt.Errorf("transport: listen on %s: %w", listenAddr, err)
 	}
+	t := newTransport(id, ln, peerAddrs)
+	t.wg.Add(1)
+	go t.acceptLoop()
+	return t, nil
+}
+
+// newTransport builds a Transport around an already-created listener
+// (plain TCP for New, TLS-wrapped for NewTLS) without starting
+// acceptLoop — callers start it themselves once any TLS-specific field
+// (tlsSrc) is set, so acceptLoop never observes a half-initialized
+// Transport.
+func newTransport(id raft.NodeID, ln net.Listener, peerAddrs map[raft.NodeID]string) *Transport {
 	t := &Transport{
 		id:          id,
 		ln:          ln,
@@ -134,9 +154,7 @@ func New(id raft.NodeID, listenAddr string, peerAddrs map[raft.NodeID]string) (*
 	for peer, addr := range peerAddrs {
 		t.addrs[peer] = addr
 	}
-	t.wg.Add(1)
-	go t.acceptLoop()
-	return t, nil
+	return t
 }
 
 // Addr returns the transport's actual listen address (useful when
@@ -198,7 +216,7 @@ func (t *Transport) peerSendLoop(peer raft.NodeID, addr string, ch chan raft.Mes
 		select {
 		case msg := <-ch:
 			if conn == nil {
-				c, err := net.DialTimeout("tcp", addr, dialTimeout)
+				c, err := t.dial(peer, addr)
 				if err != nil {
 					continue // drop this message; a later one may succeed once the peer is reachable
 				}
@@ -212,6 +230,22 @@ func (t *Transport) peerSendLoop(peer raft.NodeID, addr string, ch chan raft.Mes
 			return
 		}
 	}
+}
+
+// dial opens a connection to peer at addr — plaintext for a Transport
+// created via New, or a peer-mTLS handshake (dial-side certificate
+// presented, peer chain+identity verified against peer specifically,
+// tls.go's clientTLSConfigFor) for one created via NewTLS. No plaintext
+// fallback ever occurs for a TLS-configured Transport: a failed
+// handshake (untrusted CA, expired certificate, wrong peer identity)
+// returns an error exactly like a failed TCP dial, and the caller drops
+// the message and retries later, never downgrading to plaintext.
+func (t *Transport) dial(peer raft.NodeID, addr string) (net.Conn, error) {
+	if t.tlsSrc == nil {
+		return net.DialTimeout("tcp", addr, dialTimeout)
+	}
+	d := &net.Dialer{Timeout: dialTimeout}
+	return tls.DialWithDialer(d, "tcp", addr, clientTLSConfigFor(t.tlsSrc, peer))
 }
 
 // acceptLoop accepts inbound connections until Close, handling each on
@@ -250,10 +284,50 @@ func (t *Transport) readLoop(conn net.Conn) {
 		delete(t.inbound, conn)
 		t.mu.Unlock()
 	}()
+
+	// verifiedPeer is the cryptographically-verified identity of the
+	// peer that dialed us, established once via the TLS handshake below
+	// (docs/enterprise-v1-plan.md §5 layer 1/2: identity is the
+	// certificate subject). Every message this connection ever delivers
+	// must claim to be From that same identity — a connection cannot be
+	// used to impersonate a different cluster member than the one whose
+	// certificate it actually presented, even though (unlike an
+	// outbound dial) the server side does not know in advance which
+	// peer is calling.
+	var verifiedPeer raft.NodeID
+	if t.tlsSrc != nil {
+		tc, ok := conn.(*tls.Conn)
+		if !ok {
+			return // NewTLS always wraps the listener in tls.NewListener; this would be a construction bug, not adversarial input
+		}
+		if err := tc.Handshake(); err != nil {
+			return // invalid/expired/untrusted/no client certificate: reject before any Raft message is ever read, never fall back to plaintext
+		}
+		// Chain trust (CA-signed, not expired/not-yet-valid, matches
+		// ClientCAs) was already enforced by Handshake itself above
+		// (ClientAuth: RequireAndVerifyClientCert in serverTLSConfig);
+		// what remains is reading off the now-trusted identity.
+		state := tc.ConnectionState()
+		if len(state.PeerCertificates) == 0 {
+			return
+		}
+		verifiedPeer = raft.NodeID(state.PeerCertificates[0].Subject.CommonName)
+	}
+
 	r := bufio.NewReader(conn)
 	for {
 		msg, err := readFrame(r)
 		if err != nil {
+			return
+		}
+		if t.tlsSrc != nil && msg.From != verifiedPeer {
+			// The connection's certificate identity does not match the
+			// NodeID this message claims to be from: a holder of some
+			// valid certificate cannot impersonate a different peer.
+			// Reject the connection outright rather than trust the
+			// unauthenticated From field (docs/failure-model.md §6: no
+			// component trusts a field from the network without
+			// independent verification).
 			return
 		}
 		t.mu.Lock()

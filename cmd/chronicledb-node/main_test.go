@@ -96,6 +96,12 @@ func newRealCluster(t *testing.T, bin string, n int) []*realNode {
 				"-listen=" + raftAddrs[id],
 				"-cluster=" + clusterFlag,
 				"-peers=" + strings.Join(peerParts, ","),
+				// This shared real-process cluster is used by
+				// chaos_test.go's fault-injection tests, which need
+				// /fault reachable — docs/enterprise-v1-plan.md §5
+				// FAULT SURFACE OFF BY DEFAULT means /fault requires
+				// this explicit flag, not that it can never be used.
+				"-enable-fault-endpoint",
 			},
 		}
 	}

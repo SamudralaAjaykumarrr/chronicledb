@@ -49,35 +49,41 @@ on a best-effort basis by the project maintainer(s); there is no SLA.
 
 ## Deployment assumptions (please read before deploying)
 
-ChronicleDB's threat model, as documented in
-[`docs/failure-model.md`](docs/failure-model.md) §6 and
-[`docs/non-goals.md`](docs/non-goals.md) §Authentication and TLS,
-assumes:
+As of `v0.2.0` (Security Foundation, `docs/enterprise-v1-plan.md` §5;
+not yet tagged/released), ChronicleDB *supports* TLS (client and peer
+mTLS), authentication (static bearer token or mTLS identity), RBAC, and
+audit logging — see [`docs/security.md`](docs/security.md) for the full
+operational guide. **None of it is on by default.** Every relevant flag
+defaults to the exact `v0.1.0` behavior described below, so an in-place
+binary upgrade of an existing trusted-network deployment does not
+silently change behavior:
 
-- **A trusted network** between clients and the cluster, and among
-  cluster nodes. There is no authentication, authorization, or
-  transport encryption (TLS) on the Raft transport or the HTTP control
-  plane (`cmd/chronicledb-node`'s `/propose`, `/status`, `/outcome`,
-  `/fault`, `/metrics`, `/health` endpoints). Anyone who can reach
-  these ports can propose mutations, read cluster state, and (via
-  `/fault`) inject network faults.
+- **A trusted network remains the default assumption** between clients
+  and the cluster, and among cluster nodes, until an operator
+  explicitly configures `-tls-cert`/`-peer-tls-cert`/`-auth-mode`. With
+  those left unset, there is still no authentication, authorization, or
+  transport encryption on the Raft transport or the HTTP control plane
+  (`cmd/chronicledb-node`'s `/propose`, `/status`, `/outcome`, `/fault`
+  when explicitly enabled, `/metrics`, `/health` endpoints), and anyone
+  who can reach these ports can propose mutations and read cluster
+  state. A node running this way prints a loud, repeated warning.
 - **No input sanitization boundary for a hostile client.** The
   constrained SQL frontend (`internal/sql`, [`docs/sql.md`](docs/sql.md))
   is fuzz-tested against malformed/adversarial *syntax* (it never
   panics on bad input), but this is a correctness/robustness property,
   not a claim that ChronicleDB is safe to expose directly to an
   untrusted network.
-- **Do not expose ChronicleDB directly to the public internet.** Run
-  it behind your own network boundary (VPN, private network,
-  authenticating proxy) exactly as you would any database without
-  built-in auth/TLS.
+- **Do not expose ChronicleDB directly to the public internet**, even
+  with TLS/auth configured — Byzantine node behavior and CA compromise
+  remain out of scope (`docs/security.md` §2). Run it behind your own
+  network boundary as you would any database.
 
-Resolving the authentication/TLS gap is tracked as a prerequisite for
-any future production-readiness claim — see
-[`docs/roadmap.md`](docs/roadmap.md) §Maturity Model and
-[`docs/non-goals.md`](docs/non-goals.md) §Authentication and TLS. It
-is not resolved today. This document will be updated if and when that
-changes.
+Configuring TLS/auth is a **required migration**, not optional
+hardening — see [`docs/security.md`](docs/security.md) §7. Flipping the
+*default* to secure-by-default (rather than merely secure-by-
+configuration) remains tracked as a prerequisite for any future
+production-readiness claim — see [`docs/roadmap.md`](docs/roadmap.md)
+§Maturity Model and `docs/enterprise-v1-plan.md` §5/§13.2.
 
 ## What we do not claim
 

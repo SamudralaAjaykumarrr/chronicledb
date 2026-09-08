@@ -23,11 +23,28 @@ building infrastructure ahead of a concrete need).
 | `-snapshot-threshold` | No (default: package default, see [`docs/snapshots.md`](snapshots.md)) | Number of durable log entries since the last snapshot before this node creates a new one and compacts its log. |
 | `-version` | No | Print version information (`internal/version`) and exit 0, ignoring every other flag. |
 
-There is no flag to disable durability (fsync), authentication, or
-TLS — the first because durability is this project's core correctness
-property (never configurable off), the second and third because
-neither is implemented yet (see [`SECURITY.md`](../SECURITY.md) and
-[`docs/non-goals.md`](non-goals.md) §Authentication and TLS).
+### Security Foundation flags (`v0.2.0`, `docs/enterprise-v1-plan.md` §5)
+
+See [`docs/security.md`](security.md) for the full operational guide.
+Every flag below defaults to `v0.1.0`'s exact plaintext/unauthenticated
+behavior — none of them are required.
+
+| Flag | Required | Meaning |
+|---|---|---|
+| `-tls-cert` | No | Control-plane HTTP TLS certificate file. Enables client TLS when set (together with `-tls-key`). |
+| `-tls-key` | No | Control-plane HTTP TLS private key file. |
+| `-tls-ca` | No | CA bundle used to verify client certificates presented to the control-plane HTTP server. Optional unless `-auth-mode=mtls`. |
+| `-peer-tls-cert` | No | Peer Raft transport mTLS certificate file. All three `-peer-tls-*` flags must be set together or all left empty — a partial configuration is refused at startup. |
+| `-peer-tls-key` | No | Peer Raft transport mTLS private key file. |
+| `-peer-tls-ca` | No | CA bundle trusted for peer mTLS. |
+| `-auth-mode` | No (default `none`) | Client authentication mode: `none`, `token`, or `mtls`. `none` matches pre-Security-Foundation behavior exactly. |
+| `-auth-token-file` | Required if `-auth-mode=token` | Bearer token file, lines of `<token>:<principal>`. |
+| `-rbac-mapping-file` | Required if `-auth-mode` is not `none` | JSON file mapping principal name to role (`admin`\|`operator`\|`read-only`). |
+| `-audit-log-dir` | No (default `<datadir>/audit`) | Directory for the hash-chained administrative audit log. |
+| `-enable-fault-endpoint` | No (default `false`) | Registers the `/fault` fault-injection endpoint. Off by default — the route does not exist at all unless set; never enable in production. |
+
+There is no flag to disable durability (fsync) — durability is this
+project's core correctness property, never configurable off.
 
 ## Example: a real three-node cluster on one machine
 

@@ -94,6 +94,8 @@ jobs:
           go test ./internal/sql/... -fuzz FuzzDecodeRow -fuzztime 15s
       - name: fuzz smoke (snapshot decode)
         run: go test ./internal/snapshot/... -fuzz FuzzDecode -fuzztime 15s
+      - name: fuzz smoke (audit log frame decode)
+        run: go test ./internal/audit/... -fuzz FuzzDecodeFrame -fuzztime 15s
       - name: benchmark compile + single-iteration smoke
         # Phase 9 (docs/testing-strategy.md §9.3): every benchmark added
         # this phase must keep compiling and its own internal

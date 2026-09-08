@@ -17,6 +17,7 @@ package main
 
 import (
 	"context"
+	"crypto/tls"
 	"encoding/json"
 	"errors"
 	"flag"
@@ -30,7 +31,10 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/SamudralaAjaykumarrr/chronicledb/internal/audit"
+	"github.com/SamudralaAjaykumarrr/chronicledb/internal/authz"
 	"github.com/SamudralaAjaykumarrr/chronicledb/internal/fsm"
+	"github.com/SamudralaAjaykumarrr/chronicledb/internal/identity"
 	"github.com/SamudralaAjaykumarrr/chronicledb/internal/mvcc"
 	"github.com/SamudralaAjaykumarrr/chronicledb/internal/node"
 	"github.com/SamudralaAjaykumarrr/chronicledb/internal/raft"
@@ -47,6 +51,19 @@ func main() {
 		dataDir           = flag.String("datadir", "", "durable log directory")
 		snapshotThreshold = flag.Uint64("snapshot-threshold", 0, "log entries since last snapshot before compacting (0 = package default); tests use a small value to force snapshot/compaction chaos quickly")
 		showVersion       = flag.Bool("version", false, "print version information and exit")
+
+		// Security Foundation flags (docs/enterprise-v1-plan.md §5).
+		tlsCertFile     = flag.String("tls-cert", "", "control-plane HTTP TLS certificate file (enables client TLS when set)")
+		tlsKeyFile      = flag.String("tls-key", "", "control-plane HTTP TLS private key file")
+		tlsCAFile       = flag.String("tls-ca", "", "CA bundle used to verify client certificates presented to the control-plane HTTP server (optional unless -auth-mode=mtls)")
+		peerTLSCertFile = flag.String("peer-tls-cert", "", "peer Raft transport mTLS certificate file (enables peer mTLS when set, together with -peer-tls-key/-peer-tls-ca)")
+		peerTLSKeyFile  = flag.String("peer-tls-key", "", "peer Raft transport mTLS private key file")
+		peerTLSCAFile   = flag.String("peer-tls-ca", "", "CA bundle trusted for peer mTLS")
+		authModeFlag    = flag.String("auth-mode", string(authModeNone), `client authentication mode: "none" (default; matches pre-Security-Foundation behavior), "token", or "mtls"`)
+		authTokenFile   = flag.String("auth-token-file", "", `bearer token file for -auth-mode=token, lines of "<token>:<principal>"`)
+		rbacMappingFile = flag.String("rbac-mapping-file", "", "JSON file mapping principal name to role (admin|operator|read-only); required when -auth-mode is not none")
+		auditLogDir     = flag.String("audit-log-dir", "", "directory for the hash-chained administrative audit log (default: <datadir>/audit)")
+		enableFault     = flag.Bool("enable-fault-endpoint", false, "register the /fault fault-injection endpoint (off by default; also requires admin auth when -auth-mode is not none)")
 	)
 	flag.Parse()
 
@@ -57,6 +74,28 @@ func main() {
 
 	if *id == "" || *listenAddr == "" || *httpAddr == "" || *dataDir == "" || *allFlag == "" {
 		fmt.Fprintln(os.Stderr, "usage: chronicledb-node -id=ID -listen=HOST:PORT -http=HOST:PORT -datadir=DIR -cluster=id1,id2,id3 -peers=id2=host:port,id3=host:port")
+		os.Exit(2)
+	}
+
+	secFlags := securityFlags{
+		tlsCertFile:     *tlsCertFile,
+		tlsKeyFile:      *tlsKeyFile,
+		tlsCAFile:       *tlsCAFile,
+		peerTLSCertFile: *peerTLSCertFile,
+		peerTLSKeyFile:  *peerTLSKeyFile,
+		peerTLSCAFile:   *peerTLSCAFile,
+		authModeFlag:    *authModeFlag,
+		authTokenFile:   *authTokenFile,
+		rbacMappingFile: *rbacMappingFile,
+		auditLogDir:     *auditLogDir,
+		enableFault:     *enableFault,
+	}
+	if secFlags.auditLogDir == "" {
+		secFlags.auditLogDir = audit.Path(*dataDir)
+	}
+	authModeValue, err := validateSecurityFlags(secFlags)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "chronicledb-node: invalid security configuration: %v\n", err)
 		os.Exit(2)
 	}
 
@@ -91,6 +130,9 @@ func main() {
 		TickInterval:               25 * time.Millisecond,
 		SnapshotThreshold:          *snapshotThreshold,
 		Logger:                     logger,
+		PeerTLSCertFile:            secFlags.peerTLSCertFile,
+		PeerTLSKeyFile:             secFlags.peerTLSKeyFile,
+		PeerTLSCAFile:              secFlags.peerTLSCAFile,
 	}
 
 	n, err := node.Open(cfg)
@@ -98,22 +140,74 @@ func main() {
 		logger.Fatalf("opening node: %v", err)
 	}
 
-	srv := newControlServer(n, logger)
-	httpSrv := &http.Server{Addr: *httpAddr, Handler: srv}
-	go func() {
-		if err := httpSrv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-			logger.Fatalf("control-plane HTTP server: %v", err)
+	sec, err := newSecurity(secFlags, authModeValue, logger)
+	if err != nil {
+		n.Stop()
+		logger.Fatalf("initializing security (auth/RBAC/audit): %v", err)
+	}
+	defer sec.Close()
+
+	var clientTLSHolder *identity.Holder
+	insecure := secFlags.tlsCertFile == "" || authModeValue == authModeNone
+	if secFlags.tlsCertFile != "" {
+		clientTLSHolder, err = identity.NewHolder(secFlags.tlsCertFile, secFlags.tlsKeyFile, secFlags.tlsCAFile)
+		if err != nil {
+			n.Stop()
+			logger.Fatalf("loading control-plane TLS material: %v", err)
 		}
-	}()
+	}
+
+	srv := newControlServer(n, logger, sec, clientTLSHolder, secFlags.enableFault)
+	httpSrv := &http.Server{Addr: *httpAddr, Handler: srv}
+
+	if clientTLSHolder != nil {
+		clientAuth := tls.NoClientCert
+		switch {
+		case authModeValue == authModeMTLS:
+			clientAuth = tls.RequireAndVerifyClientCert
+		case secFlags.tlsCAFile != "":
+			clientAuth = tls.VerifyClientCertIfGiven
+		}
+		httpSrv.TLSConfig = buildTLSConfig(clientTLSHolder, clientAuth)
+		go func() {
+			if err := httpSrv.ListenAndServeTLS("", ""); err != nil && err != http.ErrServerClosed {
+				logger.Fatalf("control-plane HTTPS server: %v", err)
+			}
+		}()
+	} else {
+		go func() {
+			if err := httpSrv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+				logger.Fatalf("control-plane HTTP server: %v", err)
+			}
+		}()
+	}
+
+	if insecure {
+		logInsecureWarning(logger)
+		go warnInsecurePeriodically(logger, n.Done())
+	}
 
 	sigCh := make(chan os.Signal, 1)
-	signal.Notify(sigCh, syscall.SIGTERM, syscall.SIGINT)
+	signal.Notify(sigCh, syscall.SIGTERM, syscall.SIGINT, syscall.SIGHUP)
 
-	select {
-	case <-sigCh:
-		logger.Printf("received shutdown signal")
-	case <-n.Done():
-		logger.Printf("node stopped itself: %v", n.Err())
+shutdownLoop:
+	for {
+		select {
+		case sig := <-sigCh:
+			if sig == syscall.SIGHUP {
+				// docs/enterprise-v1-plan.md §5 layer 7: certificate
+				// rotation triggered by SIGHUP, without a restart.
+				if err := reloadTLS(n, clientTLSHolder, logger); err != nil {
+					logger.Printf("SIGHUP: TLS reload failed: %v", err)
+				}
+				continue
+			}
+			logger.Printf("received shutdown signal")
+			break shutdownLoop
+		case <-n.Done():
+			logger.Printf("node stopped itself: %v", n.Err())
+			break shutdownLoop
+		}
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
@@ -122,23 +216,60 @@ func main() {
 	n.Stop()
 }
 
+// logInsecureWarning prints the loud, repeated warning
+// docs/enterprise-v1-plan.md §5's Compatibility implications require:
+// "startup prints a loud, repeated warning when running without
+// TLS/auth."
+func logInsecureWarning(logger *log.Logger) {
+	logger.Printf("!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!")
+	logger.Printf("!! WARNING: this node is running WITHOUT TLS and/or WITHOUT authentication.   !!")
+	logger.Printf("!! Anyone who can reach its ports can read/write cluster state. This is a     !!")
+	logger.Printf("!! required migration, not a supported permanent configuration — see          !!")
+	logger.Printf("!! docs/security.md. Set -tls-cert/-tls-key and -auth-mode=token|mtls.         !!")
+	logger.Printf("!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!")
+}
+
+func warnInsecurePeriodically(logger *log.Logger, done <-chan struct{}) {
+	ticker := time.NewTicker(30 * time.Second)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ticker.C:
+			logInsecureWarning(logger)
+		case <-done:
+			return
+		}
+	}
+}
+
 // controlServer is the minimal local HTTP control plane an integration
 // test uses to drive a real chronicledb-node process (see this file's
 // package doc comment).
 type controlServer struct {
-	n      *node.Node
-	logger *log.Logger
-	mux    *http.ServeMux
+	n               *node.Node
+	logger          *log.Logger
+	mux             *http.ServeMux
+	sec             *security
+	clientTLSHolder *identity.Holder
 }
 
-func newControlServer(n *node.Node, logger *log.Logger) *controlServer {
-	s := &controlServer{n: n, logger: logger, mux: http.NewServeMux()}
-	s.mux.HandleFunc("/status", s.handleStatus)
-	s.mux.HandleFunc("/propose", s.handlePropose)
-	s.mux.HandleFunc("/outcome", s.handleOutcome)
-	s.mux.HandleFunc("/fault", s.handleFault)
-	s.mux.HandleFunc("/metrics", s.handleMetrics)
-	s.mux.HandleFunc("/health", s.handleHealth)
+// newControlServer wires every route through the Security Foundation
+// middleware chain (security.wrap — a no-op when sec is nil/auth-mode
+// none) and registers /fault only when enableFault is true
+// (docs/enterprise-v1-plan.md §5 layer 8, FAULT SURFACE OFF BY DEFAULT:
+// "the flag's absence must make the handler structurally unreachable
+// (registered conditionally, not just checked-and-rejected)").
+func newControlServer(n *node.Node, logger *log.Logger, sec *security, clientTLSHolder *identity.Holder, enableFault bool) *controlServer {
+	s := &controlServer{n: n, logger: logger, mux: http.NewServeMux(), sec: sec, clientTLSHolder: clientTLSHolder}
+	s.mux.HandleFunc("/status", sec.wrap(authz.EndpointStatus, s.handleStatus))
+	s.mux.HandleFunc("/propose", sec.wrap(authz.EndpointPropose, s.handlePropose))
+	s.mux.HandleFunc("/outcome", sec.wrap(authz.EndpointOutcome, s.handleOutcome))
+	s.mux.HandleFunc("/metrics", sec.wrap(authz.EndpointMetrics, s.handleMetrics))
+	s.mux.HandleFunc("/health", sec.wrap(authz.EndpointHealth, s.handleHealth))
+	s.mux.HandleFunc("/admin/reload-tls", sec.wrap(authz.EndpointReloadTLS, s.handleReloadTLS))
+	if enableFault {
+		s.mux.HandleFunc("/fault", sec.wrap(authz.EndpointFault, s.handleFault))
+	}
 	return s
 }
 
@@ -177,6 +308,28 @@ func (s *controlServer) handleMetrics(w http.ResponseWriter, r *http.Request) {
 	line("chronicledb_requestid_duplicates_total", "Propose calls resolved as a known-RequestID retry without a fresh Raft round", "counter", float64(m.RequestIDDuplicatesTotal))
 	line("chronicledb_snapshots_created_total", "local snapshots this node has created", "counter", float64(m.SnapshotsCreatedTotal))
 	line("chronicledb_snapshots_installed_total", "peer snapshots this node has installed", "counter", float64(m.SnapshotsInstalledTotal))
+
+	// Security Foundation metrics (docs/enterprise-v1-plan.md §5
+	// Observability: "auth success/failure counts (no credential value
+	// in any label)... certificate-expiry-remaining gauge per
+	// configured certificate, audit-write-failure counter").
+	if s.sec != nil {
+		line("chronicledb_auth_success_total", "authentication checks that succeeded", "counter", float64(s.sec.authSuccessTotal.Load()))
+		line("chronicledb_auth_failure_total", "authentication checks that failed", "counter", float64(s.sec.authFailureTotal.Load()))
+		line("chronicledb_audit_write_failures_total", "audit log append calls that failed", "counter", float64(s.sec.auditWriteFailuresTotal.Load()))
+	}
+	if m, ok := s.n.PeerTLSMaterial(); ok {
+		remaining := time.Until(m.Leaf.NotAfter).Seconds()
+		fmt.Fprintf(w, "# HELP %s %s\n# TYPE %s %s\n%s{cert=\"peer\"} %v\n",
+			"chronicledb_cert_expiry_seconds", "seconds until this certificate's NotAfter (negative if already expired)",
+			"chronicledb_cert_expiry_seconds", "gauge", "chronicledb_cert_expiry_seconds", remaining)
+	}
+	if s.clientTLSHolder != nil {
+		remaining := time.Until(s.clientTLSHolder.Current().Leaf.NotAfter).Seconds()
+		fmt.Fprintf(w, "# HELP %s %s\n# TYPE %s %s\n%s{cert=\"client\"} %v\n",
+			"chronicledb_cert_expiry_seconds", "seconds until this certificate's NotAfter (negative if already expired)",
+			"chronicledb_cert_expiry_seconds", "gauge", "chronicledb_cert_expiry_seconds", remaining)
+	}
 }
 
 // healthResponse is an honest, minimal health signal (docs/roadmap.md

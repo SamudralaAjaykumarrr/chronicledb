@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/SamudralaAjaykumarrr/chronicledb/internal/fsm"
+	"github.com/SamudralaAjaykumarrr/chronicledb/internal/identity"
 	"github.com/SamudralaAjaykumarrr/chronicledb/internal/mvcc"
 	"github.com/SamudralaAjaykumarrr/chronicledb/internal/raft"
 	"github.com/SamudralaAjaykumarrr/chronicledb/internal/snapshot"
@@ -70,6 +71,22 @@ type Config struct {
 	// dependency (docs/roadmap.md §Observability: "a correct decision
 	// must never depend on whether a metric/log was recorded").
 	Logger *log.Logger
+
+	// PeerTLSCertFile/PeerTLSKeyFile/PeerTLSCAFile configure peer mTLS
+	// (docs/enterprise-v1-plan.md §5 layer 2). All three empty (the
+	// default) means plaintext peer replication, identical to
+	// pre-Security-Foundation behavior. If any is set, all three are
+	// required (validate below) — there is no partial/optional-mTLS
+	// configuration for peer traffic: it is fully on or fully off, never
+	// silently degraded (NO PLAINTEXT PEER REPLICATION).
+	PeerTLSCertFile string
+	PeerTLSKeyFile  string
+	PeerTLSCAFile   string
+}
+
+// PeerTLSEnabled reports whether Config requests peer mTLS.
+func (c Config) PeerTLSEnabled() bool {
+	return c.PeerTLSCertFile != "" || c.PeerTLSKeyFile != "" || c.PeerTLSCAFile != ""
 }
 
 const (
@@ -113,6 +130,12 @@ func (c Config) validate() error {
 	}
 	if !found {
 		return fmt.Errorf("node: Config.Peers must include Config.ID (%q)", c.ID)
+	}
+	if c.PeerTLSEnabled() {
+		if c.PeerTLSCertFile == "" || c.PeerTLSKeyFile == "" || c.PeerTLSCAFile == "" {
+			return fmt.Errorf("node: peer mTLS requires PeerTLSCertFile, PeerTLSKeyFile, and PeerTLSCAFile all set (got cert=%q key=%q ca=%q) — partial peer-TLS configuration is not supported (NO PLAINTEXT PEER REPLICATION)",
+				c.PeerTLSCertFile, c.PeerTLSKeyFile, c.PeerTLSCAFile)
+		}
 	}
 	return nil
 }
@@ -208,7 +231,11 @@ type Node struct {
 	// handleInstallSnapshot against a concurrent FSM() read).
 	fsmachine atomic.Pointer[fsm.FSM]
 	tr        *transport.Transport
-	logger    *log.Logger
+	// identityHolder is non-nil only when peer mTLS is configured
+	// (Config.PeerTLSEnabled). ReloadPeerTLS reloads it in place
+	// (docs/enterprise-v1-plan.md §5 layer 7, certificate rotation).
+	identityHolder *identity.Holder
+	logger         *log.Logger
 
 	electionArmed      bool
 	electionTicksLeft  int
@@ -400,27 +427,48 @@ func Open(cfg Config) (*Node, error) {
 		return nil, fmt.Errorf("node: constructing raft core: %w", err)
 	}
 
-	tr, err := transport.New(cfg.ID, cfg.ListenAddr, cfg.PeerAddrs)
+	var (
+		tr             *transport.Transport
+		identityHolder *identity.Holder
+	)
+	if cfg.PeerTLSEnabled() {
+		identityHolder, err = identity.NewHolder(cfg.PeerTLSCertFile, cfg.PeerTLSKeyFile, cfg.PeerTLSCAFile)
+		if err != nil {
+			w.Close()
+			return nil, fmt.Errorf("node: loading peer TLS identity: %w", err)
+		}
+		// docs/enterprise-v1-plan.md §5 layer 1: "internal/node binds
+		// NodeID to the certificate at startup and refuses to start on a
+		// mismatch."
+		if err := identity.BindNodeIdentity(string(cfg.ID), identityHolder.Current().Leaf); err != nil {
+			w.Close()
+			return nil, fmt.Errorf("node: %w", err)
+		}
+		tr, err = transport.NewTLS(cfg.ID, cfg.ListenAddr, cfg.PeerAddrs, identityHolder)
+	} else {
+		tr, err = transport.New(cfg.ID, cfg.ListenAddr, cfg.PeerAddrs)
+	}
 	if err != nil {
 		w.Close()
 		return nil, err
 	}
 
 	n := &Node{
-		cfg:          cfg,
-		core:         core,
-		walog:        w,
-		storage:      st,
-		snapMgr:      snapMgr,
-		tr:           tr,
-		logger:       cfg.Logger,
-		appliedIndex: baseIndex,
-		waiters:      make(map[raft.Index]waiter),
-		ackSeq:       make(map[raft.NodeID]uint64, len(cfg.Peers)),
-		proposeCh:    make(chan proposeReq),
-		readIndexCh:  make(chan readIndexReq),
-		stopCh:       make(chan struct{}),
-		doneCh:       make(chan struct{}),
+		cfg:            cfg,
+		core:           core,
+		walog:          w,
+		storage:        st,
+		snapMgr:        snapMgr,
+		tr:             tr,
+		identityHolder: identityHolder,
+		logger:         cfg.Logger,
+		appliedIndex:   baseIndex,
+		waiters:        make(map[raft.Index]waiter),
+		ackSeq:         make(map[raft.NodeID]uint64, len(cfg.Peers)),
+		proposeCh:      make(chan proposeReq),
+		readIndexCh:    make(chan readIndexReq),
+		stopCh:         make(chan struct{}),
+		doneCh:         make(chan struct{}),
 	}
 	n.fsmachine.Store(fsmachine)
 	n.electionArmed = true
@@ -441,6 +489,39 @@ func (n *Node) logf(format string, args ...interface{}) {
 // control in tests (Transport.Block/Unblock) beyond what Node's own API
 // exposes — mirroring internal/fault.Cluster's own accessor pattern.
 func (n *Node) Transport() *transport.Transport { return n.tr }
+
+// PeerTLSMaterial returns the node's currently loaded peer-TLS
+// certificate material and true, or the zero value and false if peer
+// mTLS is not configured. Read-only diagnostic use only (e.g. the
+// certificate-expiry-remaining gauge, docs/enterprise-v1-plan.md §5
+// Observability) — never a correctness dependency.
+func (n *Node) PeerTLSMaterial() (identity.Material, bool) {
+	if n.identityHolder == nil {
+		return identity.Material{}, false
+	}
+	return n.identityHolder.Current(), true
+}
+
+// ErrPeerTLSNotConfigured is returned by ReloadPeerTLS when this node
+// was not opened with peer mTLS configured — there is no certificate
+// material to reload.
+var ErrPeerTLSNotConfigured = errors.New("node: peer TLS is not configured on this node")
+
+// ReloadPeerTLS re-reads this node's peer TLS certificate/key/CA
+// material from the same file paths Config was opened with and
+// atomically swaps it in for every future handshake
+// (docs/enterprise-v1-plan.md §5 layer 7: certificate rotation via
+// SIGHUP or /admin/reload-tls, with "an overlap window during which
+// both old and new peer certificates validate" satisfied by
+// internal/identity.Holder's hot-swap semantics — see its doc comment).
+// A live connection using the previously loaded certificate is never
+// forcibly dropped by this call.
+func (n *Node) ReloadPeerTLS() error {
+	if n.identityHolder == nil {
+		return ErrPeerTLSNotConfigured
+	}
+	return n.identityHolder.Reload()
+}
 
 // FSM returns the node's deterministic state machine, for read-only
 // access (docs/mvcc.md §3 visibility reads bypass Apply) by a caller

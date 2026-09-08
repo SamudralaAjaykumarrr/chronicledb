@@ -27,3 +27,4 @@ skeleton.
 | [0012](0012-recovery-and-corruption-policy.md) | Recovery and corruption policy |
 | [0013](0013-sql-boundary-and-deferred-functionality.md) | SQL boundary and deferred functionality |
 | [0014](0014-election-no-op-for-readindex-liveness.md) | Election no-op entry for `ReadIndex` liveness |
+| [0015](0015-security-foundation.md) | Security Foundation architecture |

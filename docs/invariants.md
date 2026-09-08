@@ -468,3 +468,139 @@ independently constructed state machines fed the identical input
 sequence (`docs/testing-strategy.md` §Deterministic Simulation);
 static-analysis/lint rule forbidding forbidden imports inside those
 packages, once code exists.
+
+---
+
+## Security Foundation invariants (`v0.2.0`, `docs/enterprise-v1-plan.md` §5)
+
+See [`docs/security.md`](security.md) for the full operational guide.
+These invariants apply whenever TLS/authentication is configured — see
+each invariant's Scope for how it applies when it is not (`v0.2.0` is
+secure-by-configuration, not yet secure-by-default).
+
+### NO UNAUTHENTICATED ADMIN ACTION
+
+**Statement**: Every state-changing administrative HTTP endpoint
+requires a successful authentication check before any side effect, with
+no code path that performs the side effect first and authenticates
+after.
+
+**Scope**: `cmd/chronicledb-node`'s control-plane HTTP endpoints,
+whenever `-auth-mode` is not `none`. (When `-auth-mode` is `none`, no
+endpoint is authenticated at all — the pre-`v0.2.0` trusted-network
+posture, unchanged and loudly warned about; see
+[`docs/security.md`](security.md) §1.)
+
+**Why it matters**: Every later Enterprise V1 phase adds a new
+administrative surface (backup/restore, membership changes, upgrade
+orchestration); this is the foundation those phases depend on rather
+than each separately bolting on authentication.
+
+**Mechanism**: The middleware chain `TLS termination -> authn -> authz
+-> audit -> handler` (`cmd/chronicledb-node/auth.go`'s `security.wrap`)
+wraps every route; the underlying handler is invoked only after authn
+and authz both succeed.
+
+**Threatened by**: A new endpoint registered directly on the mux
+without going through `security.wrap`.
+
+**Proof/test obligations**: RBAC decision-table test covering every
+role x every endpoint through the actual HTTP middleware chain, and an
+unauthenticated-request-denied test for every endpoint
+(`cmd/chronicledb-node/auth_test.go`).
+
+### NO PLAINTEXT PEER REPLICATION
+
+**Statement**: Once peer TLS is configured for a node, `internal/transport`
+never sends or accepts an unencrypted Raft message on that node; there
+is no runtime toggle to disable it without a restart with different
+flags.
+
+**Scope**: `internal/transport`'s peer connections, whenever
+`-peer-tls-cert`/`-peer-tls-key`/`-peer-tls-ca` are configured. A
+Transport is either constructed via `New` (plaintext, matching
+pre-`v0.2.0` behavior) or `NewTLS` (mTLS) — never both, and never
+partially (`internal/node.Config.validate` refuses a partial peer-TLS
+configuration at startup).
+
+**Why it matters**: A silent plaintext fallback would defeat the entire
+purpose of configuring peer mTLS, exactly at the moment a node believes
+itself protected.
+
+**Mechanism**: `NewTLS` wraps the listener in `tls.NewListener` with
+`RequireAndVerifyClientCert`; outbound dials use `tls.DialWithDialer`
+with an explicit chain-and-identity `VerifyPeerCertificate` callback.
+Every message on an inbound connection is additionally checked against
+that connection's own TLS-verified identity.
+
+**Threatened by**: A future change that reads `Message.From` before
+identity verification completes, or that falls back to a plaintext
+`net.Dial` on a TLS handshake failure.
+
+**Proof/test obligations**: `internal/transport/tls_test.go` — valid
+mTLS round-trip; expired/wrong-CA/self-signed/no-certificate/plaintext-
+to-TLS-listener rejection; wrong-identity message spoofing rejection;
+certificate rotation with zero dropped connections. A real three-node
+cluster with peer mTLS enabled (`internal/node/tls_test.go`) proving
+replication and failover are unaffected.
+
+### FAULT SURFACE OFF BY DEFAULT
+
+**Statement**: `/fault` is unreachable unless both the
+`-enable-fault-endpoint` build/run flag and `admin` authentication (when
+auth is configured) are satisfied; proven by a test asserting the route
+is unregistered, not merely that calling it returns an error status.
+
+**Scope**: `cmd/chronicledb-node`'s HTTP mux.
+
+**Why it matters**: `/fault` injects real network faults against a live
+process — reachable-by-default in `v0.1.0`, this is the exact kind of
+surface that must not ship open in a security-conscious default.
+
+**Mechanism**: `newControlServer` registers `/fault`'s route
+conditionally on `enableFault`, never checked-and-rejected after
+unconditional registration.
+
+**Threatened by**: Registering `/fault` unconditionally and relying on
+RBAC alone to gate it.
+
+**Proof/test obligations**: `TestFaultEndpoint_UnregisteredByDefault`
+and `TestFaultEndpoint_RegisteredFlagCombinations`
+(`cmd/chronicledb-node/auth_test.go`) assert `http.ServeMux.Handler`
+returns an empty pattern when the flag is unset, across every
+flag/auth-mode combination; a real-process integration test
+(`cmd/chronicledb-node/security_integration_test.go`) confirms `404`,
+not `403`, against a real binary invocation with an admin credential
+but no `-enable-fault-endpoint` flag.
+
+### AUDIT COMPLETENESS
+
+**Statement**: Every action gated by RBAC produces exactly one audit
+record (never zero, never more than one for a single logical action),
+and audit-write failure blocks the action rather than silently
+succeeding without a record.
+
+**Scope**: `cmd/chronicledb-node`'s control-plane HTTP endpoints,
+whenever `-auth-mode` is not `none`.
+
+**Why it matters**: An audit trail with silent gaps, or one that can be
+bypassed by a slow/failing disk, is not a tamper-evident record of
+administrative activity — it is decoration.
+
+**Mechanism**: `security.wrap` writes exactly one `audit.Entry` per
+request, synchronously, before ever invoking the handler; a non-nil
+`Append` error short-circuits with `500` and the handler never runs.
+`internal/audit.Log`'s on-disk format is hash-chained (each record's
+`recordHash` covers its header/payload/checksum; the next record embeds
+it as `prevHash`) so tampering after the fact is independently
+detectable even without trusting the writer.
+
+**Threatened by**: Moving the audit write after the handler call (an
+audit-log outage would then silently permit unrecorded actions);
+logging only failures, not successes.
+
+**Proof/test obligations**: `internal/audit`'s exhaustive single-byte-
+tamper-detection test, forged-but-internally-consistent-record
+detection, and `FuzzDecodeFrame`; `cmd/chronicledb-node/auth_test.go`'s
+`TestAudit_ExactlyOneRecordPerDecision` and
+`TestAudit_WriteFailureBlocksAction`.

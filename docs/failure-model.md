@@ -270,16 +270,36 @@ Full worked scenario in [`docs/replication.md`](replication.md) §5.
 
 ## 6. Security and Safety Expectations
 
-Authentication and TLS are **explicitly deferred** in V1 — ChronicleDB
-V1 assumes a trusted network between nodes and between client and
-cluster (e.g. a private network or an operator-managed tunnel). This
-is a scope decision, not an oversight; it is tracked for a future
-phase in [`docs/roadmap.md`](roadmap.md) and must be resolved before
-any claim of production-readiness or external exposure.
+Through `v0.1.0`, authentication and TLS were **explicitly deferred** —
+ChronicleDB assumed a trusted network between nodes and between client
+and cluster (e.g. a private network or an operator-managed tunnel).
+That was a scope decision, not an oversight.
 
-Regardless of the auth deferral, the following are required from V1
-onward, because they are correctness/robustness properties independent
-of authentication:
+As of `v0.2.0` (Security Foundation, `docs/enterprise-v1-plan.md` §5;
+not yet tagged/released), TLS (client and peer mTLS), authentication,
+RBAC, and audit logging are **implemented and available** — see
+[`docs/security.md`](security.md) for the full guide — but **not on by
+default**: every relevant flag defaults to `v0.1.0`'s exact plaintext/
+unauthenticated behavior, so the trusted-network assumption above
+remains the operative one for any deployment that has not explicitly
+configured TLS/auth, and a node running that way prints a loud,
+repeated warning. Once TLS/auth are configured, the threat model
+expands from "an untrusted network with only a benign/faulty actor" to
+a genuinely **adversarial network**: an attacker who can observe or
+inject packets but does not possess a valid certificate or credential
+is now a defended-against threat. Byzantine node behavior (an
+authorized-but-malicious node) remains explicitly out of scope,
+unchanged — TLS/auth protect against unauthorized access, not against
+a node that has valid credentials but misbehaves; Raft itself provides
+no Byzantine fault tolerance either (§5 above). Resolving the
+authentication/TLS gap at the *default* level (rather than merely as a
+supported configuration) remains tracked for a future phase before any
+claim of production-readiness or external exposure — see
+`docs/enterprise-v1-plan.md` §13.2.
+
+Regardless of the auth deferral-by-default, the following are required
+from V1 onward, because they are correctness/robustness properties
+independent of authentication:
 
 - **Malformed input validation**: no component trusts a length,
   count, or type field from disk or network without bounding it
@@ -317,6 +337,25 @@ of authentication:
   (network I/O, disk I/O) respect cancellation/timeouts where the Go
   standard library idioms for this apply, once such code exists.
 
-These expectations govern implementation quality from Phase 1 onward;
-none of them are implemented yet in this Architecture Foundation
-phase, since no code exists.
+Added by Security Foundation (`v0.2.0`, `docs/enterprise-v1-plan.md`
+§5; see [`docs/security.md`](security.md) for the full guide):
+
+- **No plaintext fallback**: once peer TLS is configured for a node, an
+  invalid/expired/untrusted/self-signed/missing peer certificate causes
+  the connection to be rejected at the TLS handshake — never a silent
+  downgrade to plaintext, and never a "trust anyway" path.
+- **Generic authentication/authorization failure messages**: a `401`/
+  `403` response never distinguishes "wrong token" from "unknown
+  principal" from "insufficient role" — every failure in a given class
+  returns byte-identical body text.
+- **Audit-write failure fails closed**: if the audit log cannot be
+  written (disk full, permission error), the triggering administrative
+  action is itself rejected — a "best-effort" audit record is treated
+  as equivalent to no record, and never allowed to silently pass the
+  action through unrecorded.
+- **Fault-injection surface off by default**: `/fault` is not merely
+  access-controlled but structurally unregistered unless an explicit
+  build/run flag (`-enable-fault-endpoint`) is set, so a default binary
+  invocation has no code path that can reach it at all.
+
+These expectations govern implementation quality from Phase 1 onward.
