@@ -17,7 +17,7 @@ is the designated resolution point for that gap, planned as the first
 phase of the Enterprise V1 roadmap because every later phase adds a new
 administrative surface that would otherwise ship unauthenticated. This
 ADR records the architecture actually implemented for that phase,
-targeted at release `v0.2.0` (not yet tagged).
+targeted at, and released as, `v0.2.0`.
 
 ## Decision
 

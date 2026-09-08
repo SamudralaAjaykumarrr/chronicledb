@@ -1,7 +1,7 @@
 # Security
 
 Status: `v0.2.0` (Security Foundation, `docs/enterprise-v1-plan.md` §5;
-not yet tagged/released — see `docs/roadmap.md`). This document is the
+tagged and released — see `docs/roadmap.md`). This document is the
 authoritative operational guide for TLS, authentication, RBAC, and
 audit logging as actually implemented, and supersedes the "no auth/TLS"
 posture described in `SECURITY.md`'s "Deployment assumptions" and
