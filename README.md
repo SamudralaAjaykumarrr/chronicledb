@@ -345,10 +345,14 @@ untested.
 
 ## Known limitations
 
-- **No authentication or TLS** on the Raft transport or the HTTP
-  control plane — see [`SECURITY.md`](SECURITY.md) and
-  [`docs/non-goals.md`](docs/non-goals.md) §Authentication and TLS. Do
-  not deploy ChronicleDB outside a trusted network.
+- **Authentication/TLS are supported but not on by default** (as of
+  `v0.2.0`, not yet tagged/released) — peer mTLS, client TLS, static-
+  token/mTLS authentication, RBAC, and audit logging all exist
+  (`docs/security.md`) but every relevant flag defaults to `v0.1.0`'s
+  plaintext/unauthenticated behavior. See [`SECURITY.md`](SECURITY.md)
+  and [`docs/non-goals.md`](docs/non-goals.md) §Authentication and TLS.
+  Do not deploy ChronicleDB outside a trusted network without
+  explicitly configuring these.
 - **Snapshot Isolation, not Serializable** — see
   [`docs/mvcc.md`](docs/mvcc.md) §1.1.
 - **No joins, subqueries, secondary indexes, or PostgreSQL wire
