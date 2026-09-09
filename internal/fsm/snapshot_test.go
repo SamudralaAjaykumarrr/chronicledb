@@ -160,7 +160,7 @@ func TestDecodeStateRejectsTrailingGarbage(t *testing.T) {
 }
 
 // TestEncodeStateDecodeStateRoundTrip_ClusterGeneration proves the
-// generation-aware trailing field docs/enterprise-v1-plan.md §7
+// generation-aware trailing block docs/enterprise-v1-plan.md §7
 // requires ("generation-aware encode/decode fuzz tests for each of the
 // five formats, including 'old generation still decodes under the new
 // binary' as an explicit assertion"):
@@ -171,7 +171,12 @@ func TestDecodeStateRejectsTrailingGarbage(t *testing.T) {
 //     the actual rollback-safety property, not merely "decodes
 //     somehow";
 //   - a state that has had a SetClusterVersionCommand applied encodes a
-//     4-byte-longer form that still round-trips through DecodeState.
+//     longer form (clusterGeneration + the control-command idempotency
+//     table, see encodeState's doc comment) that still round-trips
+//     through DecodeState, including the idempotency table itself
+//     (TestApplySetClusterVersion_SurvivesEncodeDecodeRoundTrip below
+//     is the direct proof that this actually fixes retried-finalize
+//     idempotency across a restart/snapshot boundary).
 func TestEncodeStateDecodeStateRoundTrip_ClusterGeneration(t *testing.T) {
 	base := buildRichFSM(t)
 	baseBytes := base.EncodeState()
@@ -186,8 +191,11 @@ func TestEncodeStateDecodeStateRoundTrip_ClusterGeneration(t *testing.T) {
 		t.Fatalf("ApplySetClusterVersion: %v", err)
 	}
 	finalizedBytes := finalized.EncodeState()
-	if len(finalizedBytes) != len(baseBytes)+4 {
-		t.Fatalf("finalized EncodeState length = %d, want exactly %d (base + 4-byte generation field)", len(finalizedBytes), len(baseBytes)+4)
+	// clusterGeneration(4) + numControlOutcomes(4) + one entry
+	// (requestIDLen(4) + "finalize"(8) + status(1) + CommitSeq(8)).
+	wantExtra := 4 + 4 + (4 + len("finalize") + 1 + 8)
+	if len(finalizedBytes) != len(baseBytes)+wantExtra {
+		t.Fatalf("finalized EncodeState length = %d, want exactly %d (base + %d-byte cluster-generation/control-outcomes block)", len(finalizedBytes), len(baseBytes)+wantExtra, wantExtra)
 	}
 
 	restored, maxSeq, err := DecodeState(finalizedBytes)
@@ -197,14 +205,27 @@ func TestEncodeStateDecodeStateRoundTrip_ClusterGeneration(t *testing.T) {
 	if got := restored.ClusterGeneration(); got != 1 {
 		t.Fatalf("restored ClusterGeneration = %d, want 1", got)
 	}
-	// The SetClusterVersionCommand's own CommitSeq (4) is not a CommitTxn
-	// CommitSeq and must not be folded into maxSeq — only buildRichFSM's
-	// own highest CommitSeq (2) should be reflected, proving
-	// control-command application never contaminates the
-	// snapshot-boundary consistency check DecodeState's caller relies on
-	// (docs/snapshots.md §5 point 3).
-	if maxSeq != 2 {
-		t.Fatalf("maxSeq = %d, want 2 (buildRichFSM's own highest CommitSeq; control commands must not affect this)", maxSeq)
+	// The SetClusterVersionCommand's own CommitSeq (4) IS a real,
+	// committed Raft log index — like any other committed index, a
+	// snapshot claiming a boundary below it while still reflecting its
+	// effect (the advanced clusterGeneration) would be exactly the kind
+	// of inconsistency the snapshot-boundary consistency check
+	// (docs/snapshots.md §5 point 3) exists to catch, so it must be
+	// folded into maxSeq exactly like a CommitTxn CommitSeq is.
+	if maxSeq != 4 {
+		t.Fatalf("maxSeq = %d, want 4 (the SetClusterVersionCommand's own committed index, correctly bounding the snapshot boundary)", maxSeq)
+	}
+
+	// The idempotency table itself must survive the round trip: a
+	// second, identical retry under the same RequestID must return the
+	// ORIGINAL recorded outcome, not be re-evaluated against the
+	// already-advanced clusterGeneration (where it would wrongly abort).
+	retryOutcome, err := restored.ApplySetClusterVersion(99, SetClusterVersionCommand{RequestID: "finalize", TargetGeneration: 1})
+	if err != nil {
+		t.Fatalf("ApplySetClusterVersion (post-restore retry): %v", err)
+	}
+	if retryOutcome.Status != StatusCommitted || retryOutcome.CommitSeq != 4 {
+		t.Fatalf("post-restore retry outcome = %+v, want the original Committed outcome (CommitSeq=4), proving idempotency survives a restore", retryOutcome)
 	}
 }
 
@@ -219,4 +240,22 @@ func TestDecodeState_RejectsGenerationFieldWrongLength(t *testing.T) {
 			t.Fatalf("DecodeState with %d trailing bytes: expected an error, got nil", len(extra))
 		}
 	}
+}
+
+// FuzzDecodeState is DecodeState's bounded-decoding proof
+// (docs/failure-model.md §6): the cluster-generation/control-outcomes
+// trailing block added by this phase is new, non-trivial decode logic
+// and must never panic on malformed or adversarial input, exactly like
+// every other decoder in this codebase.
+func FuzzDecodeState(f *testing.F) {
+	f.Add([]byte{})
+	f.Add(New(mvcc.NewStore()).EncodeState())
+	finalized := New(mvcc.NewStore())
+	if _, err := finalized.ApplySetClusterVersion(1, SetClusterVersionCommand{RequestID: "seed", TargetGeneration: 1}); err != nil {
+		f.Fatalf("seeding: %v", err)
+	}
+	f.Add(finalized.EncodeState())
+	f.Fuzz(func(t *testing.T, b []byte) {
+		_, _, _ = DecodeState(b)
+	})
 }

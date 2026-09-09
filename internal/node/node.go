@@ -1110,53 +1110,62 @@ func (n *Node) step(in raft.Input) {
 // mutation (docs replication.md §1.2 step 1: "the leader accepted the
 // client's request, validated it is current leader").
 func (n *Node) handlePropose(req proposeReq) {
+	n.proposeAndAwait(req.payload, req.cmd.RequestID, req.resultCh,
+		func() { n.metrics.ProposalsRejectedTotal.Inc() },
+		func() { n.metrics.ProposalsTotal.Inc() })
+}
+
+// handleControlPropose is the leader-gated entry point for a control
+// command (currently only FinalizeUpgrade's SetClusterVersionCommand),
+// sharing proposeAndAwait's plumbing with handlePropose except for the
+// missing CommitTxn-only Precheck fast-path (see controlProposeReq's
+// doc comment) and CommitTxn-specific metrics (control commands are
+// rare admin actions with their own metrics, counted in FinalizeUpgrade
+// itself).
+func (n *Node) handleControlPropose(req controlProposeReq) {
+	n.proposeAndAwait(req.payload, req.requestID, req.resultCh, nil, nil)
+}
+
+// proposeAndAwait is the leader-gated proposal path shared by
+// handlePropose and handleControlPropose (previously two
+// near-identical copies of this logic): check leadership, hand payload
+// to raft.Core, validate the resulting persist-request shape, register
+// a waiter for the resulting index, and drive processOutput. onRejected/
+// onAccepted, when non-nil, let a caller count its own command-kind-
+// specific metrics at exactly the points where this shared logic
+// decides "not leader" vs. "accepted" — the metrics themselves stay
+// specific to each caller, not baked into shared plumbing that has no
+// business knowing about them.
+func (n *Node) proposeAndAwait(payload []byte, requestID fsm.RequestID, resultCh chan proposeResult, onRejected, onAccepted func()) {
 	if n.core.Role() != raft.Leader {
-		n.metrics.ProposalsRejectedTotal.Inc()
-		req.resultCh <- proposeResult{err: &NotLeaderError{Leader: n.core.LeaderID()}}
+		if onRejected != nil {
+			onRejected()
+		}
+		resultCh <- proposeResult{err: &NotLeaderError{Leader: n.core.LeaderID()}}
 		return
 	}
-	out := n.core.Step(raft.Input{Kind: raft.InputPropose, ProposeData: req.payload})
+	out := n.core.Step(raft.Input{Kind: raft.InputPropose, ProposeData: payload})
 	if out.ProposalRejected {
-		n.metrics.ProposalsRejectedTotal.Inc()
-		req.resultCh <- proposeResult{err: &NotLeaderError{Leader: out.LeaderHint}}
+		if onRejected != nil {
+			onRejected()
+		}
+		resultCh <- proposeResult{err: &NotLeaderError{Leader: out.LeaderHint}}
 		return
 	}
-	n.metrics.ProposalsTotal.Inc()
+	if onAccepted != nil {
+		onAccepted()
+	}
 	if out.PersistRequest == nil || len(out.PersistRequest.Entries) != 1 {
 		// Defensive: a leader-accepted InputPropose always produces
 		// exactly this shape (raft.Core.handlePropose). Treat any other
 		// shape as an unrecoverable local inconsistency rather than
 		// silently dropping the caller's request.
 		n.fail(fmt.Errorf("node: unexpected propose output shape: %+v", out))
-		req.resultCh <- proposeResult{err: ErrNodeStopped}
+		resultCh <- proposeResult{err: ErrNodeStopped}
 		return
 	}
 	idx := out.PersistRequest.Entries[0].Index
-	n.waiters[idx] = waiter{requestID: req.cmd.RequestID, resultCh: req.resultCh}
-	n.processOutput(out)
-}
-
-// handleControlPropose is the leader-gated entry point for a control
-// command (currently only FinalizeUpgrade's SetClusterVersionCommand),
-// mirroring handlePropose exactly except for the missing CommitTxn-only
-// Precheck fast-path (see controlProposeReq's doc comment).
-func (n *Node) handleControlPropose(req controlProposeReq) {
-	if n.core.Role() != raft.Leader {
-		req.resultCh <- proposeResult{err: &NotLeaderError{Leader: n.core.LeaderID()}}
-		return
-	}
-	out := n.core.Step(raft.Input{Kind: raft.InputPropose, ProposeData: req.payload})
-	if out.ProposalRejected {
-		req.resultCh <- proposeResult{err: &NotLeaderError{Leader: out.LeaderHint}}
-		return
-	}
-	if out.PersistRequest == nil || len(out.PersistRequest.Entries) != 1 {
-		n.fail(fmt.Errorf("node: unexpected control-propose output shape: %+v", out))
-		req.resultCh <- proposeResult{err: ErrNodeStopped}
-		return
-	}
-	idx := out.PersistRequest.Entries[0].Index
-	n.waiters[idx] = waiter{requestID: req.requestID, resultCh: req.resultCh}
+	n.waiters[idx] = waiter{requestID: requestID, resultCh: resultCh}
 	n.processOutput(out)
 }
 
@@ -1371,23 +1380,43 @@ func (n *Node) applyCommitted(entries []raft.Entry) {
 		n.appliedIndex = uint64(e.Index)
 		n.core.SetApplied(e.Index)
 
-		if w, ok := n.waiters[e.Index]; ok {
-			delete(n.waiters, e.Index)
-			if w.requestID == cmd.RequestID {
-				switch outcome.Status {
-				case fsm.StatusCommitted:
-					n.metrics.ProposalsCommittedTotal.Inc()
-				case fsm.StatusAborted:
-					n.metrics.ProposalsAbortedTotal.Inc()
-				}
-				w.resultCh <- proposeResult{outcome: outcome}
-			} else {
-				n.metrics.ProposalsUnknownTotal.Inc()
-				w.resultCh <- proposeResult{err: ErrProposalSuperseded}
+		n.resolveWaiter(e.Index, cmd.RequestID, outcome, func(o fsm.Outcome) {
+			switch o.Status {
+			case fsm.StatusCommitted:
+				n.metrics.ProposalsCommittedTotal.Inc()
+			case fsm.StatusAborted:
+				n.metrics.ProposalsAbortedTotal.Inc()
 			}
-		}
+		})
 	}
 	n.maybeSnapshot()
+}
+
+// resolveWaiter delivers outcome to the Propose/ProposeControl waiter
+// registered for index, if any (previously duplicated near-identically
+// between applyCommitted's CommitTxn path and applyControlEntry): a
+// waiter whose requestID no longer matches what is actually at index
+// was superseded by a divergent-suffix repair before it committed (see
+// ErrProposalSuperseded) — resolved identically regardless of which
+// command kind occupies that index. onMatched, when non-nil, lets a
+// caller count its own command-kind-specific metrics for the common
+// (matched) case; the superseded case's ProposalsUnknownTotal increment
+// is identical for every caller and always happens here.
+func (n *Node) resolveWaiter(index raft.Index, requestID fsm.RequestID, outcome fsm.Outcome, onMatched func(fsm.Outcome)) {
+	w, ok := n.waiters[index]
+	if !ok {
+		return
+	}
+	delete(n.waiters, index)
+	if w.requestID != requestID {
+		n.metrics.ProposalsUnknownTotal.Inc()
+		w.resultCh <- proposeResult{err: ErrProposalSuperseded}
+		return
+	}
+	if onMatched != nil {
+		onMatched(outcome)
+	}
+	w.resultCh <- proposeResult{outcome: outcome}
 }
 
 // applyControlEntry applies one committed FSM control-command entry
@@ -1441,15 +1470,7 @@ func (n *Node) applyControlEntry(e raft.Entry) bool {
 		n.logf("node %s: cluster generation finalized to %d at index %d", n.cfg.ID, cmd.TargetGeneration, e.Index)
 	}
 
-	if w, ok := n.waiters[e.Index]; ok {
-		delete(n.waiters, e.Index)
-		if w.requestID == cmd.RequestID {
-			w.resultCh <- proposeResult{outcome: outcome}
-		} else {
-			n.metrics.ProposalsUnknownTotal.Inc()
-			w.resultCh <- proposeResult{err: ErrProposalSuperseded}
-		}
-	}
+	n.resolveWaiter(e.Index, cmd.RequestID, outcome, nil)
 	return true
 }
 
@@ -1584,6 +1605,14 @@ func (n *Node) handleInstallSnapshot(msg raft.Message) {
 		n.tr.Send(raft.Message{
 			Type: raft.MsgInstallSnapshotResponse, From: n.cfg.ID, To: msg.From,
 			Term: n.core.CurrentTerm(), Success: false,
+			// This message is sent directly rather than via
+			// processOutput (which stamps every Output.Messages entry —
+			// see that method), so SenderGeneration must be set
+			// explicitly here too: otherwise a rare snapshot-install
+			// failure would report this node's generation as 0 to the
+			// peer, transiently regressing an already-known-upgraded
+			// peer's entry in that peer's own UpgradePrecheck view.
+			SenderGeneration: version.MaxSupportedGeneration,
 		})
 		return
 	}

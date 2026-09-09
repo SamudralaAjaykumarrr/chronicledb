@@ -34,26 +34,42 @@ const fsmStateVersion uint8 = 1
 func (f *FSM) EncodeState() []byte {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	return encodeState(f.store, f.outcomes, f.clusterGeneration)
+	return encodeState(f.store, f.outcomes, f.clusterGeneration, f.controlOutcomes)
 }
 
-// encodeState serializes store/outcomes/clusterGeneration.
-// clusterGeneration is appended as a trailing 4-byte field ONLY when
-// nonzero (docs/enterprise-v1-plan.md §7 "WAL/snapshot format
-// version": "additive — existing v0.1.0-produced files remain
-// readable, since generation 0 is defined as today's exact existing
-// format, never redefined"): a not-yet-finalized cluster
-// (clusterGeneration == 0, the default and the only value any
-// pre-v0.4.0 binary ever produces or expects) encodes byte-identical
-// output to every prior release, so a pre-v0.4.0 binary's own strict,
-// non-tolerant DecodeState can still install/read a snapshot this
-// binary produced before finalize — the rollback safety
-// docs/enterprise-v1-plan.md §7 requires. Only once finalize has
-// actually run (clusterGeneration > 0) does the extra field appear,
-// at which point an old binary reading it is expected, correctly, to
-// fail closed (see DecodeState's trailing-bytes check below) — that
-// is the documented rollback boundary, not a bug.
-func encodeState(store *mvcc.Store, outcomes map[RequestID]outcomeEntry, clusterGeneration uint32) []byte {
+// encodeState serializes store/outcomes/clusterGeneration/controlOutcomes.
+// clusterGeneration and controlOutcomes (SetClusterVersionCommand's own
+// idempotency table — see ApplySetClusterVersion) are appended as a
+// single trailing block ONLY when clusterGeneration is nonzero
+// (docs/enterprise-v1-plan.md §7 "WAL/snapshot format version":
+// "additive — existing v0.1.0-produced files remain readable, since
+// generation 0 is defined as today's exact existing format, never
+// redefined"): a not-yet-finalized cluster (clusterGeneration == 0, the
+// default and the only value any pre-v0.4.0 binary ever produces or
+// expects) encodes byte-identical output to every prior release, so a
+// pre-v0.4.0 binary's own strict, non-tolerant DecodeState can still
+// install/read a snapshot this binary produced before finalize — the
+// rollback safety docs/enterprise-v1-plan.md §7 requires. Only once
+// finalize has actually run (clusterGeneration > 0) does the trailing
+// block appear, at which point an old binary reading it is expected,
+// correctly, to fail closed (see DecodeState's trailing-bytes check
+// below) — that is the documented rollback boundary, not a bug.
+//
+// controlOutcomes entries recorded from a REJECTED (StatusAborted)
+// control command while clusterGeneration was still 0 are deliberately
+// not preserved by this condition — losing one is harmless, since
+// re-evaluating an identical rejected command from a fresh FSM always
+// reaches the identical deterministic rejection (ApplySetClusterVersion's
+// validation depends only on clusterGeneration and cmd.TargetGeneration,
+// both fully determined without the outcome table). What must survive
+// a snapshot/restart boundary is a COMMITTED control command's outcome
+// — the one case where losing it would let a later retry under the
+// same RequestID be re-evaluated against already-advanced state and
+// wrongly land on StatusAborted instead of returning the original
+// StatusCommitted outcome — and that case is exactly when
+// clusterGeneration is already nonzero (the commit that recorded the
+// outcome is the same Apply call that advanced clusterGeneration).
+func encodeState(store *mvcc.Store, outcomes map[RequestID]outcomeEntry, clusterGeneration uint32, controlOutcomes map[RequestID]Outcome) []byte {
 	chains := store.Export() // already sorted by key
 
 	ids := make([]RequestID, 0, len(outcomes))
@@ -61,6 +77,15 @@ func encodeState(store *mvcc.Store, outcomes map[RequestID]outcomeEntry, cluster
 		ids = append(ids, id)
 	}
 	sort.Slice(ids, func(i, j int) bool { return ids[i] < ids[j] })
+
+	var controlIDs []RequestID
+	if clusterGeneration > 0 {
+		controlIDs = make([]RequestID, 0, len(controlOutcomes))
+		for id := range controlOutcomes {
+			controlIDs = append(controlIDs, id)
+		}
+		sort.Slice(controlIDs, func(i, j int) bool { return controlIDs[i] < controlIDs[j] })
+	}
 
 	size := 1 + 4 // version + numChains
 	for _, kc := range chains {
@@ -82,7 +107,12 @@ func encodeState(store *mvcc.Store, outcomes map[RequestID]outcomeEntry, cluster
 		size += 8 // ConflictLatestSeq
 	}
 	if clusterGeneration > 0 {
-		size += 4
+		size += 4 + 4 // clusterGeneration + numControlOutcomes
+		for _, id := range controlIDs {
+			size += 4 + len(id) // requestIDLen + requestID
+			size += 1           // status
+			size += 8           // CommitSeq (always present, 0 when meaningless)
+		}
 	}
 
 	buf := make([]byte, size)
@@ -134,6 +164,18 @@ func encodeState(store *mvcc.Store, outcomes map[RequestID]outcomeEntry, cluster
 	if clusterGeneration > 0 {
 		binary.BigEndian.PutUint32(buf[off:], clusterGeneration)
 		off += 4
+		binary.BigEndian.PutUint32(buf[off:], uint32(len(controlIDs)))
+		off += 4
+		for _, id := range controlIDs {
+			outcome := controlOutcomes[id]
+			binary.BigEndian.PutUint32(buf[off:], uint32(len(id)))
+			off += 4
+			off += copy(buf[off:], id)
+			buf[off] = byte(outcome.Status)
+			off++
+			binary.BigEndian.PutUint64(buf[off:], outcome.CommitSeq)
+			off += 8
+		}
 	}
 	return buf[:off]
 }
@@ -284,29 +326,64 @@ func DecodeState(data []byte) (*FSM, uint64, error) {
 		outcomes[id] = outcomeEntry{outcome: outcome, fingerprint: fp}
 	}
 
-	// Generation-aware trailing field (see encodeState's doc comment):
-	// exactly 0 extra bytes is generation-0 state (every pre-v0.4.0
-	// snapshot, and every not-yet-finalized v0.4.0+ one); exactly 4 extra
-	// bytes is a clusterGeneration field appended by a finalized cluster.
-	// Anything else is genuinely malformed, not a newer-but-unreadable
-	// generation this build simply declines to guess at — an actual
-	// future generation bump would introduce its own new trailing-field
-	// case here, deliberately, the same way this one was added; it would
-	// never silently fall through to "corrupt."
+	// Generation-aware trailing block (see encodeState's doc comment):
+	// zero extra bytes remaining is generation-0 state (every
+	// pre-v0.4.0 snapshot, and every not-yet-finalized v0.4.0+ one);
+	// anything present is a self-describing
+	// clusterGeneration+controlOutcomes block, bounded exactly like
+	// every other count-prefixed section above — never a newer-but-
+	// unreadable generation this build simply declines to guess at (an
+	// actual future generation bump would introduce its own new
+	// trailing-block case here, deliberately, the same way this one was
+	// added; it would never silently fall through to "corrupt").
+	controlOutcomes := make(map[RequestID]Outcome)
 	var clusterGeneration uint32
-	switch extra := len(data) - off; extra {
-	case 0:
-	case 4:
+	if len(data)-off > 0 {
+		if len(data)-off < 8 {
+			return nil, 0, fmt.Errorf("%w: truncated cluster-generation trailing block", ErrMalformedCommand)
+		}
 		clusterGeneration = binary.BigEndian.Uint32(data[off:])
 		off += 4
-	default:
-		return nil, 0, fmt.Errorf("%w: %d trailing bytes after decoding state", ErrMalformedCommand, extra)
+		numControlOutcomes := binary.BigEndian.Uint32(data[off:])
+		off += 4
+		const minControlOutcomeSize = 4 + 1 + 8 // requestIDLen + status + CommitSeq
+		if remaining := len(data) - off; numControlOutcomes > uint32(remaining/minControlOutcomeSize) {
+			return nil, 0, fmt.Errorf("%w: declares %d control outcomes but only %d bytes remain", ErrMalformedCommand, numControlOutcomes, remaining)
+		}
+		for i := uint32(0); i < numControlOutcomes; i++ {
+			if len(data)-off < 4 {
+				return nil, 0, fmt.Errorf("%w: truncated control outcome %d (RequestID length)", ErrMalformedCommand, i)
+			}
+			idLen := binary.BigEndian.Uint32(data[off:])
+			off += 4
+			if int64(idLen) > int64(len(data)-off) {
+				return nil, 0, fmt.Errorf("%w: truncated control outcome %d (RequestID: declared %d, %d remain)", ErrMalformedCommand, i, idLen, len(data)-off)
+			}
+			id := RequestID(data[off : off+int(idLen)])
+			off += int(idLen)
+			if len(data)-off < 1+8 {
+				return nil, 0, fmt.Errorf("%w: truncated control outcome %d body", ErrMalformedCommand, i)
+			}
+			status := Status(data[off])
+			off++
+			commitSeq := binary.BigEndian.Uint64(data[off:])
+			off += 8
+			outcome := Outcome{RequestID: id, Status: status}
+			if status == StatusCommitted {
+				outcome.CommitSeq = commitSeq
+				bumpMax(commitSeq)
+			}
+			controlOutcomes[id] = outcome
+		}
+		if off != len(data) {
+			return nil, 0, fmt.Errorf("%w: %d trailing bytes after decoding cluster-generation block", ErrMalformedCommand, len(data)-off)
+		}
 	}
 
 	return &FSM{
 		store:             mvcc.RestoreStore(chains),
 		outcomes:          outcomes,
-		controlOutcomes:   make(map[RequestID]Outcome),
+		controlOutcomes:   controlOutcomes,
 		clusterGeneration: clusterGeneration,
 	}, maxSeq, nil
 }

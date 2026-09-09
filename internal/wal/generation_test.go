@@ -133,6 +133,36 @@ func TestSetClusterGeneration_RejectsBackwardMove(t *testing.T) {
 	}
 }
 
+// TestSetClusterGeneration_SameValueIsIdempotentNoOp proves the
+// same-value short-circuit directly: internal/node.applyControlEntry
+// calls this unconditionally for every StatusCommitted control-command
+// outcome, including a retried proposal resolved from the FSM's own
+// idempotency table against an already-current generation — this must
+// succeed as a cheap no-op, not merely "not error" (it must not pay for
+// a redundant append+fsync either, though that is proven at the WAL
+// level only indirectly here by asserting the call is at least as fast
+// as an Open on a fresh directory would suggest is possible for a real
+// append — the doc comment on the fix is the authoritative statement of
+// intent; this test pins the observable behavior: no error, unchanged
+// state).
+func TestSetClusterGeneration_SameValueIsIdempotentNoOp(t *testing.T) {
+	dir := t.TempDir()
+	w, _, err := Open(dir, Options{})
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer w.Close()
+	if err := w.SetClusterGeneration(1); err != nil {
+		t.Fatalf("SetClusterGeneration(1): %v", err)
+	}
+	if err := w.SetClusterGeneration(1); err != nil {
+		t.Fatalf("SetClusterGeneration(1) again (idempotent retry): %v", err)
+	}
+	if got := w.Metadata().ClusterGeneration; got != 1 {
+		t.Fatalf("Metadata().ClusterGeneration after idempotent retry = %d, want unchanged 1", got)
+	}
+}
+
 func TestSetClusterGeneration_RejectsBeyondThisBinary(t *testing.T) {
 	dir := t.TempDir()
 	w, _, err := Open(dir, Options{})

@@ -546,6 +546,20 @@ func (w *WAL) SetClusterGeneration(generation uint32) error {
 	if w.closed {
 		return ErrClosed
 	}
+	if generation == w.metadata.ClusterGeneration {
+		// Idempotent no-op: internal/node.applyControlEntry calls this
+		// unconditionally whenever a control command's outcome is
+		// StatusCommitted, including a retried proposal resolved from
+		// FSM.ApplySetClusterVersion's own idempotency table rather than
+		// freshly evaluated (docs/enterprise-v1-plan.md §7's own
+		// "finalize... a retry is idempotent" requirement can produce
+		// exactly this: two separate committed log entries under the
+		// same RequestID, both landing on the identical already-current
+		// generation). Skipping the append+fsync here avoids paying for
+		// that redundant durability round-trip on the single event-loop
+		// goroutine a second time for no state change at all.
+		return nil
+	}
 	if generation < w.metadata.ClusterGeneration {
 		return fmt.Errorf("wal: SetClusterGeneration: %d is behind current generation %d", generation, w.metadata.ClusterGeneration)
 	}

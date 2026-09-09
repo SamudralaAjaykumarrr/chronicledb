@@ -43,6 +43,22 @@ const (
 	controlKindSetClusterVersion byte = 1
 )
 
+// init structurally guarantees ControlCommandMarker/commitTxnCommandVersion's
+// non-collision at process startup, in every build, rather than relying
+// solely on TestControlCommandMarker_NeverCollidesWithCommitTxnVersion
+// being run: this is the entire backward-compatibility mechanism a
+// pre-v0.4.0 binary's fail-closed behavior depends on (see
+// ControlCommandMarker's doc comment), so a future accidental collision
+// — e.g. commitTxnCommandVersion mechanically bumped by some future
+// tool without this file in view — must be caught before either
+// constant is ever used to encode a single byte, not discovered later
+// by whichever test happens to run.
+func init() {
+	if ControlCommandMarker == commitTxnCommandVersion {
+		panic(fmt.Sprintf("fsm: ControlCommandMarker (%d) collides with commitTxnCommandVersion (%d) — this would silently defeat NO SILENT FORMAT MISINTERPRETATION for every pre-v0.4.0 binary", ControlCommandMarker, commitTxnCommandVersion))
+	}
+}
+
 // SetClusterVersionCommand is the single new FSM command this phase
 // introduces (docs/enterprise-v1-plan.md §7 "Cluster version /
 // finalize"): a Raft-replicated, deterministically-applied change to

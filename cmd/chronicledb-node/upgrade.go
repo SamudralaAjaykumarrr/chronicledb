@@ -16,7 +16,9 @@ import (
 	"net/http"
 	"time"
 
+	"github.com/SamudralaAjaykumarrr/chronicledb/internal/fsm"
 	"github.com/SamudralaAjaykumarrr/chronicledb/internal/node"
+	"github.com/SamudralaAjaykumarrr/chronicledb/internal/version"
 )
 
 type precheckPeerJSON struct {
@@ -93,7 +95,24 @@ func (s *controlServer) handleUpgradeFinalize(w http.ResponseWriter, r *http.Req
 		writeJSON(w, http.StatusConflict, resp)
 		return
 	}
-	writeJSON(w, http.StatusOK, finalizeResponse{Status: outcome.Status.String(), NewGeneration: s.n.Status().ClusterGeneration})
+	// NewGeneration is derived from version.MaxSupportedGeneration (a
+	// compile-time constant), not from s.n.Status() read right after
+	// FinalizeUpgrade returns: Node.run()'s event-loop goroutine only
+	// calls refreshStatusLocked() AFTER handleControlPropose (and the
+	// applyControlEntry inside it that signals FinalizeUpgrade's
+	// resultCh) returns — there is no happens-before edge forcing that
+	// refresh to complete before this HTTP handler goroutine, unblocked
+	// by the resultCh send, gets to read Status(). A successful finalize
+	// (Outcome.Status == StatusCommitted) always raises the cluster to
+	// exactly this binary's own MaxSupportedGeneration by construction
+	// (FinalizeUpgrade only ever proposes that target), so reading the
+	// constant directly is both race-free and correct — no need to
+	// observe the FSM's own state at all for this value.
+	newGeneration := uint32(0)
+	if outcome.Status == fsm.StatusCommitted {
+		newGeneration = version.MaxSupportedGeneration
+	}
+	writeJSON(w, http.StatusOK, finalizeResponse{Status: outcome.Status.String(), NewGeneration: newGeneration})
 }
 
 // runUpgradePrecheck implements the -upgrade-precheck CLI flag: a
