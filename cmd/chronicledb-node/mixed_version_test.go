@@ -2,10 +2,10 @@
 
 // This file is the "real mixed-binary cluster" proof
 // docs/enterprise-v1-plan.md §7 requires: it builds two ACTUAL
-// chronicledb-node binaries — one from the pre-v0.4.0 baseline commit
-// (5637afa, "docs: correct v0.2.0 release status" — the last commit
-// before any compatibility/rolling-upgrade code existed at all) and one
-// from this working tree's own current source — and runs them together
+// chronicledb-node binaries — one from the previous release tag,
+// v0.3.0 (the last released version before any compatibility/
+// rolling-upgrade code existed at all — see preV040Commit below) and
+// one from this working tree's own current source — and runs them together
 // as real OS processes over real TCP/disk, exactly like
 // main_test.go's existing single-binary real-process proof, but with
 // two genuinely different binaries instead of one. It deliberately does
@@ -25,13 +25,21 @@ import (
 	"time"
 )
 
-// buildBinaryAtRef builds chronicledb-node from git ref (a commit hash)
-// rather than this working tree, via a temporary, detached git
-// worktree — a real, independently-compiled binary reflecting exactly
-// what that commit's source produced, not a synthetic stand-in. The
-// worktree is created and torn down entirely outside the repository's
-// actual working directory/index (git worktree add never touches
-// either), and is removed in t.Cleanup regardless of test outcome.
+// buildBinaryAtRef builds chronicledb-node from git ref (a tag or
+// commit hash) rather than this working tree, via a temporary,
+// detached git worktree — a real, independently-compiled binary
+// reflecting exactly what that commit's source produced, not a
+// synthetic stand-in. The worktree is created and torn down entirely
+// outside the repository's actual working directory/index (git
+// worktree add never touches either), and is removed in t.Cleanup
+// regardless of test outcome.
+//
+// This requires ref's commit to actually be present in the local
+// clone's object database — CI runs actions/checkout with
+// fetch-depth: 0 (see .github/workflows/ci.yml) specifically so that
+// historical release tags like preV040Commit below are available; a
+// default shallow checkout would make this fail with "invalid
+// reference".
 func buildBinaryAtRef(t *testing.T, ref string) string {
 	t.Helper()
 	repoRoot := findRepoRoot(t)
@@ -73,13 +81,22 @@ func findRepoRoot(t *testing.T) string {
 	return strings.TrimSpace(string(out))
 }
 
-// preV040Commit is the last real commit before any Compatibility /
-// Rolling Upgrades code existed (docs/enterprise-v1-plan.md §7's
-// baseline) — see this task's own baseline description. Building the
-// "old" binary from here, rather than from a synthetic flag on the
-// current binary, is exactly what "do not fake mixed-version proof
-// using one binary with different flags" requires.
-const preV040Commit = "5637afa"
+// preV040Commit identifies the previous release baseline this test
+// builds the "old" binary from: the v0.3.0 tag, which happens to point
+// at commit 5637afa ("docs: correct v0.2.0 release status") — the last
+// commit before any Compatibility / Rolling Upgrades code existed
+// (docs/enterprise-v1-plan.md §7's baseline). Building the "old" binary
+// from here, rather than from a synthetic flag on the current binary,
+// is exactly what "do not fake mixed-version proof using one binary
+// with different flags" requires.
+//
+// Referenced by its release tag rather than the raw commit hash: a
+// mixed-version compatibility proof is inherently about "the previous
+// released version", and v0.3.0 is that version's permanent,
+// deliberately-created identity (docs/releasing.md) — self-documenting
+// in a way a bare hash isn't, and exactly what a real operator upgrades
+// from.
+const preV040Commit = "v0.3.0"
 
 // statusJSONv2 is statusJSON (main_test.go) extended with the two new
 // fields this phase adds to node.Status — decoding an old binary's

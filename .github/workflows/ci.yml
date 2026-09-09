@@ -9,6 +9,14 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
+        with:
+          # Full history (not the default shallow, single-commit
+          # checkout) is required: cmd/chronicledb-node/mixed_version_test.go
+          # builds a real "old" chronicledb-node binary from the
+          # previous release tag (v0.3.0) via a temporary `git worktree
+          # add`, which needs that historical commit to actually be
+          # present in this checkout's object database.
+          fetch-depth: 0
       - uses: actions/setup-go@v7
         with:
           go-version: "1.26"
