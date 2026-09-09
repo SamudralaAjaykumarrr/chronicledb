@@ -3,6 +3,7 @@ package node
 import (
 	"context"
 	"errors"
+	"fmt"
 	"testing"
 	"time"
 
@@ -140,4 +141,106 @@ func TestFinalizeUpgrade_RestartPersistsGeneration(t *testing.T) {
 	awaitCondition(t, 5*time.Second, "restarted node recovers ClusterGeneration=1 from local durable state", func() bool {
 		return restarted.Status().ClusterGeneration == version.MaxSupportedGeneration
 	})
+}
+
+// TestFinalizeUpgrade_FollowerAdoptsGenerationViaSnapshotInstall is a
+// regression pin for a gap code review found in this same phase's own
+// implementation: a follower that catches up via a real InstallSnapshot
+// (because the leader has already compacted past the committed
+// SetClusterVersionCommand log entry) never replays that entry itself
+// via applyControlEntry — the only place the original implementation
+// durably persisted the finalized generation to WAL metadata. Without
+// Node.adoptClusterGeneration also being called from
+// handleInstallSnapshot, such a follower's in-memory FSM would
+// correctly report the finalized generation (it comes along for free
+// inside the installed snapshot's own state, per
+// fsm.EncodeState/DecodeState) while its WAL metadata silently stayed
+// at generation 0 forever — defeating wal.Open's ErrUnsupportedGeneration
+// rollback-refusal check for that specific node on a future restart
+// with an older binary. This mirrors TestSN5_FollowerCatchesUpViaSnapshotAfterLeaderCompaction's
+// exact isolate/compact/heal shape, but checks fnode.walog.Metadata()
+// directly (this package's own tests already have that access) rather
+// than only Status(), which cannot distinguish "persisted to WAL
+// metadata" from "merely reflected by the in-memory FSM."
+func TestFinalizeUpgrade_FollowerAdoptsGenerationViaSnapshotInstall(t *testing.T) {
+	const threshold = 3
+	const numKeys = 9
+	tc := newTestClusterWithSnapshotThreshold(t, 3, threshold)
+	leaderID := tc.awaitLeader(5 * time.Second)
+	leader := tc.node(leaderID)
+
+	// Isolate the follower BEFORE finalize is ever proposed, so it has
+	// no way to ever learn the finalized generation via live replication
+	// (applyControlEntry) at all — the installed snapshot below must be
+	// the only path. (Precheck can still see this follower as
+	// Known/ready: it exchanged RequestVote traffic with the leader
+	// during the bootstrap election above, and PeerGenerationInfo has no
+	// recency requirement — see UpgradePrecheck's own doc comment.)
+	var follower raft.NodeID
+	for _, id := range tc.ids {
+		if id != leaderID {
+			follower = id
+			break
+		}
+	}
+	tc.isolate(follower)
+
+	awaitCondition(t, 5*time.Second, "precheck reports Ready despite the isolated follower", func() bool {
+		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+		defer cancel()
+		res, err := leader.UpgradePrecheck(ctx)
+		return err == nil && res.Ready
+	})
+	{
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if _, err := leader.FinalizeUpgrade(ctx); err != nil {
+			t.Fatalf("FinalizeUpgrade: %v", err)
+		}
+	}
+	awaitCondition(t, 5*time.Second, "leader converges on ClusterGeneration=1", func() bool {
+		return leader.Status().ClusterGeneration == version.MaxSupportedGeneration
+	})
+	if got := tc.node(follower).Status().ClusterGeneration; got != 0 {
+		t.Fatalf("isolated follower's ClusterGeneration = %d, want 0 (it must not have learned about finalize yet)", got)
+	}
+
+	outcomes := make([]fsm.Outcome, numKeys)
+	for i := 0; i < numKeys; i++ {
+		key := fmt.Sprintf("k%d", i)
+		outcome, err := propose(t, leader, cmd(fmt.Sprintf("r%d", i), uint64(i+1), 0, key, "v"), 3*time.Second)
+		if err != nil || outcome.Status != fsm.StatusCommitted {
+			t.Fatalf("Propose #%d: outcome=%+v err=%v", i, outcome, err)
+		}
+		outcomes[i] = outcome
+	}
+	last := outcomes[numKeys-1].CommitSeq
+	for i := 0; uint64(leader.Status().SnapshotIndex) < last && i < threshold; i++ {
+		if _, err := propose(t, leader, cmd(fmt.Sprintf("filler-r%d", i), uint64(numKeys+i+1000), 0, fmt.Sprintf("filler-k%d", i), "v"), 3*time.Second); err != nil {
+			t.Fatalf("filler Propose #%d: %v", i, err)
+		}
+	}
+	awaitCondition(t, 3*time.Second, "leader compacts its own log past every proposed key (and the finalize entry) while the follower is isolated", func() bool {
+		return uint64(leader.Status().SnapshotIndex) >= last
+	})
+	snapIndex := uint64(leader.Status().SnapshotIndex)
+
+	tc.heal(follower)
+	awaitCondition(t, 5*time.Second, "isolated follower catches up via an installed snapshot", func() bool {
+		st := tc.node(follower).Status()
+		return uint64(st.SnapshotIndex) == snapIndex && uint64(st.AppliedIndex) >= snapIndex
+	})
+
+	fnode := tc.node(follower)
+	if got := uint64(fnode.walog.FirstIndex()); got != snapIndex+1 {
+		t.Fatalf("follower FirstIndex() after catch-up = %d, want %d — only a genuine InstallSnapshot install ever moves a follower's own boundary this way (confirming this follower never replayed the finalize entry itself)", got, snapIndex+1)
+	}
+	if got := fnode.Status().ClusterGeneration; got != version.MaxSupportedGeneration {
+		t.Fatalf("follower's in-memory ClusterGeneration after snapshot catch-up = %d, want %d", got, version.MaxSupportedGeneration)
+	}
+	// The critical assertion: WAL metadata itself, not merely the
+	// in-memory FSM, must reflect the adopted generation.
+	if got := fnode.walog.Metadata().ClusterGeneration; got != version.MaxSupportedGeneration {
+		t.Fatalf("follower's WAL metadata ClusterGeneration after snapshot catch-up = %d, want %d — handleInstallSnapshot must durably adopt the installed snapshot's own cluster generation", got, version.MaxSupportedGeneration)
+	}
 }

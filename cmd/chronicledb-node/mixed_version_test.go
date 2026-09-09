@@ -134,48 +134,34 @@ func awaitLeaderV2(t *testing.T, nodes []*realNode, timeout time.Duration) *real
 	return nil
 }
 
-type precheckPeerJSONt struct {
-	Generation uint32 `json:"generation"`
-	Known      bool   `json:"known"`
-}
-type precheckResponseT struct {
-	LocalClusterGeneration      uint32                       `json:"localClusterGeneration"`
-	LocalMaxSupportedGeneration uint32                       `json:"localMaxSupportedGeneration"`
-	TargetGeneration            uint32                       `json:"targetGeneration"`
-	Peers                       map[string]precheckPeerJSONt `json:"peers"`
-	AlreadyFinalized            bool                         `json:"alreadyFinalized"`
-	Ready                       bool                         `json:"ready"`
-	Error                       string                       `json:"error,omitempty"`
-}
-type finalizeResponseT struct {
-	Status        string `json:"status"`
-	NewGeneration uint32 `json:"newGeneration,omitempty"`
-	Error         string `json:"error,omitempty"`
-	LeaderHint    string `json:"leaderHint,omitempty"`
-}
-
-func precheckHTTP(rn *realNode) (precheckResponseT, int, error) {
+// precheckHTTP/finalizeHTTP deliberately decode into precheckResponse/
+// finalizeResponse — the exact same types upgrade.go's HTTP handlers
+// themselves use, not a separately-maintained copy — so this test,
+// specifically meant to catch protocol drift across two real binaries,
+// cannot itself silently pass against a stale shape if those types
+// ever gain or rename a field (same package, main).
+func precheckHTTP(rn *realNode) (precheckResponse, int, error) {
 	resp, err := http.Get("http://" + rn.httpAddr + "/admin/upgrade/precheck")
 	if err != nil {
-		return precheckResponseT{}, 0, err
+		return precheckResponse{}, 0, err
 	}
 	defer resp.Body.Close()
-	var out precheckResponseT
+	var out precheckResponse
 	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
-		return precheckResponseT{}, resp.StatusCode, err
+		return precheckResponse{}, resp.StatusCode, err
 	}
 	return out, resp.StatusCode, nil
 }
 
-func finalizeHTTP(rn *realNode) (finalizeResponseT, int, error) {
+func finalizeHTTP(rn *realNode) (finalizeResponse, int, error) {
 	resp, err := http.Post("http://"+rn.httpAddr+"/admin/upgrade/finalize", "application/json", nil)
 	if err != nil {
-		return finalizeResponseT{}, 0, err
+		return finalizeResponse{}, 0, err
 	}
 	defer resp.Body.Close()
-	var out finalizeResponseT
+	var out finalizeResponse
 	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
-		return finalizeResponseT{}, resp.StatusCode, err
+		return finalizeResponse{}, resp.StatusCode, err
 	}
 	return out, resp.StatusCode, nil
 }

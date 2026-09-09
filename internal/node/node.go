@@ -240,22 +240,41 @@ type PrecheckResult struct {
 	// LocalMaxSupportedGeneration is this node's own binary capability.
 	LocalMaxSupportedGeneration uint32
 	// TargetGeneration is the generation FinalizeUpgrade would attempt
-	// to raise the cluster to — always LocalMaxSupportedGeneration
-	// (V1 supports only N/N+1 adjacent-generation operation, never an
-	// arbitrary caller-chosen target).
+	// to raise the cluster to: LocalClusterGeneration+1, capped by
+	// LocalMaxSupportedGeneration (fsm.ApplySetClusterVersion's own
+	// single-step N/N+1-only rule — see its doc comment). Today's single
+	// possible generation bump (0 -> 1, since MaxSupportedGeneration==1)
+	// makes this identical to the flat constant LocalMaxSupportedGeneration
+	// in every reachable case, but a future release that raises
+	// MaxSupportedGeneration further must still step one generation at a
+	// time from whatever a cluster currently holds, never jump straight
+	// to that release's own max — computing it as current+1 here, rather
+	// than the flat constant, is what keeps this true without requiring
+	// every future caller to remember it.
 	TargetGeneration uint32
 	// Peers reports every OTHER configured cluster member's last-known
 	// generation (this node's own entry is never included — see
 	// LocalClusterGeneration/LocalMaxSupportedGeneration above).
 	Peers map[string]PeerGenerationInfo
-	// AlreadyFinalized is true when LocalClusterGeneration already
-	// equals TargetGeneration — finalize would have nothing to do.
+	// AlreadyFinalized is true when this node's own binary has nothing
+	// further to offer the cluster (LocalClusterGeneration already
+	// equals LocalMaxSupportedGeneration) — finalize would have nothing
+	// to do.
 	AlreadyFinalized bool
 	// Ready is true iff every entry in Peers is Known and its Generation
 	// is >= TargetGeneration, and AlreadyFinalized is false — i.e. iff
 	// FinalizeUpgrade would actually be attempted and expected to
 	// succeed right now.
 	Ready bool
+	// IsLeader/Leader are computed live, on the same event-loop
+	// dispatch as everything else in this result (never from a
+	// separately-read, possibly-stale Status() snapshot — see
+	// FinalizeUpgrade's own doc comment for why that distinction is
+	// load-bearing): whether this node was the Raft leader at the exact
+	// moment this PrecheckResult was computed, and its best current
+	// knowledge of who is if not.
+	IsLeader bool
+	Leader   raft.NodeID
 }
 
 type precheckReq struct {
@@ -350,6 +369,21 @@ type Node struct {
 	appliedIndex uint64
 	waiters      map[raft.Index]waiter
 	pendingReads []pendingRead
+
+	// clusterGeneration mirrors fsm.FSM.ClusterGeneration() but is
+	// written directly by run's own goroutine (via
+	// adoptClusterGeneration) instead of read through fsmachine's mutex
+	// on every refreshStatusLocked call — this value changes at most
+	// once or twice in a node's entire lifetime, so caching it here
+	// avoids taking FSM.mu (contended by every Propose call's Precheck)
+	// on the single hottest loop in the system for a value that is
+	// otherwise constant. Always kept in sync with the FSM's own value
+	// by construction: every code path that can change the FSM's
+	// clusterGeneration (a committed control command, or adopting a
+	// peer's snapshot via InstallSnapshot) goes through
+	// adoptClusterGeneration, never updates fsmachine's generation any
+	// other way.
+	clusterGeneration uint32
 
 	// sentSeqCounter/ackSeq implement ADR-0010's ReadIndex freshness
 	// proof (docs/replication.md §4.1). sentSeqCounter is bumped once
@@ -549,25 +583,26 @@ func Open(cfg Config) (*Node, error) {
 	}
 
 	n := &Node{
-		cfg:             cfg,
-		core:            core,
-		walog:           w,
-		storage:         st,
-		snapMgr:         snapMgr,
-		tr:              tr,
-		identityHolder:  identityHolder,
-		logger:          cfg.Logger,
-		appliedIndex:    baseIndex,
-		waiters:         make(map[raft.Index]waiter),
-		ackSeq:          make(map[raft.NodeID]uint64, len(cfg.Peers)),
-		peerGenerations: make(map[raft.NodeID]uint32, len(cfg.Peers)),
-		proposeCh:       make(chan proposeReq),
-		controlCh:       make(chan controlProposeReq),
-		readIndexCh:     make(chan readIndexReq),
-		backupCh:        make(chan backupReq),
-		precheckCh:      make(chan precheckReq),
-		stopCh:          make(chan struct{}),
-		doneCh:          make(chan struct{}),
+		cfg:               cfg,
+		core:              core,
+		walog:             w,
+		storage:           st,
+		snapMgr:           snapMgr,
+		tr:                tr,
+		identityHolder:    identityHolder,
+		logger:            cfg.Logger,
+		appliedIndex:      baseIndex,
+		clusterGeneration: fsmachine.ClusterGeneration(),
+		waiters:           make(map[raft.Index]waiter),
+		ackSeq:            make(map[raft.NodeID]uint64, len(cfg.Peers)),
+		peerGenerations:   make(map[raft.NodeID]uint32, len(cfg.Peers)),
+		proposeCh:         make(chan proposeReq),
+		controlCh:         make(chan controlProposeReq),
+		readIndexCh:       make(chan readIndexReq),
+		backupCh:          make(chan backupReq),
+		precheckCh:        make(chan precheckReq),
+		stopCh:            make(chan struct{}),
+		doneCh:            make(chan struct{}),
 	}
 	n.fsmachine.Store(fsmachine)
 	n.electionArmed = true
@@ -662,7 +697,7 @@ func (n *Node) refreshStatusLocked() {
 		AppliedIndex:           n.appliedIndex,
 		LastIndex:              n.core.LastIndex(),
 		SnapshotIndex:          n.core.SnapshotIndex(),
-		ClusterGeneration:      n.fsmachine.Load().ClusterGeneration(),
+		ClusterGeneration:      n.clusterGeneration,
 		MaxSupportedGeneration: version.MaxSupportedGeneration,
 	}
 	n.statusMu.Unlock()
@@ -694,13 +729,38 @@ func (n *Node) recordPeerGeneration(peer raft.NodeID, gen uint32) {
 	n.peerGenerations[peer] = gen
 }
 
+// send stamps this node's own compatibility generation
+// (raft.Message.SenderGeneration — docs/enterprise-v1-plan.md §7's
+// wire-protocol version handshake) and transmits msg via the
+// transport. This is the single choke point every outbound
+// raft.Message goes through instead of calling n.tr.Send directly, so
+// a future call site cannot silently forget the stamp — exactly the
+// kind of gap code review already caught once by hand at
+// handleInstallSnapshot's own failure-reply site before this helper
+// existed.
+func (n *Node) send(msg raft.Message) {
+	msg.SenderGeneration = version.MaxSupportedGeneration
+	n.tr.Send(msg)
+}
+
 // computePrecheck builds a PrecheckResult from this node's current
-// view. Call only from run's goroutine.
+// view, including a live (not cached) leadership read. Call only from
+// run's goroutine.
 func (n *Node) computePrecheck() PrecheckResult {
-	target := version.MaxSupportedGeneration
-	local := n.fsmachine.Load().ClusterGeneration()
+	local := n.clusterGeneration
+	alreadyFinalized := local >= version.MaxSupportedGeneration
+	// Single-step target: current+1, never a flat jump to this binary's
+	// own max — see TargetGeneration's doc comment. When
+	// alreadyFinalized, local+1 could nominally exceed
+	// MaxSupportedGeneration (this binary has nothing further to offer);
+	// the exact value reported in that case is not meaningful since
+	// Ready is unconditionally false below, but is still computed
+	// without overflow risk (uint32 wraparound is not a concern at these
+	// magnitudes).
+	target := local + 1
+
 	peers := make(map[string]PeerGenerationInfo, len(n.cfg.Peers))
-	ready := local < target
+	ready := !alreadyFinalized
 	for _, p := range n.cfg.Peers {
 		if p == n.cfg.ID {
 			continue
@@ -713,11 +773,13 @@ func (n *Node) computePrecheck() PrecheckResult {
 	}
 	return PrecheckResult{
 		LocalClusterGeneration:      local,
-		LocalMaxSupportedGeneration: target,
+		LocalMaxSupportedGeneration: version.MaxSupportedGeneration,
 		TargetGeneration:            target,
 		Peers:                       peers,
-		AlreadyFinalized:            local >= target,
+		AlreadyFinalized:            alreadyFinalized,
 		Ready:                       ready,
+		IsLeader:                    n.core.Role() == raft.Leader,
+		Leader:                      n.core.LeaderID(),
 	}
 }
 
@@ -741,6 +803,23 @@ func (n *Node) computePrecheck() PrecheckResult {
 // leader (docs/upgrades.md's runbook does) for the authoritative
 // picture.
 func (n *Node) UpgradePrecheck(ctx context.Context) (PrecheckResult, error) {
+	res, err := n.upgradePrecheck(ctx)
+	if err != nil {
+		return PrecheckResult{}, err
+	}
+	n.metrics.UpgradePrecheckTotal.Inc()
+	return res, nil
+}
+
+// upgradePrecheck is the unexported channel round-trip UpgradePrecheck
+// and FinalizeUpgrade both dispatch through — split out so
+// FinalizeUpgrade's own internal re-check (see its doc comment) does
+// not inflate UpgradePrecheckTotal, a metric meant to reflect explicit
+// operator/CLI precheck polling (docs/enterprise-v1-plan.md §7
+// Observability), not finalize's own bookkeeping — a dedicated
+// UpgradeFinalizeTotal/UpgradeFinalizeFailedTotal pair already exists
+// for that.
+func (n *Node) upgradePrecheck(ctx context.Context) (PrecheckResult, error) {
 	req := precheckReq{resultCh: make(chan PrecheckResult, 1)}
 	select {
 	case n.precheckCh <- req:
@@ -751,7 +830,6 @@ func (n *Node) UpgradePrecheck(ctx context.Context) (PrecheckResult, error) {
 	}
 	select {
 	case res := <-req.resultCh:
-		n.metrics.UpgradePrecheckTotal.Inc()
 		return res, nil
 	case <-ctx.Done():
 		return PrecheckResult{}, ctx.Err()
@@ -820,26 +898,37 @@ var ErrAlreadyFinalized = errors.New("node: cluster is already finalized at this
 // Propose/BeginReadIndex, it returns *NotLeaderError otherwise) — an
 // operator/CLI caller retries against the leader hint exactly as any
 // other client of this node's HTTP control plane already does for
-// /propose.
+// /propose. Leadership is read live, from the exact same event-loop
+// dispatch that computes the rest of the precheck result
+// (PrecheckResult.IsLeader/Leader), never from a separately-read
+// Status() snapshot: Status() is refreshed once per run() event-loop
+// iteration by refreshStatusLocked, which — for a control-command
+// proposal specifically — only runs *after* the very call that would
+// unblock a waiting caller, so reading it from another goroutine
+// immediately after such a call has no happens-before guarantee it
+// reflects this node's just-changed role. A single live read inside
+// upgradePrecheck's own dispatch has no such gap.
 func (n *Node) FinalizeUpgrade(ctx context.Context) (fsm.Outcome, error) {
-	// Leadership is checked first, before precheck: a non-leader's own
-	// peerGenerations view is architecturally incomplete (a follower only
-	// ever exchanges Raft messages directly with the leader, plus
-	// whichever peers it happened to vote for/against during a past
-	// election — never a full mesh of pairwise traffic with every other
-	// follower), so a non-leader calling precheck could see "not ready"
-	// for reasons entirely unrelated to whether the actual leader is
-	// ready to finalize. Failing with NotLeaderError up front, before
-	// ever consulting that possibly-incomplete view, keeps this honest:
-	// only the leader's own precheck view is ever actually used to gate
-	// a real finalize decision.
-	if st := n.Status(); st.Role != raft.Leader {
-		return fsm.Outcome{}, &NotLeaderError{Leader: st.Leader}
-	}
-
-	pre, err := n.UpgradePrecheck(ctx)
+	// unexported upgradePrecheck, not the exported UpgradePrecheck: this
+	// internal re-check must not inflate UpgradePrecheckTotal, a metric
+	// meant to reflect explicit operator/CLI polling — see
+	// upgradePrecheck's own doc comment.
+	pre, err := n.upgradePrecheck(ctx)
 	if err != nil {
 		return fsm.Outcome{}, err
+	}
+	// A non-leader's own peerGenerations view is architecturally
+	// incomplete (a follower only ever exchanges Raft messages directly
+	// with the leader, plus whichever peers it happened to vote for/
+	// against during a past election — never a full mesh of pairwise
+	// traffic with every other follower), so a non-leader's own Ready/
+	// AlreadyFinalized fields could be misleading for reasons entirely
+	// unrelated to whether the actual leader is ready to finalize.
+	// Checking IsLeader first, before trusting either of those fields,
+	// keeps this honest: only the leader's own precheck view is ever
+	// actually used to gate a real finalize decision.
+	if !pre.IsLeader {
+		return fsm.Outcome{}, &NotLeaderError{Leader: pre.Leader}
 	}
 	if pre.AlreadyFinalized {
 		return fsm.Outcome{}, ErrAlreadyFinalized
@@ -1247,12 +1336,6 @@ func (n *Node) processOutput(out raft.Output) {
 	}
 
 	for _, m := range out.Messages {
-		// Stamp this node's own compatibility generation on every
-		// outbound message (docs/enterprise-v1-plan.md §7's wire-protocol
-		// version handshake — see raft.Message.SenderGeneration's doc
-		// comment). raft.Core itself never sets this field; only the
-		// driver does, exactly like m.Seq below.
-		m.SenderGeneration = version.MaxSupportedGeneration
 		if m.Type == raft.MsgInstallSnapshotRequest && len(m.SnapshotData) == 0 {
 			// Core never carries snapshot bytes itself (docs/snapshots.md
 			// §7 step 1, raft.MsgInstallSnapshotRequest's doc comment) —
@@ -1273,7 +1356,7 @@ func (n *Node) processOutput(out raft.Output) {
 			n.sentSeqCounter++
 			m.Seq = n.sentSeqCounter
 		}
-		n.tr.Send(m)
+		n.send(m)
 		n.metrics.RaftMessagesSentTotal.Inc()
 	}
 
@@ -1419,6 +1502,24 @@ func (n *Node) resolveWaiter(index raft.Index, requestID fsm.RequestID, outcome 
 	w.resultCh <- proposeResult{outcome: outcome}
 }
 
+// adoptClusterGeneration is the single choke point every code path that
+// can advance this node's cluster generation goes through — a
+// committed control command (applyControlEntry) and adopting a peer's
+// installed snapshot (handleInstallSnapshot) alike — so neither path
+// can forget to durably persist it (wal.WAL.SetClusterGeneration) or
+// forget to keep the cached n.clusterGeneration field (see its own doc
+// comment) in sync with the FSM's own value. Returns false if it called
+// n.fail, mirroring every other apply-path helper's control flow. Call
+// only from run's goroutine.
+func (n *Node) adoptClusterGeneration(generation uint32) bool {
+	if err := n.walog.SetClusterGeneration(generation); err != nil {
+		n.fail(fmt.Errorf("node: persisting cluster generation %d: %w", generation, err))
+		return false
+	}
+	n.clusterGeneration = generation
+	return true
+}
+
 // applyControlEntry applies one committed FSM control-command entry
 // (fsm.ControlCommandMarker — currently only SetClusterVersionCommand),
 // resolving any waiter registered for its index exactly as
@@ -1463,9 +1564,8 @@ func (n *Node) applyControlEntry(e raft.Entry) bool {
 		// the next tick must still see the finalized generation via
 		// wal.Open's own ErrUnsupportedGeneration check, not silently
 		// forget it happened.
-		if err := n.walog.SetClusterGeneration(cmd.TargetGeneration); err != nil {
-			n.fail(fmt.Errorf("node: persisting cluster generation %d after entry %d: %w", cmd.TargetGeneration, e.Index, err))
-			return false
+		if !n.adoptClusterGeneration(cmd.TargetGeneration) {
+			return false // n.fail already recorded the error and stopped the node
 		}
 		n.logf("node %s: cluster generation finalized to %d at index %d", n.cfg.ID, cmd.TargetGeneration, e.Index)
 	}
@@ -1602,17 +1702,9 @@ func (n *Node) termAtApplied() raft.Term {
 func (n *Node) handleInstallSnapshot(msg raft.Message) {
 	snap, err := n.snapMgr.Install(msg.SnapshotData)
 	if err != nil {
-		n.tr.Send(raft.Message{
+		n.send(raft.Message{
 			Type: raft.MsgInstallSnapshotResponse, From: n.cfg.ID, To: msg.From,
 			Term: n.core.CurrentTerm(), Success: false,
-			// This message is sent directly rather than via
-			// processOutput (which stamps every Output.Messages entry —
-			// see that method), so SenderGeneration must be set
-			// explicitly here too: otherwise a rare snapshot-install
-			// failure would report this node's generation as 0 to the
-			// peer, transiently regressing an already-known-upgraded
-			// peer's entry in that peer's own UpgradePrecheck view.
-			SenderGeneration: version.MaxSupportedGeneration,
 		})
 		return
 	}
@@ -1625,6 +1717,20 @@ func (n *Node) handleInstallSnapshot(msg raft.Message) {
 		}
 		n.fsmachine.Store(snap.FSM)
 		n.appliedIndex = snap.Meta.LastIncludedIndex
+		// A follower catching up via a peer's snapshot, rather than
+		// replaying the committed SetClusterVersionCommand log entry
+		// itself (e.g. that entry was already compacted away by the
+		// leader before this node caught up), must still durably adopt
+		// whatever cluster generation the installed snapshot's FSM state
+		// carries — otherwise this node's WAL metadata would never learn
+		// a generation its own in-memory FSM already reflects, silently
+		// bypassing wal.Open's ErrUnsupportedGeneration rollback-refusal
+		// check on a future restart with an older binary (see
+		// adoptClusterGeneration's doc comment: this is the other of the
+		// two paths that must go through it).
+		if !n.adoptClusterGeneration(snap.FSM.ClusterGeneration()) {
+			return // n.fail already recorded the error and stopped the node
+		}
 		n.metrics.SnapshotsInstalledTotal.Inc()
 		// Any waiter for an index this install just superseded is never
 		// resolved from here (applyCommitted no longer replays it) — it
