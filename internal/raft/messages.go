@@ -114,4 +114,31 @@ type Message struct {
 	// later — see Node.ackSeq's doc comment for why that distinction is
 	// load-bearing for ADR-0010's ReadIndex freshness proof.
 	Seq uint64
+
+	// SenderGeneration is a driver-assigned (internal/node,
+	// internal/transport), Core-opaque wire-protocol version handshake
+	// field (docs/enterprise-v1-plan.md §7, docs/upgrades.md): the
+	// sending node's internal/version.MaxSupportedGeneration, stamped on
+	// every outbound Message by internal/node.processOutput and read by
+	// the receiving internal/node's message-receive path to track each
+	// peer's currently-known compatibility generation. Core itself never
+	// reads or writes it and it plays no role in any Raft safety
+	// invariant, exactly like Seq above.
+	//
+	// This rides on every ordinary Message rather than a separate
+	// preamble/handshake message deliberately: internal/transport already
+	// gob-encodes Message on the wire (see that package's doc comment),
+	// and Go's encoding/gob is self-describing per field — a peer built
+	// before this field existed (any pre-v0.4.0 binary) simply never
+	// populates it (the receiving new binary decodes it as the zero
+	// value, correctly read as "generation 0 / pre-compatibility-phase
+	// peer"), and such a peer's own gob decoder silently ignores this
+	// field on a Message a new binary sends it, wire-compatible with no
+	// changes to the old binary at all. A one-time preamble exchanged
+	// before any Raft message would have required an old, unmodified
+	// binary to already understand a brand-new message kind it was never
+	// built to parse — impossible without modifying the old binary,
+	// which the mixed-version proof this phase requires explicitly rules
+	// out.
+	SenderGeneration uint32
 }

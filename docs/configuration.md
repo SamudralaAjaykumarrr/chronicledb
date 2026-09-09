@@ -67,6 +67,18 @@ cluster.
 | `-restore-until` | No (default: everything the backup includes) | A PITR boundary: the last committed log index to restore up to. Only meaningful together with `-restore-from`. Must name a real committed log index — there is no wall-clock/timestamp form (see [`docs/backup.md`](backup.md) §PITR boundary model for why). |
 | `-force-overwrite` | No (default `false`) | Required, together with `-restore-from`, to restore over a `-datadir` that already contains WAL/snapshot state — this destroys that existing state (DESTRUCTIVE RESTORE ISOLATION). Produces an audit record; a failure to write that record aborts startup. |
 
+### Compatibility / Rolling Upgrades flag (`v0.4.0`, `docs/enterprise-v1-plan.md` §7)
+
+See [`docs/upgrades.md`](upgrades.md) for the full runbook. Precheck and
+finalize themselves are admin-gated, audited HTTP actions (`GET
+/admin/upgrade/precheck`, `POST /admin/upgrade/finalize`), not flags —
+`-upgrade-precheck` below is only a standalone CLI convenience for the
+read-only dry run.
+
+| Flag | Required | Meaning |
+|---|---|---|
+| `-upgrade-precheck` | No | Dry-run only: query an already-running node's HTTP control-plane address (`host:port`) for `/admin/upgrade/precheck` and print the result, then exit. Never opens `-datadir` and never calls `node.Open`. Plain HTTP only in this release — see [`docs/upgrades.md`](upgrades.md) §7. |
+
 ## Example: a real three-node cluster on one machine
 
 Three separate `-datadir` values and three separate ports, run as

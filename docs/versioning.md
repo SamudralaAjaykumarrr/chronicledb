@@ -65,6 +65,38 @@ Releases are created by pushing an annotated tag matching `v*.*.*` to
 commands. Tags are never force-pushed or deleted after a release has
 been published.
 
+## On-disk/wire binary format compatibility (`v0.4.0`)
+
+The policy above governs *tagged-release* API surfaces. It says nothing
+about what happens to a *running, replicated cluster* mid-rollout when
+one of those surfaces changes underneath it — that is a distinct
+question `docs/enterprise-v1-plan.md` §7 /
+[`docs/upgrades.md`](upgrades.md) /
+[`ADR-0017`](adr/0017-compatibility-and-rolling-upgrades.md) answer:
+
+- Every durable/wire binary format this policy's "on-disk WAL/snapshot
+  formats" bullet already covers — plus, as of `v0.4.0`, `internal/fsm`'s
+  command encoding and `internal/raft.Message`'s wire shape — carries an
+  explicit version or **generation** field, checked at the point it is
+  interpreted. "Generation 0" is, by definition, every format exactly as
+  it existed through `v0.3.0`, never redefined.
+- Within one generation, decode is exact (a version mismatch is refused,
+  never guessed at) — matching this policy's PATCH-bump promise above.
+  *Across* adjacent generations (N/N+1 only — no skip-version support),
+  a newer binary's decoder is required to still read a not-yet-finalized
+  older generation's own exact bytes, and a not-yet-upgraded older
+  binary is required to still be able to rejoin and replicate normally
+  against a cluster that has upgraded but not yet finalized — see
+  `docs/upgrades.md` §5 for the precise boundary (finalize) past which
+  that older-binary compatibility is no longer claimed, honestly and
+  explicitly, rather than silently.
+- This extends, rather than replaces, the SemVer policy above: a MINOR
+  version bump that introduces a new generation is still a MINOR bump
+  (pre-1.0) exactly as any other breaking-capable change would be: what
+  changes is that ChronicleDB now provides a *tested, mechanized* path
+  (precheck -> roll nodes one at a time -> finalize) through that bump
+  for a live cluster, where before `v0.4.0` none existed at all.
+
 ## What this policy does not promise
 
 Consistent with [`docs/non-goals.md`](non-goals.md) §Staff/Principal

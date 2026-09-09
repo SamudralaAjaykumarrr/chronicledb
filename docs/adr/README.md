@@ -29,3 +29,4 @@ skeleton.
 | [0014](0014-election-no-op-for-readindex-liveness.md) | Election no-op entry for `ReadIndex` liveness |
 | [0015](0015-security-foundation.md) | Security Foundation architecture |
 | [0016](0016-backup-disaster-recovery-and-pitr.md) | Backup / Disaster Recovery / PITR architecture |
+| [0017](0017-compatibility-and-rolling-upgrades.md) | Compatibility / Rolling Upgrades architecture |

@@ -34,10 +34,26 @@ const fsmStateVersion uint8 = 1
 func (f *FSM) EncodeState() []byte {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	return encodeState(f.store, f.outcomes)
+	return encodeState(f.store, f.outcomes, f.clusterGeneration)
 }
 
-func encodeState(store *mvcc.Store, outcomes map[RequestID]outcomeEntry) []byte {
+// encodeState serializes store/outcomes/clusterGeneration.
+// clusterGeneration is appended as a trailing 4-byte field ONLY when
+// nonzero (docs/enterprise-v1-plan.md §7 "WAL/snapshot format
+// version": "additive — existing v0.1.0-produced files remain
+// readable, since generation 0 is defined as today's exact existing
+// format, never redefined"): a not-yet-finalized cluster
+// (clusterGeneration == 0, the default and the only value any
+// pre-v0.4.0 binary ever produces or expects) encodes byte-identical
+// output to every prior release, so a pre-v0.4.0 binary's own strict,
+// non-tolerant DecodeState can still install/read a snapshot this
+// binary produced before finalize — the rollback safety
+// docs/enterprise-v1-plan.md §7 requires. Only once finalize has
+// actually run (clusterGeneration > 0) does the extra field appear,
+// at which point an old binary reading it is expected, correctly, to
+// fail closed (see DecodeState's trailing-bytes check below) — that
+// is the documented rollback boundary, not a bug.
+func encodeState(store *mvcc.Store, outcomes map[RequestID]outcomeEntry, clusterGeneration uint32) []byte {
 	chains := store.Export() // already sorted by key
 
 	ids := make([]RequestID, 0, len(outcomes))
@@ -64,6 +80,9 @@ func encodeState(store *mvcc.Store, outcomes map[RequestID]outcomeEntry) []byte 
 		size += 8 // CommitSeq (always present, 0 when meaningless)
 		size += 4 + len(e.outcome.ConflictKey)
 		size += 8 // ConflictLatestSeq
+	}
+	if clusterGeneration > 0 {
+		size += 4
 	}
 
 	buf := make([]byte, size)
@@ -111,6 +130,10 @@ func encodeState(store *mvcc.Store, outcomes map[RequestID]outcomeEntry) []byte 
 		off += copy(buf[off:], e.outcome.ConflictKey)
 		binary.BigEndian.PutUint64(buf[off:], e.outcome.ConflictLatestSeq)
 		off += 8
+	}
+	if clusterGeneration > 0 {
+		binary.BigEndian.PutUint32(buf[off:], clusterGeneration)
+		off += 4
 	}
 	return buf[:off]
 }
@@ -261,9 +284,29 @@ func DecodeState(data []byte) (*FSM, uint64, error) {
 		outcomes[id] = outcomeEntry{outcome: outcome, fingerprint: fp}
 	}
 
-	if off != len(data) {
-		return nil, 0, fmt.Errorf("%w: %d trailing bytes after decoding state", ErrMalformedCommand, len(data)-off)
+	// Generation-aware trailing field (see encodeState's doc comment):
+	// exactly 0 extra bytes is generation-0 state (every pre-v0.4.0
+	// snapshot, and every not-yet-finalized v0.4.0+ one); exactly 4 extra
+	// bytes is a clusterGeneration field appended by a finalized cluster.
+	// Anything else is genuinely malformed, not a newer-but-unreadable
+	// generation this build simply declines to guess at — an actual
+	// future generation bump would introduce its own new trailing-field
+	// case here, deliberately, the same way this one was added; it would
+	// never silently fall through to "corrupt."
+	var clusterGeneration uint32
+	switch extra := len(data) - off; extra {
+	case 0:
+	case 4:
+		clusterGeneration = binary.BigEndian.Uint32(data[off:])
+		off += 4
+	default:
+		return nil, 0, fmt.Errorf("%w: %d trailing bytes after decoding state", ErrMalformedCommand, extra)
 	}
 
-	return &FSM{store: mvcc.RestoreStore(chains), outcomes: outcomes}, maxSeq, nil
+	return &FSM{
+		store:             mvcc.RestoreStore(chains),
+		outcomes:          outcomes,
+		controlOutcomes:   make(map[RequestID]Outcome),
+		clusterGeneration: clusterGeneration,
+	}, maxSeq, nil
 }

@@ -13,14 +13,16 @@ import (
 // Allowed) rather than silently inheriting an unintended decision.
 func TestDecisionTable_EveryRoleEveryEndpoint(t *testing.T) {
 	want := map[string]map[Role]bool{
-		EndpointStatus:    {RoleAdmin: true, RoleOperator: true, RoleReadOnly: true},
-		EndpointMetrics:   {RoleAdmin: true, RoleOperator: true, RoleReadOnly: true},
-		EndpointHealth:    {RoleAdmin: true, RoleOperator: true, RoleReadOnly: true},
-		EndpointPropose:   {RoleAdmin: true, RoleOperator: true, RoleReadOnly: false},
-		EndpointOutcome:   {RoleAdmin: true, RoleOperator: true, RoleReadOnly: false},
-		EndpointFault:     {RoleAdmin: true, RoleOperator: false, RoleReadOnly: false},
-		EndpointReloadTLS: {RoleAdmin: true, RoleOperator: false, RoleReadOnly: false},
-		EndpointBackup:    {RoleAdmin: true, RoleOperator: true, RoleReadOnly: false},
+		EndpointStatus:          {RoleAdmin: true, RoleOperator: true, RoleReadOnly: true},
+		EndpointMetrics:         {RoleAdmin: true, RoleOperator: true, RoleReadOnly: true},
+		EndpointHealth:          {RoleAdmin: true, RoleOperator: true, RoleReadOnly: true},
+		EndpointPropose:         {RoleAdmin: true, RoleOperator: true, RoleReadOnly: false},
+		EndpointOutcome:         {RoleAdmin: true, RoleOperator: true, RoleReadOnly: false},
+		EndpointFault:           {RoleAdmin: true, RoleOperator: false, RoleReadOnly: false},
+		EndpointReloadTLS:       {RoleAdmin: true, RoleOperator: false, RoleReadOnly: false},
+		EndpointBackup:          {RoleAdmin: true, RoleOperator: true, RoleReadOnly: false},
+		EndpointUpgradePrecheck: {RoleAdmin: true, RoleOperator: false, RoleReadOnly: false},
+		EndpointUpgradeFinalize: {RoleAdmin: true, RoleOperator: false, RoleReadOnly: false},
 	}
 	if len(want) != len(AllEndpoints) {
 		t.Fatalf("this test's want table has %d endpoints, AllEndpoints has %d — keep them in sync", len(want), len(AllEndpoints))

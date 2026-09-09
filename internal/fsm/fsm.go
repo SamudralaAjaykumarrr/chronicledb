@@ -49,6 +49,17 @@ type FSM struct {
 	mu       sync.Mutex
 	store    *mvcc.Store
 	outcomes map[RequestID]outcomeEntry
+
+	// clusterGeneration/controlOutcomes hold the state
+	// ApplySetClusterVersion mutates (clusterversion.go) — kept as
+	// separate fields/table from store/outcomes above rather than
+	// folded into CommitTxn's own outcome table, since a control
+	// command's idempotency/fingerprint semantics are deliberately
+	// simpler (see ApplySetClusterVersion's doc comment) and mixing the
+	// two tables would entangle CommitTxn's fingerprint-mismatch
+	// detection with a command kind it does not apply to.
+	clusterGeneration uint32
+	controlOutcomes   map[RequestID]Outcome
 }
 
 // New returns an FSM that applies commands against store. store may
@@ -57,7 +68,7 @@ type FSM struct {
 // recovery — replaying a durable command history into a fresh FSM, in
 // order, is the caller's responsibility (see internal/txn.Manager.recover).
 func New(store *mvcc.Store) *FSM {
-	return &FSM{store: store, outcomes: make(map[RequestID]outcomeEntry)}
+	return &FSM{store: store, outcomes: make(map[RequestID]outcomeEntry), controlOutcomes: make(map[RequestID]Outcome)}
 }
 
 // Store returns the FSM's underlying MVCC store, for read-only access

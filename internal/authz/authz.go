@@ -54,6 +54,14 @@ const (
 	// §5's own RBAC section: "operator may call operational
 	// endpoints... (future backup-trigger)").
 	EndpointBackup = "admin.backup"
+	// EndpointUpgradePrecheck gates /admin/upgrade/precheck
+	// (docs/enterprise-v1-plan.md §7 "Security implications:
+	// Precheck/finalize are admin-gated, audited actions").
+	EndpointUpgradePrecheck = "admin.upgrade.precheck"
+	// EndpointUpgradeFinalize gates /admin/upgrade/finalize
+	// (docs/enterprise-v1-plan.md §7, same RBAC note as
+	// EndpointUpgradePrecheck).
+	EndpointUpgradeFinalize = "admin.upgrade.finalize"
 )
 
 // AllEndpoints lists every endpoint the decision table below covers —
@@ -66,6 +74,7 @@ var AllEndpoints = []string{
 	EndpointPropose, EndpointOutcome,
 	EndpointFault, EndpointReloadTLS,
 	EndpointBackup,
+	EndpointUpgradePrecheck, EndpointUpgradeFinalize,
 }
 
 // AllRoles lists every fixed V1 role.
@@ -94,6 +103,13 @@ var decisionTable = map[string]map[Role]bool{
 	// backup triggering explicitly as an operator-permitted operational
 	// action, unlike /fault or membership changes.
 	EndpointBackup: {RoleAdmin: true, RoleOperator: true, RoleReadOnly: false},
+	// Precheck/finalize are admin-only, unlike backup-trigger
+	// (docs/enterprise-v1-plan.md §7 "Security implications:
+	// Precheck/finalize are admin-gated, audited actions") — an operator
+	// may trigger a backup but may not change the cluster's
+	// version-compatibility boundary.
+	EndpointUpgradePrecheck: {RoleAdmin: true, RoleOperator: false, RoleReadOnly: false},
+	EndpointUpgradeFinalize: {RoleAdmin: true, RoleOperator: false, RoleReadOnly: false},
 }
 
 // Allowed reports whether role may call endpoint, per the fixed V1 RBAC

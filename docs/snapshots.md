@@ -244,3 +244,29 @@ not share an implementation or a trigger. Conflating them (e.g. using
 snapshot creation as the *only* moment old versions are ever
 discarded, or vice versa) is exactly the kind of ambiguity this
 document exists to prevent.
+
+## 10. Phase `v0.4.0` (Compatibility / Rolling Upgrades) implementation decision (resolved)
+
+`docs/enterprise-v1-plan.md` §7 / [`docs/upgrades.md`](upgrades.md) /
+[`ADR-0017`](adr/0017-compatibility-and-rolling-upgrades.md) required
+this format to gain a "generation" concept alongside its existing
+`FormatVersion` (§5). The resolution: **no code change to this package
+at all.**
+
+`Encode`/`Decode`'s outer frame already carries the FSM state as an
+opaque blob behind an explicit, length-prefixed `fsmStateLen` field
+(§2's frame layout) — it was already, by construction, tolerant of the
+FSM state blob changing size for reasons this package has no opinion
+about. The actual generation-aware content (a trailing `ClusterGeneration`
+field, appended only once nonzero — the same additive-and-conditional
+discipline [`docs/wal.md`](wal.md) §14 uses for its own `Metadata`
+record) lives one layer down, inside `internal/fsm.EncodeState`'s own
+serialized state — see that function's doc comment and
+`internal/fsm/snapshot_test.go`'s
+`TestEncodeStateDecodeStateRoundTrip_ClusterGeneration`.
+
+This is a direct instance of §1's own founding principle ("one
+coordinated snapshot, not competing sources of truth") paying off: because
+this package never independently encodes or interprets FSM content, a
+change entirely internal to `internal/fsm`'s own state format required
+zero changes here to remain correct.

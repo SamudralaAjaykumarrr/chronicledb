@@ -73,11 +73,29 @@ func main() {
 		restoreFrom    = flag.String("restore-from", "", "restore -datadir from the backup at this directory before starting (must be empty/absent unless -force-overwrite is also set); the process exits after a successful restore is not required — normal startup continues against the now-restored data directory")
 		restoreUntil   = flag.String("restore-until", "", "PITR boundary log index to restore up to (empty = everything the backup includes); only meaningful with -restore-from")
 		forceOverwrite = flag.Bool("force-overwrite", false, "required in addition to -restore-from to restore over a -datadir that already contains WAL/snapshot state (DESTRUCTIVE RESTORE ISOLATION: this destroys that existing state)")
+
+		// Compatibility / Rolling Upgrades flag (docs/enterprise-v1-plan.md
+		// §7): a standalone dry-run against an already-running node's
+		// control plane, never touching -datadir/node.Open.
+		upgradePrecheckAddr = flag.String("upgrade-precheck", "", "dry-run: query an already-running node's HTTP control-plane address (host:port) for /admin/upgrade/precheck and print the result, then exit; does not start a node or touch -datadir (plain HTTP only in this release — see docs/upgrades.md)")
 	)
 	flag.Parse()
 
 	if *showVersion {
 		fmt.Println(version.String())
+		return
+	}
+
+	if *upgradePrecheckAddr != "" {
+		res, err := runUpgradePrecheck(*upgradePrecheckAddr, true)
+		out, _ := json.MarshalIndent(res, "", "  ")
+		fmt.Println(string(out))
+		if err != nil {
+			os.Exit(1)
+		}
+		if !res.Ready {
+			os.Exit(1)
+		}
 		return
 	}
 
@@ -306,6 +324,8 @@ func newControlServer(n *node.Node, logger *log.Logger, sec *security, clientTLS
 	s.mux.HandleFunc("/health", sec.wrap(authz.EndpointHealth, s.handleHealth))
 	s.mux.HandleFunc("/admin/reload-tls", sec.wrap(authz.EndpointReloadTLS, s.handleReloadTLS))
 	s.mux.HandleFunc("/admin/backup", sec.wrap(authz.EndpointBackup, s.handleBackup))
+	s.mux.HandleFunc("/admin/upgrade/precheck", sec.wrap(authz.EndpointUpgradePrecheck, s.handleUpgradePrecheck))
+	s.mux.HandleFunc("/admin/upgrade/finalize", sec.wrap(authz.EndpointUpgradeFinalize, s.handleUpgradeFinalize))
 	if enableFault {
 		s.mux.HandleFunc("/fault", sec.wrap(authz.EndpointFault, s.handleFault))
 	}
@@ -347,6 +367,16 @@ func (s *controlServer) handleMetrics(w http.ResponseWriter, r *http.Request) {
 	line("chronicledb_requestid_duplicates_total", "Propose calls resolved as a known-RequestID retry without a fresh Raft round", "counter", float64(m.RequestIDDuplicatesTotal))
 	line("chronicledb_snapshots_created_total", "local snapshots this node has created", "counter", float64(m.SnapshotsCreatedTotal))
 	line("chronicledb_snapshots_installed_total", "peer snapshots this node has installed", "counter", float64(m.SnapshotsInstalledTotal))
+
+	// Compatibility / Rolling Upgrades metrics (docs/enterprise-v1-plan.md
+	// §7 Observability: "cluster version gauge, per-node reported-version
+	// gauge... precheck pass/fail history, finalize event... as a
+	// distinct metric").
+	line("chronicledb_cluster_generation", "this node's currently applied cluster-version generation", "gauge", float64(st.ClusterGeneration))
+	line("chronicledb_node_max_supported_generation", "the highest cluster-version generation this binary understands", "gauge", float64(st.MaxSupportedGeneration))
+	line("chronicledb_upgrade_precheck_total", "UpgradePrecheck calls this node has made", "counter", float64(m.UpgradePrecheckTotal))
+	line("chronicledb_upgrade_finalize_total", "successful FinalizeUpgrade calls this node has made", "counter", float64(m.UpgradeFinalizeTotal))
+	line("chronicledb_upgrade_finalize_failed_total", "failed FinalizeUpgrade calls this node has made", "counter", float64(m.UpgradeFinalizeFailedTotal))
 
 	// Security Foundation metrics (docs/enterprise-v1-plan.md §5
 	// Observability: "auth success/failure counts (no credential value

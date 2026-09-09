@@ -158,3 +158,65 @@ func TestDecodeStateRejectsTrailingGarbage(t *testing.T) {
 		t.Fatal("DecodeState with trailing garbage bytes: expected an error, got nil")
 	}
 }
+
+// TestEncodeStateDecodeStateRoundTrip_ClusterGeneration proves the
+// generation-aware trailing field docs/enterprise-v1-plan.md §7
+// requires ("generation-aware encode/decode fuzz tests for each of the
+// five formats, including 'old generation still decodes under the new
+// binary' as an explicit assertion"):
+//
+//   - generation 0 (the default, and the ONLY value any pre-v0.4.0
+//     binary ever produces or expects) encodes byte-identical to a plain
+//     EncodeState call with no cluster-version command ever applied —
+//     the actual rollback-safety property, not merely "decodes
+//     somehow";
+//   - a state that has had a SetClusterVersionCommand applied encodes a
+//     4-byte-longer form that still round-trips through DecodeState.
+func TestEncodeStateDecodeStateRoundTrip_ClusterGeneration(t *testing.T) {
+	base := buildRichFSM(t)
+	baseBytes := base.EncodeState()
+
+	gen0 := buildRichFSM(t) // clusterGeneration still 0: never finalized
+	if got := gen0.EncodeState(); string(got) != string(baseBytes) {
+		t.Fatalf("generation-0 EncodeState is not byte-identical to the pre-v0.4.0 encoding — this breaks pre-finalize rollback compatibility")
+	}
+
+	finalized := buildRichFSM(t)
+	if _, err := finalized.ApplySetClusterVersion(4, SetClusterVersionCommand{RequestID: "finalize", TargetGeneration: 1}); err != nil {
+		t.Fatalf("ApplySetClusterVersion: %v", err)
+	}
+	finalizedBytes := finalized.EncodeState()
+	if len(finalizedBytes) != len(baseBytes)+4 {
+		t.Fatalf("finalized EncodeState length = %d, want exactly %d (base + 4-byte generation field)", len(finalizedBytes), len(baseBytes)+4)
+	}
+
+	restored, maxSeq, err := DecodeState(finalizedBytes)
+	if err != nil {
+		t.Fatalf("DecodeState(finalized): %v", err)
+	}
+	if got := restored.ClusterGeneration(); got != 1 {
+		t.Fatalf("restored ClusterGeneration = %d, want 1", got)
+	}
+	// The SetClusterVersionCommand's own CommitSeq (4) is not a CommitTxn
+	// CommitSeq and must not be folded into maxSeq — only buildRichFSM's
+	// own highest CommitSeq (2) should be reflected, proving
+	// control-command application never contaminates the
+	// snapshot-boundary consistency check DecodeState's caller relies on
+	// (docs/snapshots.md §5 point 3).
+	if maxSeq != 2 {
+		t.Fatalf("maxSeq = %d, want 2 (buildRichFSM's own highest CommitSeq; control commands must not affect this)", maxSeq)
+	}
+}
+
+// TestDecodeState_RejectsGenerationFieldWrongLength proves an "extra
+// bytes present but not exactly 0 or 4" state is genuinely malformed,
+// not a newer generation this build simply declines to guess at (see
+// DecodeState's own doc comment on this distinction).
+func TestDecodeState_RejectsGenerationFieldWrongLength(t *testing.T) {
+	data := buildRichFSM(t).EncodeState()
+	for _, extra := range [][]byte{{0x01}, {0x01, 0x02}, {0x01, 0x02, 0x03}, {0x01, 0x02, 0x03, 0x04, 0x05}} {
+		if _, _, err := DecodeState(append(append([]byte(nil), data...), extra...)); err == nil {
+			t.Fatalf("DecodeState with %d trailing bytes: expected an error, got nil", len(extra))
+		}
+	}
+}

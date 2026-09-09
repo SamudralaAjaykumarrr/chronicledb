@@ -387,3 +387,44 @@ for the exact scenario (a pre-existing entry, an `InstallSnapshot`-style
 forward jump, live appends, then a restart) and
 `docs/adr/0012-recovery-and-corruption-policy.md` for why this remains
 a fail-closed check for any layout it does not recognize as legitimate.
+
+## 14. Phase `v0.4.0` (Compatibility / Rolling Upgrades) implementation decisions (resolved)
+
+`docs/enterprise-v1-plan.md` §7 / [`docs/upgrades.md`](upgrades.md) /
+[`ADR-0017`](adr/0017-compatibility-and-rolling-upgrades.md) add one new
+field to `Metadata` (§8): `ClusterGeneration uint32` — the highest
+cluster-version generation this node has durably observed finalized.
+Two decisions resolve exactly how it is encoded, both already
+anticipated by this document's existing framing/version discipline
+rather than requiring a new one:
+
+- **Additive, conditional encoding.** `ClusterGeneration` is appended as
+  a trailing 4 bytes on the `Metadata` record's payload **only when
+  nonzero**. A not-yet-finalized node (the default, and the only state
+  any pre-`v0.4.0` binary ever wrote) therefore encodes a byte-identical
+  `Metadata` payload to every prior release — this is the actual
+  mechanism, not merely a documented promise, behind "a rolled-back old
+  binary can still read a not-yet-finalized node's metadata."
+- **`decodeMetadata`'s pre-existing trailing-bytes tolerance, now relied
+  on deliberately.** `decodeMetadata` never validated `len(b)` against
+  `11+idLen` — a property that, before this phase, was simply
+  incidental (there was nothing to validate against). This phase relies
+  on it deliberately: a pre-`v0.4.0` binary's own *unmodified*
+  `decodeMetadata`, given a metadata record a `v0.4.0+` binary wrote
+  *after* finalize (with a trailing `ClusterGeneration` field), still
+  correctly decodes `NodeID`/`FormatVersion`/`LatestSnapshotIndex` — it
+  simply never learns the trailing field exists. `Open` itself still
+  refuses to start (`ErrUnsupportedGeneration`) if `ClusterGeneration`
+  exceeds `internal/version.MaxSupportedGeneration` — but only a
+  `v0.4.0+` binary has that check compiled in at all; see
+  [`docs/upgrades.md`](upgrades.md) §5 for the old-binary case, which is
+  instead caught one layer up, at FSM-command-apply time.
+
+This is deliberately the *same* pattern §11/§12 above already use for
+adding new legitimate log layouts without weakening what still counts
+as corruption: extend the recognized-as-legitimate cases explicitly,
+never widen tolerance unconditionally. `TestEncodeDecodeMetadata_ClusterGeneration`,
+`TestDecodeMetadata_ToleratesTrailingBytesIgnoredByPreV040Decoder`, and
+`TestDecodeMetadata_RejectsWrongTrailingLength`
+(`internal/wal/generation_test.go`) are the regression pins for exactly
+these two decisions.

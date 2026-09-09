@@ -66,25 +66,37 @@ type Metrics struct {
 	// Observability: "duration, size, and success/failure counters").
 	BackupsTotal       metrics.Counter
 	BackupsFailedTotal metrics.Counter
+
+	// UpgradePrecheckTotal/UpgradeFinalizeTotal/UpgradeFinalizeFailedTotal
+	// count every UpgradePrecheck call and every FinalizeUpgrade
+	// attempt/failure this node has made (docs/enterprise-v1-plan.md §7
+	// Observability: "precheck pass/fail history, finalize event...as a
+	// distinct metric").
+	UpgradePrecheckTotal       metrics.Counter
+	UpgradeFinalizeTotal       metrics.Counter
+	UpgradeFinalizeFailedTotal metrics.Counter
 }
 
 // MetricsSnapshot is a point-in-time, safe-to-read-anywhere copy of a
 // Node's counters (mirroring Status's own snapshot pattern).
 type MetricsSnapshot struct {
-	ElectionsTotal            uint64
-	LeaderChangesTotal        uint64
-	ProposalsTotal            uint64
-	ProposalsRejectedTotal    uint64
-	ProposalsCommittedTotal   uint64
-	ProposalsAbortedTotal     uint64
-	ProposalsUnknownTotal     uint64
-	RequestIDDuplicatesTotal  uint64
-	SnapshotsCreatedTotal     uint64
-	SnapshotsInstalledTotal   uint64
-	RaftMessagesSentTotal     uint64
-	RaftMessagesReceivedTotal uint64
-	BackupsTotal              uint64
-	BackupsFailedTotal        uint64
+	ElectionsTotal             uint64
+	LeaderChangesTotal         uint64
+	ProposalsTotal             uint64
+	ProposalsRejectedTotal     uint64
+	ProposalsCommittedTotal    uint64
+	ProposalsAbortedTotal      uint64
+	ProposalsUnknownTotal      uint64
+	RequestIDDuplicatesTotal   uint64
+	SnapshotsCreatedTotal      uint64
+	SnapshotsInstalledTotal    uint64
+	RaftMessagesSentTotal      uint64
+	RaftMessagesReceivedTotal  uint64
+	BackupsTotal               uint64
+	BackupsFailedTotal         uint64
+	UpgradePrecheckTotal       uint64
+	UpgradeFinalizeTotal       uint64
+	UpgradeFinalizeFailedTotal uint64
 }
 
 // Metrics returns a snapshot of this node's current diagnostic
@@ -92,19 +104,22 @@ type MetricsSnapshot struct {
 func (n *Node) Metrics() MetricsSnapshot {
 	m := &n.metrics
 	return MetricsSnapshot{
-		ElectionsTotal:            m.ElectionsTotal.Value(),
-		LeaderChangesTotal:        m.LeaderChangesTotal.Value(),
-		ProposalsTotal:            m.ProposalsTotal.Value(),
-		ProposalsRejectedTotal:    m.ProposalsRejectedTotal.Value(),
-		ProposalsCommittedTotal:   m.ProposalsCommittedTotal.Value(),
-		ProposalsAbortedTotal:     m.ProposalsAbortedTotal.Value(),
-		ProposalsUnknownTotal:     m.ProposalsUnknownTotal.Value(),
-		RequestIDDuplicatesTotal:  m.RequestIDDuplicatesTotal.Value(),
-		SnapshotsCreatedTotal:     m.SnapshotsCreatedTotal.Value(),
-		SnapshotsInstalledTotal:   m.SnapshotsInstalledTotal.Value(),
-		RaftMessagesSentTotal:     m.RaftMessagesSentTotal.Value(),
-		RaftMessagesReceivedTotal: m.RaftMessagesReceivedTotal.Value(),
-		BackupsTotal:              m.BackupsTotal.Value(),
-		BackupsFailedTotal:        m.BackupsFailedTotal.Value(),
+		ElectionsTotal:             m.ElectionsTotal.Value(),
+		LeaderChangesTotal:         m.LeaderChangesTotal.Value(),
+		ProposalsTotal:             m.ProposalsTotal.Value(),
+		ProposalsRejectedTotal:     m.ProposalsRejectedTotal.Value(),
+		ProposalsCommittedTotal:    m.ProposalsCommittedTotal.Value(),
+		ProposalsAbortedTotal:      m.ProposalsAbortedTotal.Value(),
+		ProposalsUnknownTotal:      m.ProposalsUnknownTotal.Value(),
+		RequestIDDuplicatesTotal:   m.RequestIDDuplicatesTotal.Value(),
+		SnapshotsCreatedTotal:      m.SnapshotsCreatedTotal.Value(),
+		SnapshotsInstalledTotal:    m.SnapshotsInstalledTotal.Value(),
+		RaftMessagesSentTotal:      m.RaftMessagesSentTotal.Value(),
+		RaftMessagesReceivedTotal:  m.RaftMessagesReceivedTotal.Value(),
+		BackupsTotal:               m.BackupsTotal.Value(),
+		BackupsFailedTotal:         m.BackupsFailedTotal.Value(),
+		UpgradePrecheckTotal:       m.UpgradePrecheckTotal.Value(),
+		UpgradeFinalizeTotal:       m.UpgradeFinalizeTotal.Value(),
+		UpgradeFinalizeFailedTotal: m.UpgradeFinalizeFailedTotal.Value(),
 	}
 }

@@ -718,3 +718,161 @@ synchronous call with no other actor able to interleave).
 **Proof/test obligations**: `TestRestore_TargetNotCleanRequiresForce`;
 `cmd/chronicledb-node`'s `TestRunRestore_NonCleanTargetRequiresForce`
 and `TestRecordRestoreAudit_WritesVerifiableEntry`.
+
+## Compatibility / Rolling Upgrades invariants (`v0.4.0`, `docs/enterprise-v1-plan.md` §7)
+
+See [`docs/upgrades.md`](upgrades.md) and
+[`ADR-0017`](adr/0017-compatibility-and-rolling-upgrades.md) for the
+full architecture. These invariants govern `internal/version`'s
+`MaxSupportedGeneration`, `internal/wal`/`internal/fsm`'s generation-
+aware encode/decode, `internal/fsm`'s `ControlCommandMarker`/
+`SetClusterVersionCommand`, `internal/raft.Message.SenderGeneration`,
+and `internal/node`'s `UpgradePrecheck`/`FinalizeUpgrade`.
+
+### NO SILENT FORMAT MISINTERPRETATION
+
+**Statement**: A node never applies, replays, or installs a record/
+command/snapshot-state whose version or generation it does not
+recognize; it fails closed with a diagnostic rather than guessing at an
+unrecognized layout.
+
+**Scope**: `internal/wal.Open` (record/metadata format version, and
+`Metadata.ClusterGeneration` against `version.MaxSupportedGeneration`),
+`internal/fsm.DecodeCommitTxn`/`DecodeSetClusterVersion`/`DecodeState`,
+`internal/node.applyCommitted`/`applyControlEntry` (a committed control
+command whose `TargetGeneration` exceeds this binary's own
+`MaxSupportedGeneration` is refused even though it is already
+committed and durable — a determinism-preserving *local* refusal, never
+a divergent *replicated* decision).
+
+**Why it matters**: This is the same posture `RECOVERY NON-INVENTION`
+already takes for corrupted data, extended to "correctly framed but
+newer than this binary understands" data — the specific hazard a
+rolling upgrade introduces that a single-version deployment never
+faced.
+
+**Mechanism**: Every one of the five versioned surfaces
+(`docs/enterprise-v1-plan.md` §7) rejects an unrecognized version/
+generation with a distinct sentinel error
+(`wal.ErrUnsupportedVersion`/`ErrUnsupportedGeneration`,
+`fsm.ErrUnsupportedCommandVersion`/`ErrUnknownControlCommand`) rather
+than a generic decode failure, and — critically — this rejection is
+free on a pre-`v0.4.0` binary for the one new wire format this phase
+introduces: `fsm.ControlCommandMarker` (`0xF0`) is chosen to never
+collide with `commitTxnCommandVersion`'s own small, sequential range, so
+an unmodified pre-`v0.4.0` `DecodeCommitTxn` already fails closed on any
+control-command payload with no code change at all (see
+`ControlCommandMarker`'s doc comment).
+
+**Threatened by**: A future format change that reuses an existing
+version/generation value for genuinely different content, or that
+widens a decoder's tolerance (e.g. "any trailing byte count") instead of
+enumerating exactly which generations are understood.
+
+**Proof/test obligations**: `internal/fsm/clusterversion_test.go`
+(`TestControlCommandMarker_NeverCollidesWithCommitTxnVersion` — proves
+the free backward-compatibility property directly by feeding a real
+encoded control command into the *old* `DecodeCommitTxn` decoder);
+`internal/wal/generation_test.go`'s
+`TestOpenRefusesDataDirectoryFinalizedBeyondThisBinary`; the real
+mixed-binary `TestMixedVersion_OldBinaryRejectedAfterFinalize`
+(`cmd/chronicledb-node`, `-tags=integration`) — an actual pre-`v0.4.0`
+binary, rejoining a live, already-finalized cluster, fails closed with
+exactly this mechanism and its own process exits.
+
+### ROLLBACK BOUNDARY HONESTY
+
+**Statement**: The system never claims rollback safety past the last
+finalize boundary; a redeploy of an older binary is safe strictly before
+finalize and is deterministically, not merely operationally, refused
+once the cluster's agreed generation has moved forward.
+
+**Scope**: `internal/fsm.ApplySetClusterVersion` (the single place the
+agreed generation ever changes), `internal/wal.SetClusterGeneration`/
+`Open`, `internal/fsm.EncodeState`/`DecodeState`'s and
+`internal/wal.encodeMetadata`/`decodeMetadata`'s generation-0-is-
+byte-identical encoding discipline (the actual mechanism that makes
+pre-finalize rollback safe — not merely undocumented-but-working).
+
+**Why it matters**: An upgrade mechanism that quietly stops being
+reversible, without the system itself being able to say exactly when
+that happened, turns "rolling upgrade" into an unbounded risk instead of
+a bounded one.
+
+**Mechanism**: `ApplySetClusterVersion` accepts only
+`TargetGeneration == currentGeneration + 1` (single-step) and
+`TargetGeneration > currentGeneration` (strictly forward) — both a
+skip-ahead and a downgrade/sideways attempt are deterministic
+`StatusAborted` outcomes, evaluated identically by every replica from
+the same replicated command and prior state, never a Go error and never
+a per-node judgment call. Every generation-0 encoding
+(`fsm.encodeState`, `wal.encodeMetadata`) is required to be
+byte-identical to the pre-`v0.4.0` format — proven, not assumed — so
+"rollback is safe before finalize" is a property of the bytes on disk,
+not an operational promise layered on top of them.
+
+**Threatened by**: Allowing `ApplySetClusterVersion` to accept an
+arbitrary target (opening the door to skip-version upgrades this phase
+explicitly does not support), or unconditionally appending the
+generation field regardless of its value (which would silently break
+pre-finalize rollback compatibility — see `encodeState`'s and
+`encodeMetadata`'s own doc comments).
+
+**Proof/test obligations**:
+`TestApplySetClusterVersion_RollbackBoundaryHonesty`,
+`TestApplySetClusterVersion_MonotonicSingleStep`
+(`internal/fsm/clusterversion_test.go`);
+`TestEncodeStateDecodeStateRoundTrip_ClusterGeneration` and
+`TestEncodeDecodeMetadata_ClusterGeneration` (byte-identical-at-
+generation-0 assertions); the real mixed-binary
+`TestMixedVersion_RollbackBeforeFinalizeIsSafe` (safe side) and
+`TestMixedVersion_OldBinaryRejectedAfterFinalize` (refused side),
+`cmd/chronicledb-node`, `-tags=integration`.
+
+### MIXED-VERSION QUORUM SAFETY
+
+**Statement**: During an N/N+1 rolling-upgrade window, Raft quorum
+safety (`RAFT ELECTION SAFETY`, `QUORUM SAFETY`) continues to hold
+regardless of which subset of the cluster is on which binary version —
+a new-binary leader with an old-binary follower (or vice versa) never
+produces a state divergence.
+
+**Scope**: `internal/raft.Message.SenderGeneration`,
+`internal/node`'s wiring of it, and — the property that actually makes
+this safe rather than merely observed — every command a leader proposes
+before finalize is written in exactly generation-0's existing wire/
+command format, which every peer, old or new binary alike, already
+understands unchanged.
+
+**Why it matters**: This is the specific safety property that lets
+every later phase's own format changes (docs/enterprise-v1-plan.md §7's
+listed dependents) be rolled out one node at a time instead of requiring
+full-cluster downtime.
+
+**Mechanism**: `raft.Message.SenderGeneration` rides on every ordinary
+Raft message (not a separate preamble) via `encoding/gob`'s
+self-describing, field-tolerant wire encoding — a pre-`v0.4.0` peer
+simply never sets it (decoded as generation 0) and silently ignores it
+when present on a message a new binary sends (see that field's doc
+comment for why this was chosen over a dedicated handshake message,
+which an unmodified old binary could not have parsed at all). Separately
+and independently, `internal/node.FinalizeUpgrade`'s precheck refuses to
+propose a `SetClusterVersionCommand` at all unless every configured peer
+already reports the target generation — so no new-format command is
+ever proposed while a peer that could not understand it might still be
+part of the cluster.
+
+**Threatened by**: Proposing any command whose encoding depends on
+generation *before* finalize (this phase deliberately introduces none —
+every CommitTxn command a leader proposes pre-finalize is
+byte-identical to generation 0, regardless of which binary the leader
+is running).
+
+**Proof/test obligations**: The real mixed-binary
+`TestMixedVersion_CriticalUpgradeProofScenario`
+(`cmd/chronicledb-node`, `-tags=integration`) — the full numbered
+scenario: old-binary cluster, one-node-at-a-time upgrade, a forced real
+leader failover while versions are mixed, continued traffic and a
+RequestID retry across that failover, final-node upgrade, finalize, a
+full-cluster restart, and every acknowledged RequestID's outcome
+verified on every node throughout.

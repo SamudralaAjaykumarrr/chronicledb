@@ -29,6 +29,17 @@ var (
 	// contains a Metadata record, which should be impossible for any log
 	// this package created.
 	ErrNoMetadata = errors.New("wal: no metadata record found in non-empty durable log")
+
+	// ErrUnsupportedGeneration indicates the durable log's own Metadata
+	// records a ClusterGeneration (docs/enterprise-v1-plan.md §7) higher
+	// than this binary's internal/version.MaxSupportedGeneration — this
+	// data directory was finalized by a newer binary than the one now
+	// trying to open it. Open refuses unconditionally, before any Raft/
+	// FSM replay, rather than guessing at generation-specific content it
+	// may not understand (NO SILENT FORMAT MISINTERPRETATION). This is
+	// the rollback boundary docs/upgrades.md documents: rolling back to
+	// an older binary is only supported strictly before finalize.
+	ErrUnsupportedGeneration = errors.New("wal: data directory was finalized to a cluster generation newer than this binary supports")
 )
 
 // errTornTail is an internal sentinel distinguishing "not enough bytes

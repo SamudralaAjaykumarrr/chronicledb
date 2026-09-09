@@ -75,14 +75,16 @@ var endpointHTTP = map[string]struct {
 	method string
 	path   string
 }{
-	authz.EndpointStatus:    {"GET", "/status"},
-	authz.EndpointMetrics:   {"GET", "/metrics"},
-	authz.EndpointHealth:    {"GET", "/health"},
-	authz.EndpointPropose:   {"POST", "/propose"}, // body supplied per-call below (RequestID must be unique per test run)
-	authz.EndpointOutcome:   {"GET", "/outcome?requestId=nonexistent"},
-	authz.EndpointFault:     {"POST", "/fault?action=block&peer=ghost"},
-	authz.EndpointReloadTLS: {"POST", "/admin/reload-tls"},
-	authz.EndpointBackup:    {"POST", "/admin/backup?dir=" + rbacTestBackupDir},
+	authz.EndpointStatus:          {"GET", "/status"},
+	authz.EndpointMetrics:         {"GET", "/metrics"},
+	authz.EndpointHealth:          {"GET", "/health"},
+	authz.EndpointPropose:         {"POST", "/propose"}, // body supplied per-call below (RequestID must be unique per test run)
+	authz.EndpointOutcome:         {"GET", "/outcome?requestId=nonexistent"},
+	authz.EndpointFault:           {"POST", "/fault?action=block&peer=ghost"},
+	authz.EndpointReloadTLS:       {"POST", "/admin/reload-tls"},
+	authz.EndpointBackup:          {"POST", "/admin/backup?dir=" + rbacTestBackupDir},
+	authz.EndpointUpgradePrecheck: {"GET", "/admin/upgrade/precheck"},
+	authz.EndpointUpgradeFinalize: {"POST", "/admin/upgrade/finalize"},
 }
 
 func TestRBAC_DecisionTable_HTTPLayer_EveryRoleEveryEndpoint(t *testing.T) {

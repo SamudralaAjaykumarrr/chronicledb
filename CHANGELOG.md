@@ -4,6 +4,60 @@ All notable changes to ChronicleDB are documented here. Format loosely
 follows [Keep a Changelog](https://keepachangelog.com/); versioning
 follows [`docs/versioning.md`](docs/versioning.md) (SemVer, pre-1.0).
 
+## [Unreleased]
+
+Compatibility / Rolling Upgrades — the third phase of the
+`docs/enterprise-v1-plan.md` Enterprise V1 roadmap (§7, target release
+`v0.4.0`, not yet tagged). See that document and
+`docs/adr/0017-compatibility-and-rolling-upgrades.md` for the complete
+design and `docs/upgrades.md` for the operational runbook this work
+adds. This is **implementation work toward `v0.4.0`, not a release** —
+no maturity claim changes, nothing here is tagged, and Enterprise V1 is
+not claimed complete.
+
+### Added
+
+- **Compatibility / Rolling Upgrades** (`docs/enterprise-v1-plan.md`
+  §7): explicit version/generation checking across all five surfaces
+  that phase names — wire protocol (`internal/raft.Message.SenderGeneration`,
+  gob-encoded so a pre-`v0.4.0` peer tolerates it for free), WAL format
+  (`internal/wal.Metadata.ClusterGeneration`, additive/conditional
+  encoding), snapshot format (no code change needed — already
+  generation-agnostic by construction, see `docs/snapshots.md` §10), FSM
+  command format (`internal/fsm.ControlCommandMarker`,
+  `SetClusterVersionCommand`, dispatched ahead of the existing
+  `CommitTxnCommand` decode path), and metadata/schema format
+  (`internal/sql/schema.go`'s pre-existing version byte, unchanged).
+- A cluster-wide, Raft-replicated "agreed generation"
+  (`internal/fsm.ApplySetClusterVersion`): N/N+1-only, strictly-forward,
+  deterministic across every replica.
+- `internal/node.UpgradePrecheck`/`FinalizeUpgrade`, new admin-gated,
+  audited HTTP endpoints `/admin/upgrade/precheck` (read-only) and
+  `/admin/upgrade/finalize`, and a standalone `-upgrade-precheck` CLI
+  dry-run flag.
+- New invariants (`docs/invariants.md`): `NO SILENT FORMAT
+  MISINTERPRETATION`, `ROLLBACK BOUNDARY HONESTY`, `MIXED-VERSION
+  QUORUM SAFETY`. New `ADR-0017`. New `docs/upgrades.md` (the five
+  surfaces, the precheck/finalize runbook, rollback/downgrade
+  semantics, failure semantics, documented deviations from the plan's
+  literal handshake wording). `docs/versioning.md`, `docs/wal.md`, and
+  `docs/snapshots.md` each gain a resolved-decisions section for this
+  phase. `docs/configuration.md` gains `-upgrade-precheck`.
+
+Proven with a real mixed-binary cluster: two actual, independently
+built `chronicledb-node` binaries (the pre-`v0.4.0` baseline commit,
+checked out into a temporary `git worktree` and built from there, and
+this working tree's own current binary) run together across the full
+critical proof scenario — old-binary cluster start, continued traffic,
+one-node-at-a-time upgrade, a forced real leader failover while
+versions are mixed, continued traffic and a RequestID retry across that
+failover, final-node upgrade, precheck, finalize, a full-cluster
+restart, and every acknowledged RequestID's outcome verified on every
+node — plus a dedicated real-binary proof of safe pre-finalize rollback
+and correct, fail-closed post-finalize rollback refusal (the old
+binary's own unmodified command decoder rejects the replicated finalize
+command it cannot understand, and its process exits).
+
 ## [0.3.0] - 2026-09-08
 
 Backup / Disaster Recovery / PITR — the second phase of the

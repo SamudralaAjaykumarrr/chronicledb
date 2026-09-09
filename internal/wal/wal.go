@@ -13,6 +13,7 @@ import (
 	"sync"
 
 	"github.com/SamudralaAjaykumarrr/chronicledb/internal/storage"
+	"github.com/SamudralaAjaykumarrr/chronicledb/internal/version"
 )
 
 // DefaultSegmentMaxSize is the segment-rotation size threshold used when
@@ -233,6 +234,11 @@ func Open(dir string, opts Options) (*WAL, *RecoveryReport, error) {
 	if meta.FormatVersion != FormatVersion {
 		w.current.Close()
 		return nil, nil, fmt.Errorf("wal: %w: metadata format version %d, expected %d", ErrUnsupportedVersion, meta.FormatVersion, FormatVersion)
+	}
+	if meta.ClusterGeneration > version.MaxSupportedGeneration {
+		w.current.Close()
+		return nil, nil, fmt.Errorf("wal: %w: data directory finalized to cluster generation %d, this binary supports up to %d",
+			ErrUnsupportedGeneration, meta.ClusterGeneration, version.MaxSupportedGeneration)
 	}
 
 	// The winning Metadata record (last one seen, per docs/wal.md §9) is
@@ -516,6 +522,50 @@ func (w *WAL) AppendMetadataSnapshot(uptoIndex uint64) error {
 	}
 	w.metadata = meta
 	w.firstLogIndex = uptoIndex + 1
+	return nil
+}
+
+// SetClusterGeneration durably records that this node has now applied a
+// cluster-version finalize up to generation, updating the Metadata
+// record exactly as AppendMetadataSnapshot does for LatestSnapshotIndex
+// above (docs/enterprise-v1-plan.md §7). Called by internal/node after
+// FSM.ApplySetClusterVersion durably commits the corresponding
+// SetClusterVersionCommand, so a restart can refuse to proceed (Open's
+// ErrUnsupportedGeneration check above) before ever touching Raft/FSM
+// replay if the binary restarting is now older than what this data
+// directory was finalized to.
+//
+// generation must be monotonically non-decreasing, mirroring
+// FSM.ApplySetClusterVersion's own ROLLBACK BOUNDARY HONESTY rule — a
+// caller asking to move it backward is a local programming error, not
+// a legitimate operation, so it is rejected rather than silently
+// accepted.
+func (w *WAL) SetClusterGeneration(generation uint32) error {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if w.closed {
+		return ErrClosed
+	}
+	if generation < w.metadata.ClusterGeneration {
+		return fmt.Errorf("wal: SetClusterGeneration: %d is behind current generation %d", generation, w.metadata.ClusterGeneration)
+	}
+	if generation > version.MaxSupportedGeneration {
+		// Defense in depth: internal/node already refuses to apply a
+		// control command whose target exceeds its own capability before
+		// ever calling this method, but this method must never itself
+		// become a way to durably record a generation this binary could
+		// not, on its own, have honestly reached.
+		return fmt.Errorf("wal: SetClusterGeneration: %d exceeds this binary's max supported generation %d: %w", generation, version.MaxSupportedGeneration, ErrUnsupportedGeneration)
+	}
+	meta := w.metadata
+	meta.ClusterGeneration = generation
+	if err := w.appendLocked(RecordTypeMetadata, encodeMetadata(meta)); err != nil {
+		return err
+	}
+	if err := w.current.Sync(); err != nil {
+		return err
+	}
+	w.metadata = meta
 	return nil
 }
 

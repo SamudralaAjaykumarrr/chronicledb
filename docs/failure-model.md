@@ -200,6 +200,48 @@ Full worked scenario in [`docs/replication.md`](replication.md) §5.
   actually violated under an asymmetric partition: see
   [`docs/testing-strategy.md`](testing-strategy.md) §7.1.
 
+### 2.9a Leader failover during a mixed-version rolling upgrade (`v0.4.0`)
+
+- A new-binary leader with an old-binary follower, or vice versa, during
+  the window between rolling one node at a time and calling `finalize`
+  ([`docs/upgrades.md`](upgrades.md)).
+- **Must never happen**: a state divergence between old- and new-binary
+  replicas. Every command a leader proposes before `finalize` is written
+  in generation 0's exact existing format, understood identically by
+  every replica regardless of binary version — this is `MIXED-VERSION
+  QUORUM SAFETY` ([`docs/invariants.md`](invariants.md)).
+- **Client-visible**: an ordinary leader failover (a brief window of
+  unavailability for new commits, per §2.8) — nothing distinguishes it
+  from a same-version failover from the client's point of view. A
+  RequestID retry against the new leader resolves normally, including
+  when the new leader is running a different binary version than the
+  one that originally accepted the request.
+- **Status (`v0.4.0`)**: `cmd/chronicledb-node/mixed_version_test.go::TestMixedVersion_CriticalUpgradeProofScenario`
+  (`-tags=integration`) forces a real `SIGKILL` of whichever node is
+  leader while the cluster is genuinely mixed-version (built from two
+  actual, independently-built binaries), then proves a fresh write and a
+  same-`RequestID` retry both commit correctly against the new leader.
+
+### 2.9b Old binary rejoining a cluster already finalized past it (`v0.4.0`)
+
+- An operator mistakenly redeploys a pre-upgrade binary onto a node
+  after `finalize` has already run — the rollback boundary
+  ([`docs/upgrades.md`](upgrades.md) §5).
+- **Must never happen**: silent misinterpretation of the replicated
+  finalize command. `NO SILENT FORMAT MISINTERPRETATION`
+  ([`docs/invariants.md`](invariants.md)) requires the old binary to
+  fail closed instead.
+- **Client-visible**: the rejoining node never becomes a functioning,
+  correctly-participating member of the cluster — it receives ordinary
+  replication traffic, attempts to apply the finalize command, fails
+  with a diagnostic (`unsupported CommitTxn command version`), and its
+  own process exits. The rest of the cluster (every node still on a
+  compatible binary) is entirely unaffected — this is a single node's
+  own local, deterministic refusal, never a cluster-wide safety issue.
+- **Status (`v0.4.0`)**: `cmd/chronicledb-node/mixed_version_test.go::TestMixedVersion_OldBinaryRejectedAfterFinalize`
+  proves this with a real, unmodified pre-`v0.4.0` binary rejoining a
+  real, already-finalized live cluster.
+
 ### 2.9 Slow follower
 
 - Falls behind `matchIndex`-wise; leader continues sending; if it

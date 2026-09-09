@@ -17,6 +17,7 @@ import (
 	"github.com/SamudralaAjaykumarrr/chronicledb/internal/raft"
 	"github.com/SamudralaAjaykumarrr/chronicledb/internal/snapshot"
 	"github.com/SamudralaAjaykumarrr/chronicledb/internal/transport"
+	"github.com/SamudralaAjaykumarrr/chronicledb/internal/version"
 	"github.com/SamudralaAjaykumarrr/chronicledb/internal/wal"
 )
 
@@ -153,6 +154,14 @@ type Status struct {
 	AppliedIndex  uint64
 	LastIndex     raft.Index
 	SnapshotIndex raft.Index
+	// ClusterGeneration is this node's currently applied FSM cluster
+	// generation (docs/enterprise-v1-plan.md §7) — 0 until a finalize
+	// has actually been applied (live, or replayed on restart).
+	ClusterGeneration uint32
+	// MaxSupportedGeneration is this node's own binary capability
+	// (internal/version.MaxSupportedGeneration) — the generation
+	// UpgradePrecheck/FinalizeUpgrade would target next.
+	MaxSupportedGeneration uint32
 }
 
 type waiter struct {
@@ -190,6 +199,67 @@ type backupReq struct {
 	continuous bool
 	clusterID  string
 	resultCh   chan backupResult
+}
+
+// controlProposeReq is a pre-encoded, non-CommitTxn proposal (currently
+// only fsm.SetClusterVersionCommand — see ProposeControl) handed to
+// run's event-loop goroutine, mirroring proposeReq but without
+// CommitTxn's Precheck fast-path (docs/enterprise-v1-plan.md §7):
+// control commands are rare admin actions, not the hot client path
+// that optimization exists for.
+type controlProposeReq struct {
+	requestID fsm.RequestID
+	payload   []byte
+	resultCh  chan proposeResult
+}
+
+// PeerGenerationInfo is one peer's last-known compatibility generation
+// as observed via live Raft traffic (docs/enterprise-v1-plan.md §7's
+// wire-protocol version handshake — see raft.Message.SenderGeneration's
+// doc comment for why it rides on ordinary messages rather than a
+// separate preamble).
+type PeerGenerationInfo struct {
+	// Generation is the peer's last-reported internal/version.MaxSupportedGeneration.
+	// Meaningless when Known is false.
+	Generation uint32
+	// Known is false until at least one message from this peer has ever
+	// been received — an operator running precheck against a cluster
+	// that has never exchanged a single Raft message with some
+	// configured peer (e.g. that peer's process was never started) must
+	// see "unknown," never a misleading assumed 0.
+	Known bool
+}
+
+// PrecheckResult is UpgradePrecheck's answer (docs/enterprise-v1-plan.md
+// §7 "precheck confirms every live node reports support for the target
+// version").
+type PrecheckResult struct {
+	// LocalClusterGeneration is this node's own currently-applied FSM
+	// cluster generation (mirrors Status.ClusterGeneration).
+	LocalClusterGeneration uint32
+	// LocalMaxSupportedGeneration is this node's own binary capability.
+	LocalMaxSupportedGeneration uint32
+	// TargetGeneration is the generation FinalizeUpgrade would attempt
+	// to raise the cluster to — always LocalMaxSupportedGeneration
+	// (V1 supports only N/N+1 adjacent-generation operation, never an
+	// arbitrary caller-chosen target).
+	TargetGeneration uint32
+	// Peers reports every OTHER configured cluster member's last-known
+	// generation (this node's own entry is never included — see
+	// LocalClusterGeneration/LocalMaxSupportedGeneration above).
+	Peers map[string]PeerGenerationInfo
+	// AlreadyFinalized is true when LocalClusterGeneration already
+	// equals TargetGeneration — finalize would have nothing to do.
+	AlreadyFinalized bool
+	// Ready is true iff every entry in Peers is Known and its Generation
+	// is >= TargetGeneration, and AlreadyFinalized is false — i.e. iff
+	// FinalizeUpgrade would actually be attempted and expected to
+	// succeed right now.
+	Ready bool
+}
+
+type precheckReq struct {
+	resultCh chan PrecheckResult
 }
 
 type pendingRead struct {
@@ -313,9 +383,20 @@ type Node struct {
 	sentSeqCounter uint64
 	ackSeq         map[raft.NodeID]uint64
 
+	// peerGenerations holds each peer's last-known
+	// internal/version.MaxSupportedGeneration, updated only from run's
+	// event-loop goroutine (see the message-receive case in run) —
+	// exactly the same single-goroutine-ownership discipline as every
+	// other field in this block, and why UpgradePrecheck must dispatch
+	// through precheckCh rather than reading this map directly from an
+	// arbitrary caller goroutine (docs/enterprise-v1-plan.md §7).
+	peerGenerations map[raft.NodeID]uint32
+
 	proposeCh   chan proposeReq
+	controlCh   chan controlProposeReq
 	readIndexCh chan readIndexReq
 	backupCh    chan backupReq
+	precheckCh  chan precheckReq
 	stopCh      chan struct{}
 	doneCh      chan struct{}
 	stopOnce    sync.Once
@@ -468,22 +549,25 @@ func Open(cfg Config) (*Node, error) {
 	}
 
 	n := &Node{
-		cfg:            cfg,
-		core:           core,
-		walog:          w,
-		storage:        st,
-		snapMgr:        snapMgr,
-		tr:             tr,
-		identityHolder: identityHolder,
-		logger:         cfg.Logger,
-		appliedIndex:   baseIndex,
-		waiters:        make(map[raft.Index]waiter),
-		ackSeq:         make(map[raft.NodeID]uint64, len(cfg.Peers)),
-		proposeCh:      make(chan proposeReq),
-		readIndexCh:    make(chan readIndexReq),
-		backupCh:       make(chan backupReq),
-		stopCh:         make(chan struct{}),
-		doneCh:         make(chan struct{}),
+		cfg:             cfg,
+		core:            core,
+		walog:           w,
+		storage:         st,
+		snapMgr:         snapMgr,
+		tr:              tr,
+		identityHolder:  identityHolder,
+		logger:          cfg.Logger,
+		appliedIndex:    baseIndex,
+		waiters:         make(map[raft.Index]waiter),
+		ackSeq:          make(map[raft.NodeID]uint64, len(cfg.Peers)),
+		peerGenerations: make(map[raft.NodeID]uint32, len(cfg.Peers)),
+		proposeCh:       make(chan proposeReq),
+		controlCh:       make(chan controlProposeReq),
+		readIndexCh:     make(chan readIndexReq),
+		backupCh:        make(chan backupReq),
+		precheckCh:      make(chan precheckReq),
+		stopCh:          make(chan struct{}),
+		doneCh:          make(chan struct{}),
 	}
 	n.fsmachine.Store(fsmachine)
 	n.electionArmed = true
@@ -570,14 +654,16 @@ func (n *Node) Status() Status {
 func (n *Node) refreshStatusLocked() {
 	n.statusMu.Lock()
 	n.status = Status{
-		ID:            n.cfg.ID,
-		Role:          n.core.Role(),
-		Term:          n.core.CurrentTerm(),
-		Leader:        n.core.LeaderID(),
-		CommitIndex:   n.core.CommitIndex(),
-		AppliedIndex:  n.appliedIndex,
-		LastIndex:     n.core.LastIndex(),
-		SnapshotIndex: n.core.SnapshotIndex(),
+		ID:                     n.cfg.ID,
+		Role:                   n.core.Role(),
+		Term:                   n.core.CurrentTerm(),
+		Leader:                 n.core.LeaderID(),
+		CommitIndex:            n.core.CommitIndex(),
+		AppliedIndex:           n.appliedIndex,
+		LastIndex:              n.core.LastIndex(),
+		SnapshotIndex:          n.core.SnapshotIndex(),
+		ClusterGeneration:      n.fsmachine.Load().ClusterGeneration(),
+		MaxSupportedGeneration: version.MaxSupportedGeneration,
 	}
 	n.statusMu.Unlock()
 }
@@ -592,6 +678,198 @@ func (n *Node) Stop() {
 }
 
 func (n *Node) majority() int { return len(n.cfg.Peers)/2 + 1 }
+
+// recordPeerGeneration updates this node's last-known view of peer's
+// compatibility generation (docs/enterprise-v1-plan.md §7). Call only
+// from run's goroutine (see peerGenerations' doc comment). A zero
+// value legitimately means "this peer has never set SenderGeneration"
+// — every pre-v0.4.0 binary — so it is recorded exactly like any other
+// value, not treated specially: UpgradePrecheck's own >= comparison
+// against a nonzero target generation is what actually makes an
+// unset/0 peer report as "not ready," not a special case here.
+func (n *Node) recordPeerGeneration(peer raft.NodeID, gen uint32) {
+	if peer == "" || peer == n.cfg.ID {
+		return
+	}
+	n.peerGenerations[peer] = gen
+}
+
+// computePrecheck builds a PrecheckResult from this node's current
+// view. Call only from run's goroutine.
+func (n *Node) computePrecheck() PrecheckResult {
+	target := version.MaxSupportedGeneration
+	local := n.fsmachine.Load().ClusterGeneration()
+	peers := make(map[string]PeerGenerationInfo, len(n.cfg.Peers))
+	ready := local < target
+	for _, p := range n.cfg.Peers {
+		if p == n.cfg.ID {
+			continue
+		}
+		gen, known := n.peerGenerations[p]
+		peers[string(p)] = PeerGenerationInfo{Generation: gen, Known: known}
+		if !known || gen < target {
+			ready = false
+		}
+	}
+	return PrecheckResult{
+		LocalClusterGeneration:      local,
+		LocalMaxSupportedGeneration: target,
+		TargetGeneration:            target,
+		Peers:                       peers,
+		AlreadyFinalized:            local >= target,
+		Ready:                       ready,
+	}
+}
+
+// UpgradePrecheck reports this node's current view of every configured
+// peer's compatibility generation, and whether FinalizeUpgrade would
+// currently be expected to succeed (docs/enterprise-v1-plan.md §7
+// "precheck confirms every live node reports support for the target
+// version"). It is a read-only, dry-run check: it never proposes
+// anything and never mutates cluster state — safe to call as often as
+// an operator likes (e.g. the -upgrade-precheck CLI flag, or repeatedly
+// while rolling nodes one at a time per docs/upgrades.md).
+//
+// Called against a follower, this view can be incomplete: a follower
+// only ever exchanges Raft messages directly with the leader (plus
+// whichever peers it happened to vote for/against during a past
+// election), never a full mesh of pairwise traffic with every other
+// follower, so an entry can legitimately show Known=false for a peer
+// that IS actually reachable and ready — this is why FinalizeUpgrade
+// only ever consults its own precheck view after first confirming it is
+// leader (see that method). Prefer calling this against the current
+// leader (docs/upgrades.md's runbook does) for the authoritative
+// picture.
+func (n *Node) UpgradePrecheck(ctx context.Context) (PrecheckResult, error) {
+	req := precheckReq{resultCh: make(chan PrecheckResult, 1)}
+	select {
+	case n.precheckCh <- req:
+	case <-ctx.Done():
+		return PrecheckResult{}, ctx.Err()
+	case <-n.doneCh:
+		return PrecheckResult{}, ErrNodeStopped
+	}
+	select {
+	case res := <-req.resultCh:
+		n.metrics.UpgradePrecheckTotal.Inc()
+		return res, nil
+	case <-ctx.Done():
+		return PrecheckResult{}, ctx.Err()
+	case <-n.doneCh:
+		return PrecheckResult{}, ErrNodeStopped
+	}
+}
+
+// ProposeControl submits a pre-encoded FSM control command (currently
+// only fsm.EncodeSetClusterVersion's output — see FinalizeUpgrade) as a
+// replicated command, mirroring Propose's leader-gated, event-loop-
+// dispatched shape but without CommitTxn's Precheck idempotency
+// fast-path (see controlProposeReq's doc comment). Exported so a future
+// control-command kind beyond SetClusterVersion (none exists yet) can
+// reuse this same plumbing without internal/node needing to grow a new
+// per-kind Propose* method each time.
+func (n *Node) ProposeControl(ctx context.Context, requestID fsm.RequestID, payload []byte) (fsm.Outcome, error) {
+	req := controlProposeReq{requestID: requestID, payload: payload, resultCh: make(chan proposeResult, 1)}
+	select {
+	case n.controlCh <- req:
+	case <-ctx.Done():
+		return fsm.Outcome{}, ctx.Err()
+	case <-n.doneCh:
+		return fsm.Outcome{}, ErrNodeStopped
+	}
+	select {
+	case res := <-req.resultCh:
+		return res.outcome, res.err
+	case <-ctx.Done():
+		return fsm.Outcome{}, ctx.Err()
+	case <-n.doneCh:
+		return fsm.Outcome{}, ErrNodeStopped
+	}
+}
+
+// ErrUpgradeNotReady is returned by FinalizeUpgrade when
+// UpgradePrecheck reports the cluster is not yet ready (some configured
+// peer has never been heard from, or reports a generation below the
+// target) — docs/enterprise-v1-plan.md §7 Failure semantics: "finalize
+// called while any node still reports an old version fails the
+// finalize action outright... rather than partially finalizing." No
+// Raft proposal is even attempted in this case.
+var ErrUpgradeNotReady = errors.New("node: upgrade precheck not satisfied; not every configured cluster member currently reports support for the target generation")
+
+// ErrAlreadyFinalized is returned by FinalizeUpgrade when this node's
+// cluster generation already equals its own binary's max supported
+// generation — there is nothing further to finalize to.
+var ErrAlreadyFinalized = errors.New("node: cluster is already finalized at this binary's max supported generation")
+
+// FinalizeUpgrade is the admin-triggered action that durably, cluster-
+// wide raises the agreed cluster generation to this node's own
+// internal/version.MaxSupportedGeneration (docs/enterprise-v1-plan.md
+// §7 "finalize is an explicit, admin-gated, audited action that raises
+// the cluster version once every node has actually been upgraded").
+// It first runs the identical check UpgradePrecheck reports (never
+// trusting a caller to have checked separately — see Failure
+// semantics), and only if that passes does it propose a
+// SetClusterVersionCommand through the ordinary Raft log, exactly like
+// any other replicated command: a crash between precheck passing and
+// this call returning leaves the command either fully committed (by
+// the underlying Raft/FSM machinery this proposal path already shares
+// with CommitTxn) or not proposed/committed at all, never partially
+// applied.
+//
+// FinalizeUpgrade must be called against the current leader (like
+// Propose/BeginReadIndex, it returns *NotLeaderError otherwise) — an
+// operator/CLI caller retries against the leader hint exactly as any
+// other client of this node's HTTP control plane already does for
+// /propose.
+func (n *Node) FinalizeUpgrade(ctx context.Context) (fsm.Outcome, error) {
+	// Leadership is checked first, before precheck: a non-leader's own
+	// peerGenerations view is architecturally incomplete (a follower only
+	// ever exchanges Raft messages directly with the leader, plus
+	// whichever peers it happened to vote for/against during a past
+	// election — never a full mesh of pairwise traffic with every other
+	// follower), so a non-leader calling precheck could see "not ready"
+	// for reasons entirely unrelated to whether the actual leader is
+	// ready to finalize. Failing with NotLeaderError up front, before
+	// ever consulting that possibly-incomplete view, keeps this honest:
+	// only the leader's own precheck view is ever actually used to gate
+	// a real finalize decision.
+	if st := n.Status(); st.Role != raft.Leader {
+		return fsm.Outcome{}, &NotLeaderError{Leader: st.Leader}
+	}
+
+	pre, err := n.UpgradePrecheck(ctx)
+	if err != nil {
+		return fsm.Outcome{}, err
+	}
+	if pre.AlreadyFinalized {
+		return fsm.Outcome{}, ErrAlreadyFinalized
+	}
+	if !pre.Ready {
+		n.metrics.UpgradeFinalizeFailedTotal.Inc()
+		return fsm.Outcome{}, ErrUpgradeNotReady
+	}
+
+	// Deterministic per-target RequestID (not per-call randomness): a
+	// retried finalize call targeting the same generation — e.g. after a
+	// client-visible timeout/crash mid-call, docs/enterprise-v1-plan.md
+	// §7's "kill the process that issued finalize mid-call" chaos
+	// scenario — reuses the identical RequestID, so
+	// FSM.ApplySetClusterVersion's own idempotency table (not a second,
+	// ad hoc retry mechanism) is what makes the retry safe.
+	reqID := fsm.RequestID(fmt.Sprintf("\x00chronicledb-finalize\x00target=%d", pre.TargetGeneration))
+	payload := fsm.EncodeSetClusterVersion(fsm.SetClusterVersionCommand{RequestID: reqID, TargetGeneration: pre.TargetGeneration})
+	outcome, err := n.ProposeControl(ctx, reqID, payload)
+	if err != nil {
+		n.metrics.UpgradeFinalizeFailedTotal.Inc()
+		return fsm.Outcome{}, err
+	}
+	if outcome.Status == fsm.StatusAborted {
+		n.metrics.UpgradeFinalizeFailedTotal.Inc()
+		return outcome, fmt.Errorf("node: finalize to generation %d was rejected by replicated cluster-version state (concurrent finalize, or generation moved between precheck and propose)", pre.TargetGeneration)
+	}
+	n.metrics.UpgradeFinalizeTotal.Inc()
+	return outcome, nil
+}
 
 // Propose submits cmd as a replicated mutation (docs/architecture.md
 // §6's request path; this phase's brief's proposal path). It first
@@ -733,6 +1011,7 @@ func (n *Node) run() {
 			n.tick()
 		case msg := <-n.tr.Recv():
 			n.metrics.RaftMessagesReceivedTotal.Inc()
+			n.recordPeerGeneration(msg.From, msg.SenderGeneration)
 			if msg.Type == raft.MsgInstallSnapshotRequest {
 				n.handleInstallSnapshot(msg)
 			} else {
@@ -740,10 +1019,14 @@ func (n *Node) run() {
 			}
 		case req := <-n.proposeCh:
 			n.handlePropose(req)
+		case req := <-n.controlCh:
+			n.handleControlPropose(req)
 		case req := <-n.readIndexCh:
 			n.handleReadIndex(req)
 		case req := <-n.backupCh:
 			n.handleBackup(req)
+		case req := <-n.precheckCh:
+			req.resultCh <- n.computePrecheck()
 		case <-n.stopCh:
 			return
 		}
@@ -853,6 +1136,30 @@ func (n *Node) handlePropose(req proposeReq) {
 	n.processOutput(out)
 }
 
+// handleControlPropose is the leader-gated entry point for a control
+// command (currently only FinalizeUpgrade's SetClusterVersionCommand),
+// mirroring handlePropose exactly except for the missing CommitTxn-only
+// Precheck fast-path (see controlProposeReq's doc comment).
+func (n *Node) handleControlPropose(req controlProposeReq) {
+	if n.core.Role() != raft.Leader {
+		req.resultCh <- proposeResult{err: &NotLeaderError{Leader: n.core.LeaderID()}}
+		return
+	}
+	out := n.core.Step(raft.Input{Kind: raft.InputPropose, ProposeData: req.payload})
+	if out.ProposalRejected {
+		req.resultCh <- proposeResult{err: &NotLeaderError{Leader: out.LeaderHint}}
+		return
+	}
+	if out.PersistRequest == nil || len(out.PersistRequest.Entries) != 1 {
+		n.fail(fmt.Errorf("node: unexpected control-propose output shape: %+v", out))
+		req.resultCh <- proposeResult{err: ErrNodeStopped}
+		return
+	}
+	idx := out.PersistRequest.Entries[0].Index
+	n.waiters[idx] = waiter{requestID: req.requestID, resultCh: req.resultCh}
+	n.processOutput(out)
+}
+
 func (n *Node) handleReadIndex(req readIndexReq) {
 	if n.core.Role() != raft.Leader {
 		req.resultCh <- readResult{err: &NotLeaderError{Leader: n.core.LeaderID()}}
@@ -931,6 +1238,12 @@ func (n *Node) processOutput(out raft.Output) {
 	}
 
 	for _, m := range out.Messages {
+		// Stamp this node's own compatibility generation on every
+		// outbound message (docs/enterprise-v1-plan.md §7's wire-protocol
+		// version handshake — see raft.Message.SenderGeneration's doc
+		// comment). raft.Core itself never sets this field; only the
+		// driver does, exactly like m.Seq below.
+		m.SenderGeneration = version.MaxSupportedGeneration
 		if m.Type == raft.MsgInstallSnapshotRequest && len(m.SnapshotData) == 0 {
 			// Core never carries snapshot bytes itself (docs/snapshots.md
 			// §7 step 1, raft.MsgInstallSnapshotRequest's doc comment) —
@@ -1039,6 +1352,12 @@ func (n *Node) applyCommitted(entries []raft.Entry) {
 		if uint64(e.Index) <= n.appliedIndex {
 			continue // already applied (e.g. benign re-derivation after restart)
 		}
+		if fsm.IsControlCommand(e.Data) {
+			if !n.applyControlEntry(e) {
+				return // n.fail already recorded the error and stopped the node
+			}
+			continue
+		}
 		cmd, err := fsm.DecodeCommitTxn(e.Data)
 		if err != nil {
 			n.fail(fmt.Errorf("node: decoding committed entry %d: %w", e.Index, err))
@@ -1069,6 +1388,69 @@ func (n *Node) applyCommitted(entries []raft.Entry) {
 		}
 	}
 	n.maybeSnapshot()
+}
+
+// applyControlEntry applies one committed FSM control-command entry
+// (fsm.ControlCommandMarker — currently only SetClusterVersionCommand),
+// resolving any waiter registered for its index exactly as
+// applyCommitted does for an ordinary CommitTxn entry. Returns false if
+// it called n.fail (an unrecoverable decode/capability/apply error),
+// mirroring applyCommitted's own early-return-on-failure control flow
+// — the caller must stop processing further entries in that case.
+func (n *Node) applyControlEntry(e raft.Entry) bool {
+	cmd, err := fsm.DecodeSetClusterVersion(e.Data)
+	if err != nil {
+		// NO SILENT FORMAT MISINTERPRETATION: an unrecognized control
+		// command kind (fsm.ErrUnknownControlCommand) or a malformed
+		// payload both fail closed here exactly like an unrecognized
+		// CommitTxn command version does below.
+		n.fail(fmt.Errorf("node: decoding committed control entry %d: %w", e.Index, err))
+		return false
+	}
+	if cmd.TargetGeneration > version.MaxSupportedGeneration {
+		// STATE MACHINE SAFETY / fail-closed: this node's own binary is
+		// older than the generation this already-committed command
+		// requires. In practice FinalizeUpgrade's precheck should make
+		// this unreachable (a finalize is only proposed once every live
+		// node already reports support), but a node applying a command
+		// it does not have the capability to safely interpret must still
+		// refuse rather than guess, as defense in depth.
+		n.fail(fmt.Errorf("node: committed entry %d requests cluster generation %d, this binary only supports up to %d",
+			e.Index, cmd.TargetGeneration, version.MaxSupportedGeneration))
+		return false
+	}
+	outcome, err := n.fsmachine.Load().ApplySetClusterVersion(uint64(e.Index), cmd)
+	if err != nil {
+		n.fail(fmt.Errorf("node: applying committed control entry %d: %w", e.Index, err))
+		return false
+	}
+	n.appliedIndex = uint64(e.Index)
+	n.core.SetApplied(e.Index)
+
+	if outcome.Status == fsm.StatusCommitted {
+		// Persist the new generation to WAL metadata (docs/wal.md §8)
+		// immediately, on the same goroutine, before this entry is
+		// considered fully applied — a restart between this point and
+		// the next tick must still see the finalized generation via
+		// wal.Open's own ErrUnsupportedGeneration check, not silently
+		// forget it happened.
+		if err := n.walog.SetClusterGeneration(cmd.TargetGeneration); err != nil {
+			n.fail(fmt.Errorf("node: persisting cluster generation %d after entry %d: %w", cmd.TargetGeneration, e.Index, err))
+			return false
+		}
+		n.logf("node %s: cluster generation finalized to %d at index %d", n.cfg.ID, cmd.TargetGeneration, e.Index)
+	}
+
+	if w, ok := n.waiters[e.Index]; ok {
+		delete(n.waiters, e.Index)
+		if w.requestID == cmd.RequestID {
+			w.resultCh <- proposeResult{outcome: outcome}
+		} else {
+			n.metrics.ProposalsUnknownTotal.Inc()
+			w.resultCh <- proposeResult{err: ErrProposalSuperseded}
+		}
+	}
+	return true
 }
 
 // maybeSnapshot creates a fresh local snapshot and compacts this node's
