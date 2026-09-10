@@ -126,10 +126,26 @@ Three fixed roles; no dynamic grants database. `admin` implies every
 | `/outcome` | ✅ | ✅ | ❌ |
 | `/fault` | ✅ | ❌ | ❌ |
 | `/admin/reload-tls` | ✅ | ❌ | ❌ |
+| `/admin/backup` | ✅ | ✅ | ❌ |
+| `/admin/upgrade/precheck` | ✅ | ❌ | ❌ |
+| `/admin/upgrade/finalize` | ✅ | ❌ | ❌ |
 
 `/fault` additionally requires the `-enable-fault-endpoint` flag; its
 route is never registered on the HTTP mux without it, regardless of
 role (§6).
+
+`/admin/backup` is `operator`-permitted, unlike every other `/admin/*`
+endpoint above — triggering a backup is an operational action,
+distinct from `/admin/reload-tls` or the upgrade endpoints below, which
+change the cluster's TLS trust material or version-compatibility
+boundary and require `admin` specifically
+(`internal/authz`'s decision table is the single source of truth this
+table mirrors). `/admin/upgrade/precheck` and `/admin/upgrade/finalize`
+(`docs/upgrades.md`, `docs/enterprise-v1-plan.md` §7) are `admin`-only
+and audited like every other mutating administrative action; restoring
+from a backup is a startup-time CLI flag (`-restore-from`), not an HTTP
+endpoint, so it has no row here — it is gated by filesystem/process
+access to the node, not by RBAC.
 
 Every response to a failed authentication or authorization check is a
 fixed, generic body (`401 unauthorized` / `403 forbidden`) — never one
