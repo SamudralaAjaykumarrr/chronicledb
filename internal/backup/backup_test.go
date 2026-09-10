@@ -169,6 +169,60 @@ func TestExportRestore_SnapshotOnlyRoundTrip(t *testing.T) {
 	requireSameState(t, got, fsmAtBoundary(t, cmds, 5))
 }
 
+// TestExportRestore_ClusterGenerationPersistsToRestoredWAL pins a real
+// bug found during v0.4.0 release qualification: Restore reconstructed
+// the target WAL via a brand-new wal.Open (generation 0 by default) and
+// never durably persisted the source cluster's actual agreed generation
+// into it, even though the restored FSM snapshot itself correctly
+// carried that generation. wal.Open's own ErrUnsupportedGeneration
+// rollback-refusal check (docs/upgrades.md §5's documented "first line
+// of defense" for rejecting an old binary against a data directory that
+// has moved past what it understands) reads only this durable WAL
+// metadata — so a restored data directory silently reported generation
+// 0 regardless of what was actually backed up, defeating that check
+// specifically for the restore path (ordinary restart and live
+// peer-snapshot catch-up both already went through
+// Node.adoptClusterGeneration correctly; Restore is a third path that
+// runs entirely before Node.Open/adoptClusterGeneration are ever
+// reachable).
+func TestExportRestore_ClusterGenerationPersistsToRestoredWAL(t *testing.T) {
+	srcDir := t.TempDir()
+	w, cmds := testHistory(t, srcDir, 2)
+	defer w.Close()
+
+	baseFSM := fsmAtBoundary(t, cmds, 2)
+	if _, err := baseFSM.ApplySetClusterVersion(3, fsm.SetClusterVersionCommand{RequestID: "finalize-1", TargetGeneration: 1}); err != nil {
+		t.Fatalf("ApplySetClusterVersion: %v", err)
+	}
+	if got := baseFSM.ClusterGeneration(); got != 1 {
+		t.Fatalf("baseFSM.ClusterGeneration() = %d, want 1", got)
+	}
+
+	src := backup.Source{
+		BaseMeta: snapshot.Meta{LastIncludedIndex: 3, LastIncludedTerm: 1},
+		BaseFSM:  baseFSM,
+		WAL:      w,
+	}
+	backupDir := filepath.Join(t.TempDir(), "backup")
+	if _, err := backup.Export(src, backupDir, backup.ExportOptions{UntilIndex: 3, ClusterID: "test-cluster"}); err != nil {
+		t.Fatalf("Export: %v", err)
+	}
+
+	dataDir := filepath.Join(t.TempDir(), "restored")
+	if _, err := backup.Restore(backupDir, dataDir, backup.RestoreOptions{UntilIndex: backup.UntilLatest}); err != nil {
+		t.Fatalf("Restore: %v", err)
+	}
+
+	rw, _, err := wal.Open(dataDir, wal.Options{})
+	if err != nil {
+		t.Fatalf("opening restored WAL: %v", err)
+	}
+	defer rw.Close()
+	if got := rw.Metadata().ClusterGeneration; got != 1 {
+		t.Fatalf("restored WAL Metadata().ClusterGeneration = %d, want 1 (source cluster's finalized generation)", got)
+	}
+}
+
 func TestExportRestore_ContinuousPITRRoundTrip(t *testing.T) {
 	srcDir := t.TempDir()
 	w, cmds := testHistory(t, srcDir, 10)

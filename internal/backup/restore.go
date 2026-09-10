@@ -204,13 +204,30 @@ func buildStaging(staging, backupDir string, m Manifest, snapBytes []byte, until
 	if err != nil {
 		return fmt.Errorf("backup: preparing staging snapshot directory: %w", err)
 	}
-	if _, err := snapMgr.Install(snapBytes); err != nil {
+	installedSnap, err := snapMgr.Install(snapBytes)
+	if err != nil {
 		return fmt.Errorf("backup: installing snapshot into staging: %w", err)
 	}
 
 	sw, err := newBaseWAL(staging, m.LastIncludedIndex)
 	if err != nil {
 		return err
+	}
+
+	// Restore is a third path (besides internal/node's own committed
+	// control-command apply and peer-snapshot install) that can bring a
+	// data directory up to a cluster generation the freshly-opened
+	// staging WAL — like any brand-new WAL — starts at generation 0.
+	// Mirror internal/node.adoptClusterGeneration's rule here (Restore
+	// runs entirely before node.Open is ever called, so that choke
+	// point itself is unreachable from this package): durably persist
+	// whatever generation the installed snapshot's FSM state carries,
+	// so wal.Open's ErrUnsupportedGeneration check reads a durable value
+	// that actually matches the restored FSM state, instead of always
+	// silently reporting generation 0 regardless of what was backed up.
+	if err := sw.SetClusterGeneration(installedSnap.FSM.ClusterGeneration()); err != nil {
+		sw.Close()
+		return fmt.Errorf("backup: persisting restored cluster generation: %w", err)
 	}
 
 	// The backup's own WAL copy is only ever read here (Replay + Close);
