@@ -122,8 +122,7 @@ terminology every other document depends on.
 - [`security.md`](security.md) — `v0.2.0` Security Foundation: TLS/mTLS,
   authentication, RBAC, audit logging, certificate rotation.
 - [`backup.md`](backup.md) — `v0.3.0` Backup / Disaster Recovery / PITR:
-  format, RPO/RTO model, restore runbook (implementation in progress
-  toward `v0.3.0`, not yet tagged).
+  format, RPO/RTO model, restore runbook.
 
 ### Packaging and releases (Phase 11)
 

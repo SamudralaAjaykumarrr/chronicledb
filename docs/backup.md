@@ -1,7 +1,8 @@
 # Backup / Disaster Recovery / PITR
 
-Status: `v0.3.0` (not yet tagged/released), `docs/enterprise-v1-plan.md`
-§6, [`ADR-0016`](adr/0016-backup-disaster-recovery-and-pitr.md).
+Status: `v0.3.0` (tagged and released — see `CHANGELOG.md`),
+`docs/enterprise-v1-plan.md` §6,
+[`ADR-0016`](adr/0016-backup-disaster-recovery-and-pitr.md).
 Implemented in `internal/backup` (format, export, restore),
 `internal/node.Node.Backup` (live-node export), and
 `cmd/chronicledb-node` (`/admin/backup`, `-restore-from`,

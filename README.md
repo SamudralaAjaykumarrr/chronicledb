@@ -354,7 +354,7 @@ untested.
   Do not deploy ChronicleDB outside a trusted network without
   explicitly configuring these.
 - **Backup, disaster recovery, and point-in-time recovery are
-  implemented** (as of `v0.3.0`, not yet tagged/released) — a
+  implemented** (as of `v0.3.0`) — a
   self-describing, checksummed backup format built entirely on the
   existing snapshot/WAL formats (`internal/backup`,
   [`docs/backup.md`](docs/backup.md)), an `admin`/`operator`-gated
