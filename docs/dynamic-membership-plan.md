@@ -92,11 +92,76 @@ second configuration derivation (F5), and promotes four items from
 "implementation-time choice" to plan-level decisions because each can
 affect test determinism, compatibility or security (§22).
 
+**Revision 4 — final-review response.** A third adversarial review, of
+revision 3 (planning commit `8b4a7a7`), confirmed **F1**–**F9** closed
+and the consensus architecture intact, and returned
+`V0.5.0 PLAN REQUIRES REVISION` against four further findings — one
+correctness gap (**G1**), three proof/test gaps (**G2**–**G4**) — plus
+six non-blocking items (**G5**–**G10**). All are resolved below and
+traced in §23's revision-4 table. Revision 4 changes **no consensus
+mechanism whatsoever**: §2.1's single-server protocol, §2.2's
+append-time-effective rule, §2.2a's three gates, §2.6's four shapes,
+§4.2a's one-rule-for-both-quorums, §6.3's single reconstruction
+algorithm and §7.6's two-part restore transform are all unchanged in
+substance. What changes is that three *claims* revision 3 made about
+those mechanisms were stronger than the mechanisms themselves, and one
+rule contradicted itself:
+
+- **The restore replication rule** (G1, §7.6). Revision 3 wrote that a
+  voided `EntryConfig` "arriving from a live leader" is `Node.fail`,
+  one sentence before stating that a restored directory legitimately
+  replicates its voided entries onward. Both cannot hold, the
+  fail-closed reading halts every node that joins a restored cluster
+  before it snapshots (DM-21 step 6's own schedule), and no receiver
+  can tell the two cases apart in the first place. A voided entry is
+  now **accepted unconditionally on the replication path**;
+  fail-closed lives only on the emit side, where a discriminator
+  exists.
+- **The read-path outcome claim** (G2, §4.2a, §15, §16). "Either
+  resolves or fails cleanly with `ErrLeadershipLost`, never hangs" is
+  two of three cases. When no majority of `C_new` is reachable, the
+  `EntryConfig` cannot commit *either*, so there is no step-down and no
+  clean error — the read blocks to the caller's deadline, exactly as an
+  ordinary read on a minority-partitioned leader does. DM-17's
+  self-removal sub-case asserted both halves of a schedule that cannot
+  produce both; it is now three phases, one per row of §4.2a's new
+  case table.
+- **The replacement safety proof** (G3, §2.3). Lemma 3 reduced every
+  non-adjacent pair to "two children of one common ancestor" by a step
+  that is false when two live configurations hang off *different*
+  committed ancestors — a reachable state. The conclusion holds; the
+  proof now has the case analysis to reach it, including the
+  `isLogUpToDate`-rejects-**by-index** branch revision 3 had no case
+  for at all.
+- **The pinned promotion default** (G4, §3.3). `PromotionMaxLagEntries
+  = 0` was pinned *for* determinism on the claim that it makes the gate
+  "a pure function of observable state". It does not — `lag == 0` is
+  observed by one request and re-evaluated on the event loop
+  afterwards, while §16's own background writer moves `LastIndex()`.
+  The default stays `0` (it is the conservative value), and the
+  determinism is recovered by pinning the other half: `425` is a
+  records-nothing, pre-proposal refusal and is explicitly retryable.
+
+Revision 4 additionally corrects the `cfg.Peers`/`cfg.majority()`
+call-site enumeration, which was missing `handleRequestVoteResponse`'s
+election-win tally and counted seven where there are eight (G5); pins
+that §7.6's suffix transform must not be applied inside the
+`Export`-shared `copyWALSuffix` helper (G6); states
+`Config.validate()`'s empty-`Bootstrap` carve-out that §3.1 depends on
+(G7); extends §7.2's `InstallSnapshot` cross-check to the
+`HasConfiguration` flag as well as the configuration value (G8);
+documents `heardFromLeader`'s composition with the existing
+`PauseTicksForTest` election-clock freeze (G9); and states §17's
+invariant count once, correctly, in both places that carried a
+different wrong number (G10).
+
 Revision 1's baseline remains commit `8eeb0aa`; revision 2 is written
-against `6df4e68` (`docs: define v0.5.0 dynamic membership plan`) and
+against `6df4e68` (`docs: define v0.5.0 dynamic membership plan`),
 revision 3 against `d41ec09` (`docs: harden v0.5.0 membership plan
-after architecture review`) — still `main`-clean, still planning-only,
-still not an authorization to begin implementation.
+after architecture review`), and revision 4 against `8b4a7a7`
+(`docs: close v0.5.0 membership plan boundary gaps`) — still
+`main`-clean, still planning-only, still not an authorization to begin
+implementation.
 
 This document is the detailed, implementation-ready design for
 [`docs/enterprise-v1-plan.md`](enterprise-v1-plan.md) §8 ("Dynamic
@@ -219,10 +284,30 @@ type Config struct {
 }
 ```
 
-`Config.validate()` changes from "`Peers` must include `ID`" to
-"`Bootstrap.Voters` must include `ID`" (bootstrap-only check; a node
-joining an *already-running* cluster as a learner never uses
-`Bootstrap` at all — see §3.1).
+`Config.validate()` changes from "`Peers` must include `ID`" to a
+**conditional** check, and the condition is load-bearing rather than
+incidental (§23/G7):
+
+```
+if len(Bootstrap.Voters) > 0 || len(Bootstrap.Learners) > 0:
+    Bootstrap.Voters must include Config.ID
+// an entirely empty Bootstrap is VALID and is the required state for
+// §3.1's never-joined node
+```
+
+Today's check is unconditional (`Config.Peers` must contain
+`Config.ID`, `internal/raft/config.go`), so translating it literally to
+`Bootstrap` would make `NewCore` reject the brand-new learner process
+of §3.1 — which is constructed with a deliberately **empty**
+`Bootstrap` and acquires its configuration only by replication — and
+would take the "join an existing cluster" path with it. The check is
+therefore a *bootstrap-seed well-formedness* check ("if you are seeding
+a cluster, you must be in it"), not a membership check: a node joining
+an already-running cluster as a learner never uses `Bootstrap` at all
+(§3.1), and a restored directory's `Bootstrap` is the operator's
+`-cluster`/`-peers` flag set, which does include this node (§7.6). A
+direct unit test pins both branches — empty `Bootstrap` accepted,
+non-empty `Bootstrap` without `ID` rejected.
 
 ### 1.2 Voter semantics
 
@@ -499,15 +584,37 @@ type Core struct {
 
 Every existing call site that iterated `c.cfg.Peers` or called
 `c.cfg.majority()` is changed to `c.activeConfig.Voters` /
-`c.activeConfig.majority()` (§21's slice 1 lists every one, all seven
-identified in the current `core.go`:
-`handleElectionTimeout`, `handleHeartbeatTimeout`, `handlePropose`'s
-peer fan-out, `becomeLeader`'s `nextIndex`/`matchIndex`
-initialization, `advanceLeaderCommit`'s majority loop, plus
-`internal/node.Node.majority()`/`checkPendingReads`'s mirrored copies).
+`c.activeConfig.majority()`. The complete enumeration against the
+current tree — **eight**, six in `internal/raft/core.go` and two
+mirrored copies in `internal/node`:
+
+| # | Call site | What it computes |
+|---|---|---|
+| 1 | `handleElectionTimeout` — peer fan-out | who is sent `RequestVoteRPC` |
+| 2 | `handleElectionTimeout` — the single-node instant-win check | `len(votesReceived) >= majority()` |
+| 3 | **`handleRequestVoteResponse`** — the election-win threshold | `len(votesReceived) >= majority()` |
+| 4 | `handleHeartbeatTimeout` — peer fan-out | who is sent `AppendEntriesRPC` |
+| 5 | `handlePropose` — peer fan-out | who is sent the new entry |
+| 6 | `becomeLeader` — `nextIndex`/`matchIndex` initialization | over which member set |
+| 7 | `advanceLeaderCommit` — the majority loop | the commit quorum |
+| 8 | `internal/node.Node.majority()` and `checkPendingReads` | the read quorum (§4.2a) |
+
+**Row 3 was missing from revisions 1–3, which all said "seven"
+(§23/G5).** `handleRequestVoteResponse`'s tally is a distinct function
+from `handleElectionTimeout`'s, and it is the *election* quorum — the
+one place this plan can least afford an un-migrated `cfg.majority()`.
+In practice a missed row cannot ship, because slice 1 **removes**
+`Config.Peers` and `Config.majority()` outright, so every unmigrated
+site is a compile error rather than a silent stale-quorum bug; that is
+the structural backstop, and the enumeration above is the checklist.
+Treat this table, not the prose, as authoritative, and re-derive it
+against the tree at implementation time rather than trusting the count.
+
 Learner fan-out (`AppendEntriesRPC` sent to `activeConfig.Learners`
-too, never `RequestVoteRPC`) is a small addition alongside each of
-those loops.
+too, never `RequestVoteRPC`) is a small addition alongside rows 4 and
+5, and explicitly **not** alongside rows 1, 2, 3 or 7 — a learner is
+never sent a vote request, never counted in a tally, and never counted
+toward commit.
 
 `becomeLeader` additionally initializes `nextIndex`/`matchIndex` for
 **every** member of `activeConfig` (voters *and* learners) rather than
@@ -726,23 +833,44 @@ commitIndex`. Hence the `EntryConfig` entry that produced `L`'s
 `activeConfig` (or the snapshot/bootstrap boundary, if
 `activeConfigIndex == 0`) is itself committed. ∎
 
-#### Lemma 3 (superseded-branch exclusion) — new in revision 3
+#### Lemma 3 (superseded-branch exclusion) — new in revision 3, completed in revision 4
 
 Two live configurations that are **not** adjacent are never both
 decisive: at least one is superseded, and a superseded configuration
 can never again assemble a majority.
 
-*Proof.* Let `C` and `C'` be live and non-adjacent. By W2 each is a
-single-shape child of the newest committed configuration in its
-holder's log, and by W1 the committed configurations form one chain, so
-`C` and `C'` are children of committed elements of that one chain. If
-they were children of *different* committed elements, the earlier of
-those two elements would be a committed proper ancestor of the later,
-and the child of the later would differ from the earlier element's
-child by at most one voter along the chain — so non-adjacency forces
-them to be two distinct children of **one** common committed ancestor
-`C_a`, produced by two different leaders `L` and `L'` in two different
-terms. Say `term(L) < term(L')`.
+**What revision 3 got wrong, and why it needed a case it did not have
+(§23/G3).** Revision 3 proved this from a single reduction: "if they
+were children of *different* committed elements … non-adjacency forces
+them to be two distinct children of **one** common committed ancestor."
+That reduction is **false**, and the counterexample lives inside this
+document's own rules. Take a committed chain
+`C_1 = {a,b,c} → C_2 = {a,b,c,d} → C_3 = {a,b,c,d,e}`, a node
+partitioned since before `C_2` committed still holding the uncommitted
+child `C = {a,b,c,x}` of `C_1` (W2-legal **relative to that node's own
+log**, which is how W2 is stated), and `C' = {a,b,c,d,e,f}`, a child of
+`C_3`, live on the majority side. `C` and `C'` are five voters apart,
+are non-adjacent, and are children of *different* committed elements —
+so revision 3's proof covered nothing at all here, and the state is
+reachable (it is DM-22's shape with two further committed
+transitions). The conclusion still holds; it needs the case analysis
+below, which turns on `isLogUpToDate` rejecting **by index** as well as
+by term.
+
+*Proof.* Define a live configuration's **anchor** as the newest
+*committed* configuration present in the log of the node holding it. By
+W2 every live configuration is its holder's anchor or a single-shape
+child of that anchor, and by W1 all anchors lie on one committed
+chain. Let `C` and `C'` be live and non-adjacent, with anchors `C_a`
+and `C_b`; order them so `C_a` is at or before `C_b` on that chain.
+
+**Case 1 — the anchors coincide (`C_a = C_b`).** Neither `C` nor `C'`
+equals `C_a` (they are non-adjacent, and each is `C_a` or adjacent to
+it), so they are two **distinct children** of one common committed
+ancestor, produced by two different leaders `L` and `L'`: P3 forbids
+one leader appending a second `EntryConfig` above an uncommitted one,
+and `RAFT ELECTION SAFETY` (unchanged) forbids two leaders sharing a
+term. Say `term(L) < term(L')`.
 
 By P1, `L'` appended its entry only after committing an entry of its
 own term `term(L')`. That commit required a majority of `L'`'s
@@ -754,13 +882,69 @@ by Lemma 1 `M` intersects every majority of `C_a` — in particular the
 one holding that term-`term(L')` entry. So `M` contains a node whose
 `lastLogTerm >= term(L') > term(L)`. Any candidate holding `C` carries
 a log whose last entry is from a term `<= term(L)`: it branched from
-`C_a` under `L`, and no later leader extended that branch (if one had,
-that branch's tip would itself be committed and W1 would have made the
-two configurations adjacent). The existing `isLogUpToDate` rule
+`C_a` under `L`, and no leader of a later term extended that branch (a
+later leader extending it would have had `C` as *its* own anchor, which
+makes `C` committed and, by W1's no-siblings clause, an element of the
+chain rather than a sibling of one). The existing `isLogUpToDate` rule
 compares last-log **term before index**
 (`internal/raft/core.go`, unchanged), so every such node rejects that
 candidate **regardless of how long its log is**. `C` therefore has no
-assemblable majority: it is superseded. ∎
+assemblable majority: it is superseded.
+
+**Case 2 — the anchors differ (`C_a` strictly precedes `C_b`).** `C_b`
+is an anchor and is therefore committed, and it is a strict descendant
+of `C_a`, so `C_a`'s immediate successor `C_{a+1}` exists on the chain,
+is committed, and was established by an entry at index `k`, term `t`.
+Two sub-cases exhaust `C`:
+
+- **2a — `C` is a single-shape child of `C_a`.** Then `C ≠ C_{a+1}`: a
+  child of `C_a` equal to `C_{a+1}` would be committed, hence its own
+  holder's anchor, contradicting that the anchor is `C_a`. So `C` and
+  `C_{a+1}` are two distinct children of `C_a` and **Case 1 applies
+  verbatim with `C' := C_{a+1}`**, once we know `term(L) < t`. We do:
+  if `term(L) > t` then `L`, having committed an entry of its own term
+  (P1) and `commitIndex` being a prefix bound, held the committed entry
+  at `(k, t)` in its own log, so every log carrying `C`'s entry carries
+  `(k, t)` below it and the newest configuration-establishing entry
+  below `C`'s would be `C_{a+1}`'s — making the anchor `C_{a+1}`, not
+  `C_a`, a contradiction; and `term(L) = t` is impossible because two
+  leaders never share a term. Hence `C` is superseded.
+- **2b — `C = C_a` itself** (a *committed* configuration still live on
+  a node that has not yet seen `C_{a+1}`). **This is the sub-case
+  revision 3 had no argument for, and the term comparison alone does
+  not settle it**: a node holding `C_a` may perfectly well hold an
+  entry of term `t` — `C_{a+1}`'s proposer's own election no-op, for
+  instance — so it is not term-dominated. It is *index*-dominated.
+  Every node holding `C_a` necessarily **lacks** the entry at `(k, t)`:
+  holding it would make `C_{a+1}`'s entry the newest
+  configuration-establishing entry in that node's log and therefore its
+  `activeConfig` (§6.3 step 1), so it would hold `C_{a+1}`, not `C_a`.
+  `C_{a+1}` is committed, so a majority `M` of `C_{a+1}` durably holds
+  `(k, t)` (§2.2: the entry's own configuration governs its own
+  commit). `C_a` and `C_{a+1}` are adjacent (W1), so by Lemma 1 every
+  majority of `C_a` meets `M` and therefore contains a node with
+  `lastLogTerm >= t` whose `lastLogIndex >= k` whenever its term is
+  exactly `t`. A candidate holding `C_a` has `lastLogTerm <= t` — an
+  entry of a term above `t` could only have been appended by a leader
+  of that later term, which by this same argument could not have been
+  elected without `(k, t)` — and, when its term is exactly `t`, its
+  `lastLogIndex < k`, because it lacks `(k, t)` and logs are gap-free.
+  `isLogUpToDate` therefore denies the vote in both branches: **by term
+  when the candidate's term is lower, and by index when the terms are
+  equal.** `C_a` is superseded.
+
+In every case at least one of the two non-adjacent live configurations
+is superseded, which is the statement. ∎
+
+**Note on what this does *not* say.** A committed configuration is not
+superseded merely by being old; it is superseded exactly once its
+successor on the committed chain exists (Case 2b's hypothesis). While
+`C_a` is still the newest committed configuration, `C_a` and any
+single-shape child of it are **adjacent**, Lemma 1 applies directly,
+and Lemma 3 is not invoked at all. This is why DM-22's three
+simultaneously-live configurations are safe without any of them being
+superseded on *arrival* — `C1` becomes superseded at the precise
+instant `b`'s term-2 no-op commits, by Case 1, and not before.
 
 #### Theorem (split-brain is impossible)
 
@@ -977,8 +1161,12 @@ approaching this range, and vice versa) — i.e. `AddLearner=16`,
 `PromoteToVoter=17`, `RemoveServer=18`, and `Voided=19` (§7.6's
 restore transform: an `EntryConfig` entry that establishes no
 configuration, defined here so the whole reserved range stays in one
-place, and writable **only** by `internal/backup`'s offline restore
-transform — never by any live code path, §7.6). Implementation must add a
+place. It is **produced** only by `internal/backup`'s offline restore
+transform and by no live code path — but once it exists in a restored
+directory's log it is **replicated and accepted exactly like any other
+entry**, including by nodes that join that cluster later; producing one
+and handling one are different questions, and revision 3 conflated them
+(§7.6, §23/G1). Implementation must add a
 cross-package non-collision test (`TestControlKindRangesNeverCollide`,
 one of §18's proof obligations) asserting
 `internal/fsm`'s and `internal/raft`'s reserved control-kind byte
@@ -1045,6 +1233,21 @@ message, not a legitimate state a correct leader would ever produce;
 this is the same fail-closed-on-should-never-happen posture
 `RECOVERY NON-INVENTION` already takes elsewhere).
 
+**The one carve-out, and it is not an exception to the shape rule
+(§23/G1).** A `Voided` `EntryConfig` (kind `19`, §2.5, §7.6) carries
+**no `Configuration` at all** — `fullConfigLen == 0` — so there is no
+`C_new` to compare against `C_old` and the four-shape check simply has
+no input to run on. It is therefore neither accepted nor rejected *by
+this check*: the check is not reached. A replica appends a voided entry
+on the ordinary replication path exactly as it appends an
+`EntryNormal` entry, and this is **required**, not tolerated — a node
+joining a restored cluster receives voided entries from a live leader
+as a matter of course (§7.6, §7.2, DM-21 step 6), and no receiver can
+distinguish that legitimate case from a hypothetical illegitimate one.
+The structural guarantee lives on the emit side instead, where it can:
+`ProposeConfigChange` admits only the four shapes and can never
+construct a voided entry, pinned by a debug-build assertion (§7.6).
+
 `FSM.RecordMembershipOutcome(requestID fsm.RequestID, outcome
 fsm.Outcome)` is a new, small, `Apply`-adjacent method (same locking
 discipline as `ApplySetClusterVersion`, same idempotency-first check —
@@ -1082,13 +1285,25 @@ they are not quorum-safety conditions:
 | 7 | Cluster generation `>= 2` (§8.2) | `ErrMembershipNotPermitted` | `412` | Fail-closed compatibility gate; see §8.2 for exactly when it starts passing. |
 | 8 | Sub-three-voter operator confirmation (§12.2) | `ErrConfirmationRequired` | `409` | Operator **policy**, deliberately separate from quorum mathematics; see §12.2 for the exact field and its idempotency interaction. |
 
-Checks 2 and 3 (`ErrConfigChangeNotReady`) are the only ones the admin
-API itself may retry on the operator's behalf, and it does so for a
-bounded window only (the request context's deadline, mirroring
-`FinalizeUpgrade`'s existing await discipline) before returning `503`
-to the caller. Because nothing was proposed, a client-side retry with
-the same `RequestID` is always safe and is the documented operator
-action.
+Checks 2 and 3 (`ErrConfigChangeNotReady`) are the only ones of *this*
+table the admin API itself may retry on the operator's behalf, and it
+does so for a bounded window only (the request context's deadline,
+mirroring `FinalizeUpgrade`'s existing await discipline) before
+returning `503` to the caller. Because nothing was proposed, a
+client-side retry with the same `RequestID` is always safe and is the
+documented operator action.
+
+**One check outside this table is retryable on exactly the same
+terms**: §3.3's `ErrLearnerNotCaughtUp` / `425`, which is a
+time-of-check/time-of-use refusal against a moving `LastIndex()` rather
+than a statement that the request is wrong (§23/G4). It proposes
+nothing, records nothing, and leaves the `RequestID` untouched, so it
+satisfies the identical precondition that makes 2 and 3 safely
+retryable. The complete set of admin-layer-retryable refusals is
+therefore exactly three: `ErrConfigChangeNotReady`
+(`inherited-suffix-uncommitted`), `ErrConfigChangeNotReady`
+(`no-current-term-commit`), and `ErrLearnerNotCaughtUp`. Every other
+refusal in this table is terminal for that submission.
 
 ### 2.7 Stale- and non-member message handling (replaces revision 1's over-broad rule)
 
@@ -1233,6 +1448,42 @@ already makes a non-Voter deny every vote unconditionally, ahead of
 any `heardFromLeader` test. The interaction is asserted by a direct
 unit test (§18) so it is pinned rather than rediscovered as a
 "bug".
+
+**A second interaction, with an existing test hook (§23/G9).**
+`heardFromLeader` is cleared by exactly two events, and one of them —
+`InputElectionTimeout` — is produced by the driver's election clock,
+which this project already has a test-only freeze for:
+`Node.PauseTicksForTest`/`electionTicksPaused`
+(`internal/node/node.go`), the mechanism a pre-`v0.1.0` CI flake was
+fixed with, deliberately freezing **only** the election side of the
+clock and never heartbeats. While that freeze is engaged,
+`electionTicksLeft` stops decrementing, `InputElectionTimeout` never
+arrives, and a node's `heardFromLeader` therefore stays `true`
+indefinitely once any leader message has been accepted — so that node
+ignores **every** `RequestVoteRequest`, including higher-term ones, for
+as long as the freeze lasts. That is the correct and intended
+composition of the two mechanisms (a frozen election clock means "this
+node's leader contact never goes stale"), but it is a real behavioural
+change for any existing or new test that freezes ticks on one node and
+expects another node's election to succeed. Implementation must:
+- state this in `Core.heardFromLeader`'s doc comment and in
+  `PauseTicksForTest`'s, on both sides of the coupling, so neither can
+  be changed in ignorance of the other;
+- add a direct unit test asserting the composition explicitly (freeze
+  ticks, deliver a leader `AppendEntries`, then deliver a higher-term
+  `RequestVote` and assert it is ignored with no term bump), so the
+  behaviour is pinned rather than discovered as a hang;
+- audit the existing tests that call `PauseTicksForTest` when slice 1
+  lands, and where one needs a vote to be granted under a frozen clock,
+  resume ticks (or step `InputElectionTimeout` explicitly) rather than
+  weakening Rule 2.
+This is scoped as an implementation-time obligation, not a design
+change: no production path freezes ticks, so `heardFromLeader` can
+never go stale on a Voter in a running cluster (a Voter's
+`handleElectionTimeout` always re-arms the timer, so the flag is
+cleared at least once per election timeout), and a Leader always
+reaches leadership *through* `handleElectionTimeout`, which clears the
+flag on the way.
 
 **Explicitly NOT filtered, at any layer**: `AppendEntriesRequest`,
 `MsgInstallSnapshotRequest`, and every `*Response` message. These are
@@ -1428,10 +1679,57 @@ a non-zero default makes §16's real-process promote step
 non-deterministic: the promote would succeed while the new voter is
 still behind, and "zero failed commits attributable to the membership
 change itself" would then depend on how fast that voter catches up
-rather than on an assertion. With `0`, the gate is a pure function of
-observable state (poll `/admin/membership/status` until `lag == 0`,
-then promote), which is exactly the bounded-polling discipline
-`docs/testing-strategy.md` §4 already requires instead of sleeps.
+rather than on an assertion.
+
+**`0` alone does not make the gate deterministic, and revision 3's
+claim that it does was wrong (§23/G4).** Revision 3 justified the pin
+by asserting that with `0` "the gate is a pure function of observable
+state (poll `/admin/membership/status` until `lag == 0`, then
+promote)." It is not a pure function of anything the caller can hold
+still: `lag == 0` is observed by one HTTP request and re-evaluated by
+`PromoteToVoter` on the event loop afterwards, and §16 runs a
+background `/propose` writer **across the entire test**. Any entry
+appended in between advances `LastIndex()` while the learner's
+`matchIndex` has not yet caught up, so the promote returns `425`
+`ErrLearnerNotCaughtUp` — a plain time-of-check/time-of-use race, and
+one that gets *tighter*, not looser, the stricter the threshold is.
+Under sustained write load the window in which `matchIndex ==
+LastIndex()` holds is only the gap between one write committing and
+the next being appended, so a single-shot promote is unreliable by
+construction. This is also an operational statement, not only a test
+one: with the shipped default, promotion on a continuously written
+cluster needs retry or a quiet moment.
+
+**Both halves of the decision are therefore pinned, not just the
+number:**
+
+- **The default stays `0`.** It is the conservative, availability-
+  protecting value (§12's 3→4 row depends on the new voter acking
+  immediately), and loosening it to paper over a TOCTOU would trade a
+  real availability guarantee for a test convenience.
+- **`425` is explicitly a retryable refusal**, and every caller that
+  must succeed retries it. It joins §2.6a's checks 2–3 as the third
+  refusal the admin layer may retry on the operator's behalf, under
+  the identical discipline: it is a **pre-proposal** refusal (§3.3
+  proposes nothing), so nothing is recorded, the `RequestID` is
+  untouched, and a retry with the same `RequestID` is always safe
+  (§10). The handler retries within the request context's deadline and
+  then surfaces `425` to the caller; §9's status-code table carries
+  this, and `docs/membership.md`'s runbook states it for operators
+  alongside the `503` polling instruction.
+- **§16's promote step retries on `425` under the existing bounded-
+  polling discipline** (`docs/testing-strategy.md` §4 — bounded
+  polling, never a fixed sleep), rather than asserting a single call
+  succeeds. The assertion that matters is unchanged and is now
+  actually well-founded: the promote eventually succeeds, and when it
+  does the new voter's `matchIndex` **was** equal to `LastIndex()` at
+  the instant `Core` evaluated it, which is what makes "zero failed
+  commits attributable to the membership change itself" an assertion
+  about state rather than about timing.
+
+The determinism the pin buys is thus located where it actually holds —
+in the *condition `Core` evaluates*, which is exact and observable —
+rather than in the caller's ability to hit it first try.
 
 **This threshold is operational, not a safety requirement, and the
 distinction is worth stating precisely** because it is easy to assume
@@ -1619,13 +1917,39 @@ one configuration rather than against a set that could differ between
 loop iterations.
 
 **What happens to a read that can no longer be satisfied.** Nothing new
-is needed. A pending read stays pending while `acked < majority`, and
+is needed, but the outcome must be stated in all three of its branches
+rather than two — revision 3 collapsed them and overstated the result
+(§23/G2). A pending read stays pending while `acked < majority`, and
 is failed with `ErrLeadershipLost` by the existing
 `Role() != Leader || CurrentTerm() != pr.term` check the instant the
-self-removing leader steps down at commit (§4.2). So a read in flight
-across a self-removal either resolves against a genuine `C_new`
-majority or fails cleanly at step-down — never resolves against a
-phantom majority, and never hangs.
+self-removing leader steps down at commit (§4.2). The complete case
+analysis for a read in flight across a self-removal, with `C_new`'s
+majority written `m`:
+
+| Acknowledgements from `C_new` voters (self never counted) | The `EntryConfig` entry | The read |
+|---|---|---|
+| `>= m`, and `appliedIndex >= pr.target` | commits (the same `matchIndex` majority, §4.2) | **Resolves** against a genuine `C_new` majority. |
+| `>= m`, but `appliedIndex < pr.target` when the pass runs | commits | Stays pending for that pass; the step-down that follows commit then fails it with **`ErrLeadershipLost`**. |
+| `< m` | **does not commit** — `advanceLeaderCommit` counts the same voters against the same `m` | Stays pending, and the leader does **not** step down, so no `ErrLeadershipLost` is produced. The read **blocks until the caller's context deadline**. |
+
+The third row is the one revision 3 wrote out of existence by asserting
+the read "never hangs". It does block, and the plan should say so: a
+self-removing leader that cannot reach a majority of `C_new` can
+neither commit its own removal nor confirm a read, which is exactly the
+availability cost §4.2 already states honestly for the commit path,
+inherited unchanged by the read path. It is *not* a hang in the Phase-8
+`BeginReadIndex` sense (a stall with no possible resolution on a
+**healthy** cluster); it is the ordinary, correct behaviour of a
+linearizable read on a leader that cannot assemble the quorum it needs,
+identical to a read issued on a minority-partitioned leader today, and
+it terminates at the caller's deadline.
+
+What is guaranteed unconditionally, and is the property that matters:
+**a read never resolves against a quorum basis that is not a genuine
+majority of the configuration in force when it resolves**, and the
+leader's own self-ack is never part of that basis once the leader is
+not a Voter. Blocking is the conservative direction; resolving would
+be the bug.
 
 **Removal and promotion of *other* voters need no additional rule**
 beyond recomputing against the current `activeConfig` on every pass: a
@@ -2125,7 +2449,12 @@ that, and reached only by a genuine bug rather than by corruption:
   (not one of §2.6's four shapes relative to its predecessor, or a
   duplicate `ID`, or a zero-voter set) → refuse to adopt it, `Node.fail`,
   never guess or silently repair, identical to §2.6's live-path
-  defense-in-depth check.
+  defense-in-depth check. **A `Voided` entry is not such a payload and
+  must not be caught by this rule** (§23/G1): it declares
+  `fullConfigLen == 0` and carries no `Configuration`, which is a
+  well-formed statement of "this entry establishes nothing", not a
+  zero-voter configuration. The check is on a `Configuration` that is
+  present and wrong; a voided entry presents none.
 
 
 ## 7. Snapshots / compaction
@@ -2332,26 +2661,37 @@ Option A / Option B decision and this rejection rationale.
 
 ### 7.2 Installing a snapshot with different membership
 
-`MsgInstallSnapshotRequest` gains an explicit `Configuration` field
-(mirroring how `LastIncludedIndex`/`LastIncludedTerm` are already
-explicit `Message` fields `Core` reads/writes directly, unlike the
-opaque `SnapshotData`). `Core` populates it from the sending node's
-`snapshotConfig` — i.e. `ConfigAt(snapshotIndex)`, never
-`activeConfig`.
+`MsgInstallSnapshotRequest` gains **two** explicit fields,
+`Configuration` and `HasConfiguration` (mirroring how
+`LastIncludedIndex`/`LastIncludedTerm` are already explicit `Message`
+fields `Core` reads/writes directly, unlike the opaque `SnapshotData`).
+They are a **pair**, exactly as they are in the durable frame (§7.1),
+and `Core` populates both from the sending node's
+`snapshotHasConfig`/`snapshotConfig` — i.e. `ConfigAt(snapshotIndex)`,
+never `activeConfig`. §8.1's generation-2 definition already names both
+fields; revision 3's §7.2 described only the first.
 
 **Exactly one value is authoritative on the receiving side: the
-installed snapshot's own `Meta.Configuration`.** `internal/node`'s
-existing `handleInstallSnapshot` sequence is unchanged in ordering (the
-driver validates and durably installs the bytes *before* ever calling
-`Core.Step` for this message, per the existing documented contract),
-and it gains one check: if `msg.Configuration` does not equal
-`snap.Meta.Configuration`, the install is **refused** and `Node.fail`
-is called. Revision 1 introduced both values without saying which wins
-(§23/P4); two sources of truth for one value is exactly the ambiguity
-this document exists to remove. The message field exists only so
-`Core` can reason about the transfer without the driver handing it
-snapshot bytes it must not parse (`docs/raft.md` §1); it is never the
-value adopted.
+installed snapshot's own `Meta.HasConfiguration`/`Meta.Configuration`
+pair.** `internal/node`'s existing `handleInstallSnapshot` sequence is
+unchanged in ordering (the driver validates and durably installs the
+bytes *before* ever calling `Core.Step` for this message, per the
+existing documented contract), and it gains one check, **over both
+fields**: if `msg.HasConfiguration != snap.Meta.HasConfiguration`, or
+if `msg.Configuration` does not equal `snap.Meta.Configuration`, the
+install is **refused** and `Node.fail` is called. Checking only the
+configuration would leave the flag unguarded, and the flag is the field
+that decides whether the configuration is read at all (§6.3 step 2,
+§23/F7) — a `true`/`false` disagreement with both configurations empty
+would pass a value-only check silently (§23/G8). Revision 1 introduced
+both values without saying which wins (§23/P4); two sources of truth
+for one value is exactly the ambiguity this document exists to remove.
+The message fields exist only so `Core` can reason about the transfer
+without the driver handing it snapshot bytes it must not parse
+(`docs/raft.md` §1); they are never the values adopted, so this check
+is a should-never-happen detector rather than a correctness
+dependency — which is precisely why it must cover the whole pair
+rather than half of it.
 
 On successful, durable installation,
 `Core.handleInstallSnapshotRequest` adopts the snapshot's
@@ -2531,7 +2871,13 @@ needs no transform.
 **Part 2 — the staged WAL suffix carries no configuration either.**
 While copying each source entry, `buildStaging` inspects its payload
 framing (§6.1a) and, for any entry whose type byte is `EntryConfig`,
-rewrites the payload into the **voided** form before appending it:
+rewrites the payload into the **voided** form before appending it.
+**The transform belongs to the restore path only**: the helper that
+does the copying (`copyWALSuffix`) is shared with `Export`, and voiding
+there would strip membership out of the backup itself — so the
+transform is passed in rather than baked into the shared helper, and a
+test pins that `Export`'s output still carries its `EntryConfig`
+entries intact (§21 slice 3b, §23/G6). The voided form is:
 
 ```
 voided EntryConfig payload (written only here, defined in internal/raft §2.5)
@@ -2557,11 +2903,34 @@ A voided entry is defined once and treated identically everywhere:
   directory reaches step 2 with `snapshotHasConfig == false` and then
   step 3 — the operator's bootstrap flags, exactly what §7.6 promises.
 - §2.6's four-shape validation does not apply to it: it proposes no
-  transition. `Core.ProposeConfigChange` can never produce one, and a
-  voided entry arriving from a **live leader** is a should-never-happen
-  treated as one — `Node.fail`, per §2.6's fail-closed posture. The
-  only legitimate source of a voided entry is a restored directory's
-  own durable log, and the entries it replicates from it.
+  transition, so there is no `(C_old, C_new)` pair to validate. A
+  replica **accepts a voided entry on the ordinary replication path
+  unconditionally**, exactly as it accepts an `EntryNormal` entry: it
+  occupies an index and a term and establishes nothing.
+- **A voided entry is never `Node.fail`-worthy on the accept path, and
+  revision 3 was wrong to say otherwise (§23/G1).** Revision 3 wrote
+  that "a voided entry arriving from a live leader is a
+  should-never-happen treated as one — `Node.fail`", one sentence
+  before stating that a restored directory legitimately *replicates*
+  its voided entries onward. Both cannot hold, and the fail-closed
+  reading breaks the flow §7.2 exists to protect: a learner added to a
+  restored cluster before that cluster has taken its own snapshot
+  receives the restored boundary by `InstallSnapshot` and then
+  entries `snapshotIndex+1 …` by ordinary `AppendEntries` — **voided
+  entries, from a live leader** — and would halt on its first join
+  (DM-21 step 6's exact schedule). The rule was also not implementable:
+  a receiver has no signal that separates "replicated out of a restored
+  directory's durable log" from "invented by a live leader", because
+  both arrive as an `AppendEntries` from the current leader and no node
+  knows another node's restore boundary. Fail-closed therefore lives
+  **only** where a discriminator genuinely exists, which is the emit
+  side: `Core.ProposeConfigChange` can never construct a voided entry
+  (§2.6a's check 5 admits exactly the four shapes, and `Voided` is not
+  one of them), and a debug-build assertion in `ProposeConfigChange`
+  pins that. The legitimate sources of a voided entry are a restored
+  directory's own durable log and the ordinary replication of that log
+  to every other member of the restored cluster — including members
+  that join later.
 - `internal/node.applyCommitted` applies it as a **no-op**: no
   `RecordMembershipOutcome`, no dial-table change, no waiter
   resolution, no generation check beyond §8.2's. It is a committed
@@ -2864,7 +3233,7 @@ POST /admin/membership/add
 POST /admin/membership/promote
   { "requestId": "<opaque>", "nodeId": "n4", "confirmVoterCount": 0 }
   -> 200 { "status": "committed"|"aborted", ... }
-  -> 425 { "error": "learner not caught up", "lag": <entries> }  (§3.3, never proposed)
+  -> 425 { "error": "learner not caught up", "lag": <entries> }  (§3.3, never proposed; RETRYABLE with the same requestId)
   -> 412 { "error": "peer generation older than cluster generation" } (§8.2a)
   -> 409 | 412 | 503 as above
   RBAC: admin only. Audited.
@@ -2916,6 +3285,14 @@ test, a runbook and an audit record together. The mapping is fixed:
 `400` malformed request or illegal transition; `409` not-leader,
 change-in-progress, or confirmation-required; `412` capability not
 permitted; `425` learner not caught up; `503` transiently not ready.
+**`425` and `503` are the retryable pair** — both are pre-proposal
+refusals that record nothing and leave the `RequestID` verbatim
+reusable, and both are retried by the handler within the request
+context's deadline before being surfaced (§2.6a, §3.3); `400`, `409`
+and `412` are terminal for that submission. `docs/membership.md`'s
+runbook states this split explicitly, because treating `425` as a
+failure is exactly the mistake the `503` polling instruction already
+warns against (§11, §19 gate 8).
 Because two genuinely distinct conditions share `412` (cluster
 generation `< 2`, §8.2; target peer's generation too old, §8.2a),
 **every error response body carries a machine-readable `reason` field
@@ -3376,7 +3753,10 @@ not survive.**
   receiver's own stale one** — assert unconditional adoption (§7.2), no
   merge attempted; assert additionally that a `msg.Configuration` that
   disagrees with the installed snapshot's `Meta.Configuration` causes
-  `Node.fail` rather than either value being silently preferred.
+  `Node.fail` rather than either value being silently preferred, **and
+  the same for a `msg.HasConfiguration` that disagrees with
+  `Meta.HasConfiguration` while both configurations are empty** — the
+  flag-only disagreement a value-only check would miss (§23/G8).
 - **DM-9 Stale removed node retrying elections indefinitely post-removal**
   — assert zero term bumps and zero disruption to the live cluster,
   **via both** of §2.7's rules separately: once against members whose
@@ -3491,22 +3871,49 @@ not survive.**
   §23/P1, §23/F3, and for the Phase 8 `BeginReadIndex` hang class:
   issue a `BeginReadIndex` whose acknowledgement quorum is still
   outstanding, then commit a membership change that alters the voter
-  set; assert the read either resolves or fails with
-  `ErrLeadershipLost`, **never hangs**, and never resolves against a
-  quorum basis that is not a majority of the configuration in force
-  when it resolved. **Three required sub-cases, all of §4.2a:**
+  set; assert the read never resolves against a quorum basis that is
+  not a majority of the configuration in force when it resolved, and
+  that every terminal outcome it does reach is one of §4.2a's three
+  table rows. **Three required sub-cases, all of §4.2a:**
   1. *Promote* — a new voter with `ackSeq == 0` enters the set; the
      read must wait rather than count it.
   2. *Remove* — a voter whose ack was being counted leaves the set; the
      read must stop counting it.
-  3. *Self-removal* — the **leader itself** leaves the set. Assert
-     explicitly that the leader's own implicit self-ack is **not**
-     counted: in a 3→2 self-removal, with exactly one remaining voter
-     acking, assert the read does **not** resolve (revision 2's
-     mechanical `acked := 1` would have resolved it against a
-     one-of-two "majority"), and that it then fails cleanly with
-     `ErrLeadershipLost` at the step-down that follows commit.
-  Repeat all three with a leader failover interleaved.
+  3. *Self-removal* — the **leader itself** leaves the set. Revision 3
+     specified this sub-case as a single schedule asserting both that
+     the read does not resolve with one acking voter **and** that it
+     then fails with `ErrLeadershipLost` at the step-down following
+     commit. Those two assertions are not simultaneously satisfiable
+     (§23/G2): with `C_new = {b,c}`, one acking voter is `1 < 2` for
+     `checkPendingReads` *and* `1 < 2` for `advanceLeaderCommit`, so
+     the `EntryConfig` never commits, no step-down occurs, and no
+     `ErrLeadershipLost` is ever produced. The sub-case is therefore
+     **two phases against one read**, in this order:
+     - **Phase A (the F3 assertion).** 3→2 self-removal; deliver the
+       `EntryConfig` to exactly one remaining voter, which acks. Assert
+       `acked == 1 < majority(C_new) == 2` and that the read does
+       **not** resolve — revision 2's mechanical `acked := 1` would
+       have resolved it against a one-of-two "majority". Assert in the
+       same breath that the entry has **not** committed and that the
+       leader has **not** stepped down, so the test pins that the read
+       is blocked rather than quietly failed, and that this is the
+       third row of §4.2a's table (blocks to the caller's deadline, not
+       an `ErrLeadershipLost`). Assert the deadline fires and the
+       caller observes a context error, never a result.
+     - **Phase B (the clean-failure assertion).** Heal the second
+       remaining voter so both ack. Hold the read at
+       `appliedIndex < pr.target` (the second row of §4.2a's table —
+       arrange it by keeping `pr.target` above the applied watermark,
+       e.g. by choosing the read's target at the `EntryConfig`'s own
+       index). Assert the `EntryConfig` now commits against a genuine
+       `C_new` majority **not counting the leader**, that the leader
+       steps down at that commit, and that the pending read fails
+       cleanly with `ErrLeadershipLost` on the next pass.
+     - A third, positive phase asserts §4.2a's first row on a separate
+       read: both voters ack and `appliedIndex >= pr.target`, so the
+       read **resolves**, and the harness checks the resolving basis
+       was a majority of `C_new` with the leader excluded.
+  Repeat all three sub-cases with a leader failover interleaved.
 - **DM-18 Membership change refused before generation-2 finalization,
   on both sides.** Assert the leader-side `412` (§8.2) and, separately,
   that a synthetic `EntryConfig` delivered to a node whose durable
@@ -3571,9 +3978,18 @@ not survive.**
      asserted as an exception, not glossed over).
   6. Add a learner to the restored cluster *before* it has taken its
      own snapshot, forcing an `InstallSnapshot` whose
-     `HasConfiguration` is `false`; assert the learner adopts a real
-     configuration from the replicated `AddLearner` entry that follows
-     (§7.2) rather than failing or stalling.
+     `HasConfiguration` is `false`. The replication that follows
+     necessarily carries the restored suffix's **voided** entries from
+     a live leader, so assert explicitly, in this order: (a) the
+     learner **appends** every voided entry it receives and does
+     **not** `Node.fail` (§7.6's accept rule, the §23/G1 correction —
+     this assertion is the whole reason step 6 exists, and revision
+     3's fail-closed wording would have made it fail); (b) the
+     learner's `ConfigAt(lastIndex())` remains the zero
+     `Configuration` — `neverJoined()`, never `selfRemoved()` — while
+     only voided entries have arrived; (c) the learner then adopts a
+     real configuration from the replicated `AddLearner` entry that
+     follows (§7.2) rather than failing or stalling.
   7. **Negative control**: disable part 2 of the transform (leave the
      suffix verbatim) and assert step 4 fails — specifically, that the
      restored node reports `selfRemoved()` and never elects a leader,
@@ -3629,12 +4045,32 @@ suite (`docs/testing-strategy.md` §4/§6.3) with
   SQL statement's `Session.Begin` calls `BeginReadIndex`
   (`internal/sql/engine.go`), so this is the only way to exercise the
   linearizable-read path against a changing voter set on real
-  processes. Assert: no read hangs beyond its context deadline, no read
-  returns state older than a write acknowledged before it, and every
-  read failure is a clean `ErrLeadershipLost`-class error rather than a
-  timeout. Closes §23/P1 at the real-process level (DM-17 closes it
-  deterministically).
-- **Promote the learner to voter.**
+  processes. Assert: no read blocks past its context deadline, and no
+  read returns state older than a write acknowledged before it. Assert
+  further that **every read failure is a clean `ErrLeadershipLost`-class
+  error rather than a deadline expiry, for every step of this suite that
+  runs against a reachable `C_new` majority** — which is every step, by
+  construction: this suite never partitions a remaining voter away from
+  the leader during a membership change. That scoping matters, because
+  §4.2a's third row (no reachable `C_new` majority → the read blocks to
+  the caller's deadline, with no `ErrLeadershipLost` to report) is a
+  legitimate outcome that a blanket "never a timeout" assertion would
+  wrongly call a bug; it is exercised deterministically by DM-17
+  sub-case 3 phase A instead, where the partition can be injected
+  exactly (§23/G2). Closes §23/P1 at the real-process level (DM-17
+  closes it deterministically).
+- **Promote the learner to voter**, **retrying on `425`** under the
+  existing bounded-polling discipline (`docs/testing-strategy.md` §4 —
+  bounded polling with a deadline, never a fixed sleep). The retry is
+  not optional slack: the background writer runs throughout this suite,
+  so `matchIndex == LastIndex()` is only momentarily true and a
+  single-shot promote against `PromotionMaxLagEntries = 0` is a
+  time-of-check/time-of-use race (§3.3, §23/G4). Retrying with the same
+  `requestId` is always safe here because `425` is a pre-proposal
+  refusal that records nothing (§10). Assert that the promote
+  eventually returns `200`, and that every intervening refusal was
+  `425` with a decreasing-or-equal reported `lag` — never a `409`,
+  `412` or `500`.
 - **Force a real leader failover** (`SIGKILL` the current leader,
   existing mechanism) with the 4-voter configuration active; assert a
   real election among the remaining 3 succeeds and writes resume.
@@ -3646,14 +4082,23 @@ suite (`docs/testing-strategy.md` §4/§6.3) with
 - **Remove one of the original three voters** (not the new one) via a
   real admin call against the new leader.
 - **Have the leader remove itself**, with the background SQL reader
-  still running (§4.2, §4.2a). Assert: the removal commits only after
+  still running (§4.2, §4.2a). This step runs against a **healthy**
+  cluster — every remaining voter reachable — which is precisely
+  §4.2a's first and second table rows and excludes the third by
+  construction. Assert: the removal commits only after
   acknowledgements from a genuine majority of `C_new` **not counting
   the leader**; the leader steps down exactly at commit; every SQL read
   in flight across that boundary either returns a correct result or
-  fails with a clean `ErrLeadershipLost`, and none hangs or returns
-  state older than a write acknowledged before it. This is DM-17's
-  third sub-case against real processes, and the only real-process
-  exercise of §4.2a's self-exclusion on the read path.
+  fails with a clean `ErrLeadershipLost`, and none returns state older
+  than a write acknowledged before it. Because the cluster is healthy,
+  a read that ends at its context deadline instead is a **failure** of
+  this step, and the assertion may say so — it is the reachable-quorum
+  case, where §4.2a's third row does not apply. The blocked-read row
+  is deliberately *not* exercised here; DM-17 sub-case 3 phase A
+  exercises it deterministically, where a partition can be injected
+  precisely. This is DM-17's third sub-case against real processes, and
+  the only real-process exercise of §4.2a's self-exclusion on the read
+  path.
 - **Exercise the sub-three-voter guard** (§12.2): attempt a further
   removal taking the cluster to 2 voters without `confirmVoterCount`,
   assert `409`; retry with the correct value, assert success; assert
@@ -3707,8 +4152,27 @@ to liveness. Revision 3 restates one of those three in the form that is
 actually true (`CONFIGURATION BRANCH CONFINEMENT`, §23/F4), extends two
 to boundaries they did not reach (`QUORUM CONTINUITY` to the read path,
 §23/F3; `MEMBERSHIP RECOVERY DETERMINISM` to the WAL round trip,
-§23/F2), and adds one (`RESTORE MEMBERSHIP ISOLATION`, §23/F1) — eleven
-in total.
+§23/F2), and adds one (`RESTORE MEMBERSHIP ISOLATION`, §23/F1).
+Revision 4 changes no invariant's statement; it clarifies the scope of
+`QUORUM CONTINUITY`'s read-path half (§23/G2) and of
+`RESTORE MEMBERSHIP ISOLATION`'s accept-side rule (§23/G1).
+
+**Count, stated once and correctly (§23/G10).** Revisions 2 and 3
+carried two different and both-wrong totals — §17 said "eleven in
+total" and §19 gate 8 said "§17's ten invariants" — while this section
+has always listed **thirteen** headings: **twelve** invariants this
+phase adds to or rewrites in `docs/invariants.md`
+(`LEADER-TERM CONFIGURATION GATE`, `CONFIGURATION BRANCH CONFINEMENT`,
+`SERIALIZED MEMBERSHIP CHANGE`, `QUORUM CONTINUITY`,
+`MEMBERSHIP RECOVERY DETERMINISM`, `RESTORE MEMBERSHIP ISOLATION`,
+`LEARNER NON-INTERFERENCE`, `MEMBERSHIP-SCOPED VOTE ACCEPTANCE`,
+`MINIMUM VOTER INVARIANT`, `SINGLE-SERVER TRANSITION SHAPE`,
+`MEMBERSHIP CHANGE GENERATION GATE`,
+`MEMBERSHIP REQUEST OUTCOME STABILITY`), plus one **pre-existing**
+invariant this phase only *extends* (`NO SILENT FORMAT
+MISINTERPRETATION`, which already exists in `docs/invariants.md` and is
+amended rather than added). §19 gate 8 states the same numbers, and
+§18's matrix has a row for each.
 
 ### `LEADER-TERM CONFIGURATION GATE` (new in revision 2)
 **Statement**: a leader never appends an `EntryConfig` entry unless
@@ -3752,9 +4216,16 @@ That is **false** — and the counterexample is revision 2's own repaired
 DM-12 schedule, in which `C0`, `C1` and `C2` are simultaneously live
 and `C1`/`C2` are two voters apart with disjoint majorities. That state
 is safe, but by Lemma 3 (the superseded branch can never assemble a
-majority, because every majority of it intersects a majority that now
-holds a strictly newer term, and `isLogUpToDate` compares term before
-index), **not** by any window. An invariant that is false in a safe,
+majority, because every majority of it intersects a majority that
+already holds a strictly newer term — or, when the superseded
+configuration is a *committed* one whose successor has committed, a
+majority holding the same term at a **higher index** — and
+`isLogUpToDate` compares term before index and rejects on either),
+**not** by any window. Revision 4 completes that lemma's case analysis:
+revision 3 proved only the two-children-of-one-ancestor case and
+asserted the rest away by a reduction that is false whenever two live
+configurations hang off *different* committed ancestors (§23/G3).
+An invariant that is false in a safe,
 reachable state cannot be asserted by an oracle without producing false
 alarms, which is why this restatement is a test-plan correction as much
 as a prose one.
@@ -3802,7 +4273,17 @@ no-self-exemption rule for `advanceLeaderCommit` only, while
 (`acked := 1`). Translated mechanically, a self-removing leader would
 confirm a ReadIndex against a "majority" containing a non-member — in a
 3→2 self-removal, one real voter standing in for two. §4.2a states the
-rule once for both quorums. **Why it matters**: the first half is required by §2.2
+rule once for both quorums.
+**What this invariant does and does not claim about liveness
+(§23/G2)**: it is a statement about the *basis* of a quorum decision,
+never about a read always terminating in a ChronicleDB-level result. A
+read held by a leader that cannot reach a majority of its current
+`activeConfig` stays pending and ends at the caller's context deadline,
+exactly as it does on a minority-partitioned leader today — §4.2a's
+third table row. Blocking is the conservative direction and is not a
+violation of anything here; **resolving** on a basis that is not a
+genuine current-configuration majority would be.
+**Why it matters**: the first half is required by §2.2
 (append-time-effective); the second half is required because
 `activeConfig` may reflect an uncommitted entry above the boundary that
 can still be truncated. Revision 1 stated only the first half and
@@ -3882,12 +4363,19 @@ the rule and implemented only the snapshot half (§23/F1).
 installed snapshot that carries no configuration.
 **Threatened by**: any restore path that copies WAL payloads through
 without inspecting their type; treating snapshot-only clearing as
-sufficient; letting a live code path emit a `Voided` entry; making
-`ConfigAt` step 1 match on `Type` alone without the kind check.
-**Proof/test obligations**: **DM-21** including its negative control;
-§16's two restore steps, the first of which deliberately backs up
-without snapshotting first; a `buildStaging` unit test asserting index
-and term are preserved entry-for-entry.
+sufficient; letting `ProposeConfigChange` emit a `Voided` entry; making
+`ConfigAt` step 1 match on `Type` alone without the kind check; **and —
+in the opposite direction — rejecting or failing closed on a `Voided`
+entry received on the replication path**, which halts every node that
+joins a restored cluster before it has taken its own snapshot
+(§23/G1).
+**Proof/test obligations**: **DM-21** including its negative control
+and its step 6 (a learner that receives voided entries from a live
+leader appends them and stays up); §16's two restore steps, the first
+of which deliberately backs up without snapshotting first; a
+`buildStaging` unit test asserting index and term are preserved
+entry-for-entry; a `ProposeConfigChange` debug-build assertion that no
+emitted `EntryConfig` ever carries the `Voided` kind.
 
 ### `LEARNER NON-INTERFERENCE`
 **Statement**: a learner never counts toward quorum, never votes, and
@@ -3957,15 +4445,29 @@ a direct unit test attempting removal on a 1-voter cluster; DM-19 for
 the policy layer.
 
 ### `SINGLE-SERVER TRANSITION SHAPE`
-**Statement**: every accepted `EntryConfig` entry represents exactly
-one of the four transitions in §2.6, relative to the immediately
-preceding active configuration; no other transition is ever accepted by
-any replica. **Mechanism**: §2.6's leader-side check plus every
-replica's defense-in-depth re-check. **Threatened by**: a
-leader-side-only check with no follower-side re-verification.
+**Statement**: every `EntryConfig` entry that **establishes a
+configuration** represents exactly one of the four transitions in §2.6,
+relative to the immediately preceding active configuration; no other
+transition is ever accepted by any replica.
+**Scope (clarified in revision 4, §23/G1)**: the statement is about
+configuration-**establishing** entries. A `Voided` entry (§2.5, §7.6)
+establishes none — it carries no `Configuration` to validate — so it is
+outside this invariant's scope entirely and is appended on the ordinary
+replication path like any `EntryNormal` entry. Reading it *into* scope
+is the failure mode: it halts every node that joins a restored cluster
+before that cluster's first snapshot.
+**Mechanism**: §2.6's leader-side check plus every
+replica's defense-in-depth re-check, on establishing entries; plus a
+`ProposeConfigChange` debug-build assertion that no emitted entry
+carries the `Voided` kind, which is where the guarantee lives for
+voided entries because it is the only place a discriminator exists.
+**Threatened by**: a leader-side-only check with no follower-side
+re-verification; **and, in the other direction, extending the
+re-verification to voided entries.**
 **Proof/test obligations**: a property test generating random
 `(C_old, C_new)` pairs and asserting acceptance iff exactly one of the
-four shapes holds.
+four shapes holds; a direct test that a replica appends a received
+`Voided` entry and does not fail (DM-21 step 6).
 
 ### `MEMBERSHIP CHANGE GENERATION GATE` (new in revision 2)
 **Statement**: no `EntryConfig` entry is ever proposed by a node whose
@@ -4021,7 +4523,7 @@ new one, which is the §23/F2 defect.
 | `MEMBERSHIP RECOVERY DETERMINISM` / `ConfigAt`'s four invariants | ✓ (one test per §5 table row; `termAt(snapshotIndex) == snapshotTerm` immediately after `Compact`, the boundary P1 depends on, §2.2a) | DM-7, DM-13, **DM-20**, **DM-21** | **DM-16** (incl. the never-snapshotted bootstrap-fallback case, the `Voided`-entries-only case, and both `snapshotHasConfig` states) | — | §16 restart step | — |
 | `LEARNER NON-INTERFERENCE` (incl. never blocking finalize) | ✓ (commit progress with a dead learner; `Ready` with an unreachable learner) | DM-3 | ✓ | — | §16 | `-race` |
 | `MEMBERSHIP-SCOPED VOTE ACCEPTANCE` (Rule 1) | ✓ (stray never-a-member sender; learner never grants; learner election timeout is a no-op) | DM-9 | — | — | — | — |
-| Leader-contact suppression (Rule 2, Raft §4.2.3; `Core`-owned `heardFromLeader`, node-owned clock) | ✓ (higher-term `RequestVote` ignored while leader contact is fresh; accepted once stale; flag cleared on `InputElectionTimeout` and on step-down; **a non-Voter's disarmed election timer cannot affect any vote decision**, because Rule 1's second clause is evaluated first) | DM-9, DM-14 | — | — | — | — |
+| Leader-contact suppression (Rule 2, Raft §4.2.3; `Core`-owned `heardFromLeader`, node-owned clock) | ✓ (higher-term `RequestVote` ignored while leader contact is fresh; accepted once stale; flag cleared on `InputElectionTimeout` and on step-down; **a non-Voter's disarmed election timer cannot affect any vote decision**, because Rule 1's second clause is evaluated first; **and the composition with `PauseTicksForTest`/`electionTicksPaused`** — freeze ticks, accept a leader `AppendEntries`, then deliver a higher-term `RequestVote` and assert it is ignored with no term bump, §23/G9) | DM-9, DM-14 | — | — | — | — |
 | Replication traffic is **never** membership-filtered | ✓ (self-removing leader's `AppendEntries` still accepted by a follower that adopted `C_new`) | **DM-14** | — | — | §16 | — |
 | `MINIMUM VOTER INVARIANT` (Raft safety layer) | ✓ (1-voter removal refused by `Core`, leader and replica side) | — | — | — | — | — |
 | Sub-three-voter confirmation (operator-policy layer) | ✓ (missing / stale / correct `confirmVoterCount`; fingerprint exclusion) | **DM-19** | — | — | §16's guard step | — |
@@ -4032,10 +4534,10 @@ new one, which is the §23/F2 defect.
 | `NO SILENT FORMAT MISINTERPRETATION` — wire path (§2.5) | ✓ `TestControlKindRangesNeverCollide`; ✓ a real encoded `EntryConfig` payload fed to the *old* `DecodeSetClusterVersion` fails closed | — | — | ✓ | §16's mixed-binary variant | — |
 | `NO SILENT FORMAT MISINTERPRETATION` — disk path (§6.1a) | ✓ a real **typed** `EntryConfig` payload fed to the *old* `DecodeCommitTxn` fails closed (independent of the wire path) | — | — | ✓ | §16's mixed-binary variant | — |
 | Snapshot `FormatVersion` range and configuration presence (§7.1) | ✓ v2 round-trip incl. `Configuration`; ✓ **a real `v0.4.0`-produced snapshot fixture decodes with `HasConfiguration == false`**; ✓ `HasConfiguration == false` round-trips and is **distinguishable from a present-but-empty `Configuration`**; ✓ `hasConfig = 0x02` and `hasConfig = 0x00 with configLen != 0` each refused `ErrCorrupt`; ✓ synthetic `version=3` refused fail-closed; ✓ pre-finalize `Encode` byte-identical to `v0.4.0`'s | — | — | ✓ (fuzz `Decode` across both versions and both flag states) | §16's mixed-binary variant, incl. each node starting against its own pre-existing v1 snapshot | — |
-| `InstallSnapshot` configuration authority (§7.2) | ✓ (`msg.Configuration` ≠ `Meta.Configuration` → `Node.fail`) | DM-8 | — | — | — | — |
-| `RESTORE MEMBERSHIP ISOLATION` (§7.6, new in rev 3) | ✓ (`buildStaging` sets `HasConfiguration = false`; **every `EntryConfig` in the staged suffix is rewritten to `Voided` at its original index and term**; restored `Open` reaches `ConfigAt` step 3; a `Voided` entry applies as a no-op and records no outcome; a `Voided` entry from a live leader is `Node.fail`) | **DM-21** (both carriers, incl. the learner-added-before-first-snapshot step, **with its part-2-disabled negative control**) | — | ✓ (`FuzzDecodeEntryConfig` covers the `Voided` kind) | **§16's two restore steps** (new-identity restore of a backup taken *without* snapshotting first; real `v0.4.0` backup restored under `v0.5.0`) | — |
+| `InstallSnapshot` configuration authority (§7.2) | ✓ (`msg.Configuration` ≠ `Meta.Configuration` → `Node.fail`; **`msg.HasConfiguration` ≠ `Meta.HasConfiguration` → `Node.fail`, asserted separately with both configurations empty**, §23/G8) | DM-8 | — | — | — | — |
+| `RESTORE MEMBERSHIP ISOLATION` (§7.6, new in rev 3) | ✓ (`buildStaging` sets `HasConfiguration = false`; **every `EntryConfig` in the staged suffix is rewritten to `Voided` at its original index and term**; restored `Open` reaches `ConfigAt` step 3; a `Voided` entry applies as a no-op and records no outcome; **a `Voided` entry is accepted unconditionally on the replication path** — the test asserts a follower that receives one from a live leader appends it and does **not** fail (§23/G1); `ProposeConfigChange` can never emit one, pinned by a debug-build assertion) | **DM-21** (both carriers, incl. the learner-added-before-first-snapshot step, **with its part-2-disabled negative control**) | — | ✓ (`FuzzDecodeEntryConfig` covers the `Voided` kind) | **§16's two restore steps** (new-identity restore of a backup taken *without* snapshotting first; real `v0.4.0` backup restored under `v0.5.0`) | — |
 | Restored application state remains exact (§7.6) | ✓ (`BACKUP INTEGRITY`/`BACKUP CONSISTENCY` regression, unchanged assertions) | — | — | — | §16 | — |
-| ReadIndex / linearizable reads across a configuration change (§4.2a) | ✓ (`checkPendingReads` against a changed voter set; newly promoted voter with `ackSeq == 0`; **self-removing leader's own self-ack not counted** — assert a 3→2 self-removal with one remaining acker does *not* resolve; one configuration read per pass) | **DM-17** (all three sub-cases, plus interleaved failover) | — | — | **§16's background SQL reader**, incl. the leader self-removal step | `-race` |
+| ReadIndex / linearizable reads across a configuration change (§4.2a) | ✓ (`checkPendingReads` against a changed voter set; newly promoted voter with `ackSeq == 0`; **self-removing leader's own self-ack not counted** — assert a 3→2 self-removal with one remaining acker does *not* resolve **and that no step-down and no `ErrLeadershipLost` follow, because the entry cannot commit either**, §4.2a's third row; one configuration read per pass) | **DM-17** (all three sub-cases; sub-case 3 in its **two phases plus the positive phase**, one per row of §4.2a's table, §23/G2; plus interleaved failover) | — | — | **§16's background SQL reader**, incl. the leader self-removal step (healthy-cluster rows 1–2 only, by construction) | `-race` |
 | Leader self-removal (§4.2, corrected match-index boundary) | ✓ (propose self-removal, assert the leader's own `matchIndex` is **not** counted; assert commit requires a true `C_new` majority) | DM-2 (incl. the lost-remaining-voter variant), DM-14 | — | — | §16 | — |
 | Stale removed node rejoin attempt (§4.4, §4.5) | ✓ | DM-9, DM-14 | — | — | ✓ (kill + restart-with-old-data-dir a removed node) | — |
 | Uncommitted-promote learner campaigns (§2.3's "surprising but correct") | ✓ | **DM-15** | — | — | — | — |
@@ -4098,8 +4600,19 @@ gates, all required:
    every prior `v0.2.0`–`v0.4.0` release updated its full set of
    affected docs in the landing commit, never as a follow-up). The
    complete, authoritative list, expanded in revision 2:
-   - `docs/invariants.md` — §17's ten invariants (three new, three
-     rewritten, one reclassified to liveness).
+   - `docs/invariants.md` — §17's **twelve** added-or-rewritten
+     invariants, plus the amendment to the pre-existing
+     `NO SILENT FORMAT MISINTERPRETATION` (thirteen headings in §17).
+     All twelve are **new entries in the catalog** — none of them
+     exists in `docs/invariants.md` today, which is why they are
+     "(new, added when implemented)" in the sense
+     `docs/enterprise-v1-plan.md` §5–§7 established; the "new in
+     revision 2 / restated in revision 3" labels on §17's headings are
+     relative to earlier revisions of **this plan**, not to the
+     catalog. `NO SILENT FORMAT MISINTERPRETATION` is the sole
+     pre-existing entry and is amended in place, never re-added.
+     Revisions 2 and 3 gave two different wrong counts here and in
+     §17; §23/G10.
    - `docs/raft.md` — a new "Dynamic membership" resolved-decisions
      section, mirroring the existing `§9`/`§10` Phase-implementation-note
      pattern; must cover `ConfigAt` and §6.3a's accessors, the §2.2a
@@ -4143,8 +4656,13 @@ gates, all required:
      of its single disk is unrecoverable except from backup**
      (recovery-relevant); the fixed HTTP status codes and `reason`
      vocabulary of §9/§13.4, so operator scripts key on documented
-     values; and the post-election `changesReady: false` window (§11)
-     with the instruction to poll rather than treat `503` as failure.
+     values; the post-election `changesReady: false` window (§11)
+     with the instruction to poll rather than treat `503` as failure;
+     and — the same instruction for the same reason — that **`425` on
+     promote is a retryable, records-nothing refusal**, expected on a
+     continuously written cluster because the shipped
+     `PromotionMaxLagEntries` default is `0`, to be retried with the
+     same `requestId` rather than treated as failure (§3.3, §23/G4).
    - A new `docs/adr/0018-dynamic-membership-architecture.md` —
      single-server vs. joint consensus; append-time-effective;
      `Core`-not-FSM placement; the §2.2a gates and why revision 1 was
@@ -4232,8 +4750,12 @@ and 4.
     because the whole point is that no second algorithm exists;
   - update `NewCore`/`NewCoreFromSnapshot` signatures to accept an
     initial `Configuration`;
-  - rewrite the seven identified `cfg.Peers`/`cfg.majority()` call
-    sites (§2.2) to use `activeConfig`;
+  - rewrite **all eight** `cfg.Peers`/`cfg.majority()` call sites
+    enumerated in §2.2's table to use `activeConfig` — including
+    `handleRequestVoteResponse`'s election-win tally, which revisions
+    1–3 omitted from the list (§23/G5); removing `Config.Peers` and
+    `Config.majority()` in this same slice turns any remaining site
+    into a compile error, which is the backstop, not the checklist;
   - `becomeLeader`: initialize `nextIndex`/`matchIndex` over voters
     **and** learners, `nextIndex = lastIndex()+1` for a member first
     seen mid-term, and `pendingConfIndex = lastIndex()` (§2.2a P2);
@@ -4249,19 +4771,26 @@ and 4.
     others;
   - add the `Voided` membership-change kind (§2.5) and make `ConfigAt`
     step 1 skip it; `ProposeConfigChange` must never be able to emit
-    one;
+    one (debug-build assertion), and the accept path must **never**
+    reject or fail on one — it is appended like an `EntryNormal` entry
+    and the four-shape check is not reached (§2.6's carve-out,
+    §23/G1);
   - add `heardFromLeader` (§2.2) — set on accepted leader
     `AppendEntries`/`InstallSnapshot`, cleared on `InputElectionTimeout`
     and step-down — and **no tick state**: the election clock stays in
-    `internal/node` (§2.7 Rule 2);
+    `internal/node` (§2.7 Rule 2). Document the coupling with
+    `PauseTicksForTest`/`electionTicksPaused` on **both** sides, add the
+    frozen-clock unit test, and audit existing callers of that hook
+    (§2.7's second interaction note, §23/G9);
   - `handleRequestVoteRequest`: §2.7 Rule 1;
   - `handleElectionTimeout`: no-op for a node that is not a Voter in
     its own `activeConfig` (§2.7 Rule 1's third clause) — a real
     behavior change, since it campaigns unconditionally today;
   - leader-contact suppression state and check (§2.7 Rule 2);
   - self-removal step-down on commit (§4.2).
-- `messages.go`: add `Message.Configuration` for
-  `MsgInstallSnapshotRequest`.
+- `messages.go`: add `Message.Configuration` **and
+  `Message.HasConfiguration`** for `MsgInstallSnapshotRequest` — the
+  pair, never the configuration alone (§7.2, §8.1, §23/G8).
 - Unit tests: majority-arithmetic table; the four-shapes property test;
   **`ConfigAt`'s four invariants (DM-16)**, including both
   `snapshotHasConfig` states and a log containing only `Voided`
@@ -4297,15 +4826,31 @@ and 4.
   `Meta.HasConfiguration = false` and zero `Meta.Configuration` on the
   staged snapshot, re-encoding a v2 source frame rather than copying
   bytes through.
-- `restore.go`/`copyWALSuffix`'s restore-side caller, **part 2**: while
-  copying each source entry, inspect the payload framing (§6.1a) and
-  rewrite any `EntryConfig` payload into the `Voided` form (§7.6),
-  preserving the entry's index and term exactly, so `copyWALSuffix`'s
-  existing `idx != rec.Index` assertion still holds. This is the half
-  revision 2 omitted, and without it part 1 achieves nothing (§23/F1).
-  `internal/backup` does **not** import `internal/raft`; it matches on
-  the documented payload framing, and a unit test in `internal/raft`
-  pins that framing so the two cannot drift.
+- **Part 2**: while copying each source entry, inspect the payload
+  framing (§6.1a) and rewrite any `EntryConfig` payload into the
+  `Voided` form (§7.6), preserving the entry's index and term exactly,
+  so `copyWALSuffix`'s existing `idx != rec.Index` assertion still
+  holds. This is the half revision 2 omitted, and without it part 1
+  achieves nothing (§23/F1). `internal/backup` does **not** import
+  `internal/raft`; it matches on the documented payload framing, and a
+  unit test in `internal/raft` pins that framing so the two cannot
+  drift.
+- **`copyWALSuffix` is shared by `Export` and `Restore`, so part 2 must
+  be applied to the restore path only (§23/G6).** `copyWALSuffix`
+  (`internal/backup/backup.go`) is called from `Export` — where it
+  copies the live WAL into the backup — *and* from
+  `buildStaging`/`restore.go`. Voiding inside `copyWALSuffix`
+  unconditionally would strip membership out of the **backup itself**,
+  destroying the source's own recoverable history and making the
+  backup differ from the cluster it was taken from. Take the payload
+  transform as an explicit parameter (a `func([]byte) []byte`, or a
+  small `transformNone`/`transformVoidConfigEntries` pair), passed as
+  identity by `Export` and as the voiding rewrite by `buildStaging`;
+  a wrapper function around `copyWALSuffix` used only by restore is
+  equally acceptable. What is **not** acceptable is an unparameterized
+  edit inside the shared helper. A direct unit test asserts that a
+  backup produced by `Export` still contains its `EntryConfig` entries
+  unvoided, so the two directions can never be conflated.
 - Tests: restore of a v1 (real `v0.4.0`) backup; restore of a v2 backup
   into a cluster with different NodeIDs/addresses; assertion that no
   source NodeID survives in **either** carrier; assertion that every
@@ -4325,7 +4870,9 @@ and 4.
   dispatch **with the follower-side generation gate** (§8.2);
   `maybeSnapshot` using `ConfigAt(appliedIndex)` **with the debug
   assertion** (§6.3, §7.4); `handleInstallSnapshot`'s
-  `msg.Configuration` vs. `Meta.Configuration` equality check (§7.2);
+  `msg.Configuration`/`msg.HasConfiguration` vs.
+  `Meta.Configuration`/`Meta.HasConfiguration` pairwise equality check
+  (§7.2 — both fields, §23/G8);
   dial-address table updates on configuration change (§1.8);
   `ErrNodeRemoved` (§4.6); `Node.majority()` and `checkPendingReads`
   against `Core.ActiveConfig()` read **once per pass**, with the
@@ -4463,12 +5010,22 @@ this list**. Only genuinely free choices remain.
 
 **Promoted to plan-level decisions in revision 3:**
 
-- **`PromotionMaxLagEntries` default → pinned at `0`** (§3.3). Not
-  because of safety (promoting a lagging learner is not a safety
-  violation, §3.3) but because of **test determinism**: a non-zero
-  default makes §16's "zero failed commits attributable to the
-  membership change" a timing race instead of an assertion. Still
-  runtime-tunable; the *default* is fixed.
+- **`PromotionMaxLagEntries` default → pinned at `0`, and `425` pinned
+  as retryable** (§3.3, §2.6a, §9). Not because of safety (promoting a
+  lagging learner is not a safety violation, §3.3) but because `0` is
+  the conservative availability-protecting value and because the
+  condition `Core` evaluates is then exact and observable. **Revision 3
+  additionally claimed the pin made the gate "a pure function of
+  observable state"; it does not** (§23/G4) — `lag == 0` is observed by
+  one request and re-evaluated on the event loop afterwards, and §16's
+  background writer moves `LastIndex()` in between, so a single-shot
+  promote is a time-of-check/time-of-use race. The determinism is
+  recovered by pinning the *other* half of the decision: `425` is a
+  pre-proposal, records-nothing refusal and is therefore explicitly
+  retryable with the same `RequestID`, retried by the handler within
+  the request context and by §16's promote step under bounded polling.
+  Still runtime-tunable; the *default* and the *retry semantics* are
+  both fixed.
 - **HTTP status codes → pinned** (§9). They are asserted by §16's
   real-process suite, published in `docs/membership.md`'s runbook, and
   mirrored into §13.4's audit reasons, so they are an interface with
@@ -4479,10 +5036,16 @@ this list**. Only genuinely free choices remain.
 - **`Retry-After` → value free, semantics pinned** (§9, §2.6a). The
   number is tuning. The rules are not: the handler's internal retry
   window is bounded by the request context; a handler retries **only**
-  pre-proposal refusals (P1/P2), never after an entry may have been
-  appended, so at most one `EntryConfig` can result from one admin
-  call; and a surfaced `503` is always safe to retry with the same
-  `RequestID` because nothing was recorded (§10).
+  pre-proposal refusals, never after an entry may have been appended,
+  so at most one `EntryConfig` can result from one admin call; and a
+  surfaced `503` is always safe to retry with the same `RequestID`
+  because nothing was recorded (§10). **Revision 4 fixes the set of
+  retryable refusals at exactly three** (§23/G4): P1's and P2's
+  `ErrConfigChangeNotReady`, and §3.3's `ErrLearnerNotCaughtUp`/`425`
+  — the last because `PromotionMaxLagEntries = 0` makes the promote
+  gate a time-of-check/time-of-use test against a moving
+  `LastIndex()`, not because the request is ever wrong. Every other
+  refusal is terminal for that submission.
 - **`docs/membership.md` → prose free, content pinned** (§19 gate 8).
   Its normative checklist is now enumerated, because three of its items
   are security- or recovery-relevant (certificate revocation on
@@ -4500,22 +5063,28 @@ this list**. Only genuinely free choices remain.
 **What genuinely remains free for the implementing session:**
 
 - The concrete `Retry-After` seconds value and the handler's internal
-  retry budget, within the semantics above.
+  retry budget, within the semantics above — for `425` as well as for
+  `503`, whose retry *semantics* are now pinned identically (§23/G4).
 - `docs/membership.md`'s prose, section ordering and examples, given
   the pinned content list.
 - Log-line wording, metric help strings, and the exact shape of
   debug-build assertions.
 - Whether `internal/backup`'s payload-framing matcher (§7.6 part 2) is
   a small local helper or a shared one, provided the framing contract
-  it depends on is pinned by a test in `internal/raft`.
+  it depends on is pinned by a test in `internal/raft`, and whether the
+  restore-only application of it is expressed as a transform parameter
+  to `copyWALSuffix` or as a restore-side wrapper around it — what is
+  **not** free is applying it unconditionally inside that
+  `Export`-shared helper (§23/G6).
 
 ---
 
-## 23. Review traceability (revision 1 → revision 2 → revision 3)
+## 23. Review traceability (revision 1 → revision 2 → revision 3 → revision 4)
 
 Every finding from the correctness review of planning commit `6df4e68`
-(revision 1 → 2, below) and from the closure review of `d41ec09`
-(revision 2 → 3, at the end of this section), with the section that
+(revision 1 → 2, below), from the closure review of `d41ec09`
+(revision 2 → 3), and from the final approval review of `8b4a7a7`
+(revision 3 → 4, at the end of this section), with the section that
 resolves it. Kept so a future reader can tell
 which parts of this design are load-bearing *because something was
 found to be wrong*, rather than merely asserted — and so no resolution
@@ -4595,3 +5164,42 @@ None of them required changing the consensus architecture.
 | **F8** | `termAt(commitIndex)` at the snapshot boundary was unstated, though P1 depends on it. | §2.2a states it explicitly as existing, unchanged behavior: the sentinel entry gives `snapshotTerm` at `i == snapshotIndex`, `commitIndex >= snapshotIndex` always holds, so the call is always defined and must **not** be "corrected" into an error. Unit test added (§18, §21 slice 1). |
 | **F9** | No `Core` membership accessor was named, though §8.2a, §9, §12.2 and §14 all need one. | New **§6.3a** defines exactly four accessors, requires `ActiveConfig()` to return a **deep copy** (because `refreshStatusLocked` publishes into a struct another goroutine serves), states the event-loop-only rule, and gives the complete caller table. |
 | **F-NB1..4** | `PromotionMaxLagEntries` default, HTTP status codes, `Retry-After`, and `docs/membership.md` prose were listed as free implementation choices. | Re-tested against "can this affect correctness, compatibility, recovery, security or test determinism?" and **four were promoted to plan-level decisions** (§22): the default is pinned at `0` for test determinism; status codes are pinned as a three-consumer interface and paired with a mandatory machine-readable `reason`; `Retry-After`'s semantics are pinned while its value stays free; `docs/membership.md`'s normative content is enumerated while its prose stays free. |
+
+### Revision 3 → revision 4 (final approval review of `8b4a7a7`)
+
+The final review confirmed **F1**–**F9** closed, verified every
+statement revision 3 makes about the current codebase against the tree
+(`checkPendingReads`'s `acked := 1`, `processOutput`'s
+persist-before-apply ordering, the absence of tick state in `Core`,
+`termAt`'s sentinel behaviour, `Decode`'s strict version equality,
+`encodeEntryPayload`'s `term || data` shape, `copyWALSuffix`'s verbatim
+payload copy and index assertion, and the `0xF0`/`2` control-byte
+namespace), and re-confirmed the previously approved consensus
+architecture intact on every point. It found four blocking items, all
+of them **claims outrunning their mechanisms** or one rule
+contradicting itself, and none of them requiring a mechanism change.
+
+#### Correctness gaps
+
+| ID | Finding | Resolution |
+|---|---|---|
+| **G1** | §7.6 declared, in consecutive sentences, that a voided `EntryConfig` "arriving from a **live leader**" is `Node.fail` **and** that a restored directory legitimately replicates its voided entries onward ("and the entries it replicates from it"), a claim §7.2 and DM-21 step 6 both depend on. Both cannot hold. The fail-closed reading halts any node that joins a restored cluster before that cluster has taken its own snapshot — it receives the restored boundary by `InstallSnapshot` (§7.2's blessed `HasConfiguration == false` path) and then the restored suffix's voided entries by ordinary `AppendEntries` — which is DM-21 step 6's exact schedule and the first operation a DR runbook performs. The rule is also not implementable: a receiver has no signal separating "replicated out of a restored directory's durable log" from "invented by a live leader", since both arrive as an `AppendEntries` from the current leader and no node knows another node's restore boundary. | §7.6's bullet rewritten: a voided entry is **accepted unconditionally on the replication path**, exactly like an `EntryNormal` entry, and fail-closed is confined to the emit side where a discriminator genuinely exists — `ProposeConfigChange` can never construct one (§2.6a check 5 admits only the four shapes), pinned by a debug-build assertion. `RESTORE MEMBERSHIP ISOLATION`'s "threatened by" list gains the **opposite** direction (rejecting a replicated voided entry) as a named hazard; DM-21 step 6 now asserts the acceptance explicitly, in order, as the reason the step exists; §18's row restated. |
+
+#### Proof / test gaps
+
+| ID | Finding | Resolution |
+|---|---|---|
+| **G2** | §4.2a claimed a read across a self-removal "either resolves against a genuine `C_new` majority or fails cleanly at step-down — never resolves against a phantom majority, and **never hangs**", and DM-17's self-removal sub-case asserted, of one schedule, both that the read does not resolve with one acking voter **and** that it then fails with `ErrLeadershipLost` "at the step-down that follows commit". Those are not simultaneously satisfiable: with `C_new = {b,c}`, one acking voter is `1 < 2` for `checkPendingReads` *and* `1 < 2` for `advanceLeaderCommit`, so the `EntryConfig` never commits, the leader never steps down, and no `ErrLeadershipLost` is ever produced — the read blocks to the caller's deadline. §16 carried the same overstatement ("every read failure is a clean `ErrLeadershipLost`-class error rather than a timeout"). | §4.2a now gives the **complete three-row case table** (resolve; `ErrLeadershipLost` at step-down; blocks to deadline when no `C_new` majority is reachable) and says plainly that the third row is not a hang in the Phase-8 sense but the ordinary behaviour of a linearizable read on a leader that cannot assemble its quorum — blocking is the conservative direction; resolving would be the bug. DM-17 sub-case 3 is restructured into **two phases plus a positive phase**, one per row. §16's SQL-reader and self-removal assertions are **scoped to the reachable-majority case**, which is every step that suite runs, with the blocked-read row deliberately left to DM-17 where a partition can be injected exactly. `QUORUM CONTINUITY` gains an explicit "what this invariant does and does not claim about liveness" paragraph; §18's read row restated. |
+| **G3** | §2.3's Lemma 3 reduced every non-adjacent pair of live configurations to "two distinct children of **one** common committed ancestor" by asserting that children of *different* committed elements "would differ by at most one voter along the chain". That is false: with a committed chain `{a,b,c} → {a,b,c,d} → {a,b,c,d,e}`, a partitioned node still holding the uncommitted child `{a,b,c,x}` of the first, and a child `{a,b,c,d,e,f}` of the third live on the majority side, the two are five voters apart and hang off different ancestors. The state is reachable (DM-22's shape plus two further committed transitions), so the proof covered nothing there — and the theorem's non-adjacent branch rests entirely on Lemma 3. | Lemma 3 rewritten with an explicit **anchor** definition and a complete case split: Case 1 (anchors coincide — revision 3's argument, retained verbatim and now correctly scoped); Case 2a (anchors differ, `C` a child of its anchor — reduced to Case 1 with `C' := C_{a+1}`, with the `term(L) < t` step proved from P1 plus `commitIndex` being a prefix bound); and **Case 2b** (anchors differ, `C` *is* its anchor — a committed configuration still live on a node that has not seen its successor), which revision 3 had no case for and which the term comparison alone cannot settle, because such a node may legitimately hold an entry of the successor's own term. Case 2b is closed by **index** domination: every node holding `C_a` necessarily lacks `C_{a+1}`'s entry at `(k, t)` (holding it would change its `activeConfig`), every majority of `C_a` meets the `C_{a+1}` majority that holds `(k, t)` by Lemma 1, and `isLogUpToDate` rejects on the index comparison at equal terms. A closing note records that a committed configuration is superseded only once its successor exists, which is why DM-22's three live configurations are safe *without* Lemma 3 being invoked on arrival. §17's `CONFIGURATION BRANCH CONFINEMENT` summary updated to name both rejection branches. |
+| **G4** | §3.3 pinned `PromotionMaxLagEntries = 0` **for test determinism**, on the claim that with `0` "the gate is a pure function of observable state (poll until `lag == 0`, then promote)". It is a time-of-check/time-of-use race: `lag == 0` is observed by one HTTP request and re-evaluated by `PromoteToVoter` on the event loop afterwards, and §16 runs a background `/propose` writer across the entire test, so `LastIndex()` advances in between and the promote returns `425`. The stricter the threshold, the tighter the window — so the pin made §19 gate 4 less reliable, not more, in the name of determinism. It is an operational statement too: with the shipped default, promotion on a continuously written cluster needs retry or quiescence. | Both halves of the decision are now pinned. The default **stays `0`** — it is the conservative, availability-protecting value, and loosening it would trade a real guarantee for a test convenience — and `425`/`ErrLearnerNotCaughtUp` is pinned as an **explicitly retryable, records-nothing pre-proposal refusal**, joining §2.6a's checks 2–3 as the third such refusal the admin layer may retry on the operator's behalf under the identical `RequestID`-untouched discipline. §2.6a's retry paragraph now enumerates all three; §9's status-code table names `425`/`503` as the retryable pair and `400`/`409`/`412` as terminal; §16's promote step retries under the existing bounded-polling discipline and asserts every intervening refusal was a `425` with non-increasing `lag`; §19 gate 8's `docs/membership.md` content list requires the runbook to say so; §22's F-NB1 entry records that revision 3's stated justification was wrong and where the determinism actually lives. |
+
+#### Non-blocking items, all closed rather than deferred
+
+| ID | Finding | Resolution |
+|---|---|---|
+| **G5** | §2.2 and §21 slice 1 both said "seven" `cfg.Peers`/`cfg.majority()` call sites and enumerated a list omitting `handleRequestVoteResponse`'s election-win tally (`len(c.votesReceived) >= c.cfg.majority()`) — the **election** quorum, the one site this plan can least afford to leave on a stale configuration. Harmless in practice (slice 1 removes `Config.Peers`/`Config.majority()`, so every missed site is a compile error) but the plan presents this enumeration the same way it presents §6.3's and §6.3a's exhaustive tables. | §2.2 replaces the prose list with an **eight-row table**, `handleRequestVoteResponse` included and flagged, and records the structural backstop as a backstop rather than as the checklist; it also states which rows learner fan-out is added to and which it must never be added to. §21 slice 1 says "all eight" and names the previously omitted row. |
+| **G6** | §21 slice 3b said "`copyWALSuffix`'s restore-side caller" for §7.6's part-2 transform, but `copyWALSuffix` is shared: `Export` calls it to copy the live WAL **into** the backup, and `buildStaging` calls it to copy the backup into staging. An unparameterized edit inside the shared helper would void membership out of the backup itself. | §7.6 and §21 slice 3b both now require the transform to be **passed in** (or applied through a restore-only wrapper), with `Export` passing identity, and add a unit test asserting a backup produced by `Export` still carries its `EntryConfig` entries unvoided. |
+| **G7** | §1.1 translated `Config.validate()` as "`Bootstrap.Voters` must include `ID`" with the carve-out only implied in a parenthetical. Today's check is unconditional, so a literal translation would reject §3.1's never-joined learner, which is constructed with a deliberately **empty** `Bootstrap`. | §1.1 states the predicate explicitly as a conditional (non-empty `Bootstrap` must include `ID`; an entirely empty `Bootstrap` is valid), explains why it is a bootstrap-seed well-formedness check rather than a membership check, and requires a unit test pinning both branches. |
+| **G8** | §7.2 described `MsgInstallSnapshotRequest` as gaining `Configuration` and cross-checked only that value against `Meta.Configuration`, while §8.1's generation-2 definition names `Configuration` **and** `HasConfiguration`. A flag-only disagreement with both configurations empty would pass a value-only check silently — and the flag is what decides whether the configuration is read at all (§6.3 step 2). | §7.2 now treats the two as a **pair** on the wire exactly as they are in the durable frame, and the `handleInstallSnapshot` check covers both fields; §21 slice 1's `messages.go` bullet, slice 4's check, DM-8 and §18's row all name the pair. |
+| **G9** | `Core.heardFromLeader` is cleared by `InputElectionTimeout`, which the existing test-only `PauseTicksForTest`/`electionTicksPaused` hook suppresses. Under a frozen election clock the flag stays `true` indefinitely and that node ignores every `RequestVoteRequest`, including higher-term ones — correct as a composition, but a real behavioural change for any test that freezes ticks on one node and expects another's election to succeed. | §2.7 gains a second interaction note stating the coupling, requiring it to be documented on **both** sides (`heardFromLeader`'s and `PauseTicksForTest`'s doc comments), adding a direct unit test that pins the composition, and requiring an audit of existing `PauseTicksForTest` callers when slice 1 lands — resuming ticks rather than weakening Rule 2 where a vote must be granted. Scoped as an implementation-time obligation: no production path freezes ticks, and on a Voter or a Leader the flag can never go stale. §18's Rule 2 row and §21 slice 1 updated. |
+| **G10** | §17 said "eleven in total" and §19 gate 8 said "§17's ten invariants", while §17 lists thirteen headings. | §17 states the count once and correctly — **twelve** added-or-rewritten catalog entries plus one pre-existing entry (`NO SILENT FORMAT MISINTERPRETATION`) amended in place — and notes that the "new in revision 2 / restated in revision 3" heading labels are relative to earlier revisions of *this plan*, not to `docs/invariants.md`, in which none of the twelve exists yet. §19 gate 8 repeats the same numbers. |
