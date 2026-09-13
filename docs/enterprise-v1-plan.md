@@ -984,6 +984,13 @@ not a compatibility-mechanism concern).
 §7's FSM-command versioning, since membership changes add new command
 kinds).
 
+See [`docs/dynamic-membership-plan.md`](dynamic-membership-plan.md) for
+the detailed, implementation-ready design that resolves this section's
+architecture at engineering granularity (exact append-time-effective
+mechanism, the quorum-intersection proof, and the Core/FSM placement
+decision) — planning only, not yet implemented, produced against
+baseline commit `8eeb0aa`.
+
 ### Current gap
 
 The Raft cluster is static — three nodes, fixed at creation

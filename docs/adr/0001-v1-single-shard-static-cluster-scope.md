@@ -66,6 +66,15 @@ are deferred (see [`docs/non-goals.md`](../non-goals.md)).
   obligations. This is a proof-obligation reduction, not a
   correctness weakening of what V1 does claim.
 
+## Later Reference
+
+[`docs/dynamic-membership-plan.md`](../dynamic-membership-plan.md)
+(planning only, not yet implemented) narrows the static-cluster
+decision above to "static unless changed via a documented
+single-server-change mechanism" for a future `v0.5.0` — it does not
+revisit the single-shard decision, which remains unchanged and out of
+scope for that plan.
+
 ## Testing and Proof Obligations
 
 - The scenario corpus ([`docs/scenario-corpus.md`](../scenario-corpus.md))

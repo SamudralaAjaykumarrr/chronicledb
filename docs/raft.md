@@ -220,6 +220,10 @@ Full recovery ordering is specified in [`docs/recovery.md`](recovery.md).
 
 - Static, fixed three-node membership. No joint-consensus
   reconfiguration protocol in V1 (see [`docs/non-goals.md`](non-goals.md)).
+  A detailed, not-yet-implemented plan to narrow this to "static unless
+  changed via a documented single-server-change mechanism" exists at
+  [`docs/dynamic-membership-plan.md`](dynamic-membership-plan.md)
+  (target release `v0.5.0`).
 - No pre-vote optimization, no leader leases, no follower reads in V1
   (see [`docs/replication.md`](replication.md) §Read Consistency for
   why lease reads specifically are deferred).
