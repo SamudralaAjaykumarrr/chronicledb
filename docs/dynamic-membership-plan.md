@@ -155,6 +155,27 @@ documents `heardFromLeader`'s composition with the existing
 invariant count once, correctly, in both places that carried a
 different wrong number (G10).
 
+**Revision 5 — proof-detail finalization.** A fourth review, of
+revision 4 (planning commit `1900617`), confirmed **G1**–**G10** closed
+and returned one proof gap (**H1**) plus three cosmetic/test-wording
+items (**H2**–**H4**). Revision 5 changes **no mechanism and no
+conclusion**: it corrects one intermediate bound inside §2.3's Lemma 3
+Case 1, which was stated as `<= term(L)` where the reachable bound is
+`< term(L')` (a leader may legitimately be elected on an *uncommitted*
+configuration branch and extend it, which makes a node's `activeConfig`
+and its **anchor** different things — revision 4's justification
+conflated them); replaces §16's promote-step "decreasing-or-equal
+`lag`" assertion, which required a monotonicity nothing provides
+against a `LastIndex()` the background writer advances, with a bound
+the test sets from its own inputs; states explicitly that DM-17
+sub-case 3's two phases observe **one** read — the caller's context
+error in Phase A, then that same still-registered read's
+`ErrLeadershipLost` on its buffered `resultCh` in Phase B, with no
+second `BeginReadIndex`; and fixes §2.2's call-site count, which mixed
+per-row and per-function conventions in one sentence. Lemma 3's
+conclusion, the theorem that rests on it, and every one of §17's
+invariants are unchanged.
+
 Revision 1's baseline remains commit `8eeb0aa`; revision 2 is written
 against `6df4e68` (`docs: define v0.5.0 dynamic membership plan`),
 revision 3 against `d41ec09` (`docs: harden v0.5.0 membership plan
@@ -585,8 +606,19 @@ type Core struct {
 Every existing call site that iterated `c.cfg.Peers` or called
 `c.cfg.majority()` is changed to `c.activeConfig.Voters` /
 `c.activeConfig.majority()`. The complete enumeration against the
-current tree — **eight**, six in `internal/raft/core.go` and two
-mirrored copies in `internal/node`:
+current tree is the table below: **eight rows**, seven in
+`internal/raft/core.go` and one covering the two mirrored copies in
+`internal/node`. **One counting convention, used by the table and the
+prose alike (§23/H4)**: a row is one *quorum-or-fan-out computation*,
+not one function and not one `for` statement — `handleElectionTimeout`
+contributes two rows (its peer fan-out and its single-node instant-win
+check), `becomeLeader`'s two peer loops are one row (a single
+`nextIndex`/`matchIndex` initialization over one member set), and
+`internal/node`'s `Node.majority()` and `checkPendingReads` are one row
+because they are two halves of the same read-quorum computation.
+Counted by *function* the same set is six in `internal/raft/core.go`
+plus two in `internal/node`; revision 4 mixed the two conventions in
+one sentence. The table is authoritative:
 
 | # | Call site | What it computes |
 |---|---|---|
@@ -833,7 +865,7 @@ commitIndex`. Hence the `EntryConfig` entry that produced `L`'s
 `activeConfig` (or the snapshot/bootstrap boundary, if
 `activeConfigIndex == 0`) is itself committed. ∎
 
-#### Lemma 3 (superseded-branch exclusion) — new in revision 3, completed in revision 4
+#### Lemma 3 (superseded-branch exclusion) — new in revision 3, completed in revision 4, Case 1's bound corrected in revision 5
 
 Two live configurations that are **not** adjacent are never both
 decisive: at least one is superseded, and a superseded configuration
@@ -879,17 +911,78 @@ of `C_a` durably holds an entry of term `term(L')`.**
 
 Now take any majority `M` of `C`. `C` and `C_a` are adjacent (W2), so
 by Lemma 1 `M` intersects every majority of `C_a` — in particular the
-one holding that term-`term(L')` entry. So `M` contains a node whose
-`lastLogTerm >= term(L') > term(L)`. Any candidate holding `C` carries
-a log whose last entry is from a term `<= term(L)`: it branched from
-`C_a` under `L`, and no leader of a later term extended that branch (a
-later leader extending it would have had `C` as *its* own anchor, which
-makes `C` committed and, by W1's no-siblings clause, an element of the
-chain rather than a sibling of one). The existing `isLogUpToDate` rule
-compares last-log **term before index**
-(`internal/raft/core.go`, unchanged), so every such node rejects that
-candidate **regardless of how long its log is**. `C` therefore has no
-assemblable majority: it is superseded.
+one holding that term-`term(L')` entry. So **`M` contains a node whose
+`lastLogTerm >= term(L')`.**
+
+**The candidate-side bound is `< term(L')`, not `<= term(L)`, and
+revision 4 stated the wrong one (§23/H1).** Revision 4 wrote that a
+candidate holding `C` "carries a log whose last entry is from a term
+`<= term(L)`", justified by "no leader of a later term extended that
+branch (a later leader extending it would have had `C` as *its* own
+anchor, which makes `C` committed)". That justification conflates a
+node's **anchor** (its newest *committed* configuration) with its
+**`activeConfig`** (which is `ConfigAt(lastIndex())` and may rest on an
+uncommitted entry — §2.2, §6.3). A leader elected on `C`'s branch holds
+`C` as its `activeConfig` while its anchor stays `C_a` and `C` stays
+uncommitted, so that branch can legitimately be extended with entries
+of a term **above** `term(L)`. The state is reachable under this
+document's own gates, because P1/P2/P3 gate `EntryConfig` appends only
+— never elections, never `EntryNormal` appends:
+
+| # | Event |
+|---|---|
+| 1 | `C_a = {a,b,c,d}` is committed; `a` leads term 1 and appends idx `k` `Remove(d)` → `C = {a,b,c}`, persisted locally, replicated to nobody. `a` crashes. |
+| 2 | `a` restarts as a **Follower** with idx `k` durable, so its `activeConfig` is `C` (§6.3 step 1) and it is a Voter in it. Its election timer fires; it campaigns at term 2 needing 2 of `{a,b,c}`; `b`'s log ends at `k-1`, so `b` grants (`isLogUpToDate`). `a` wins and appends a term-2 no-op at `k+1`. **`C`'s branch now carries term 2 > `term(L) = 1`.** `a` is then partitioned. |
+| 3 | `c` campaigns at term 3 with `activeConfig = C_a` (it never saw idx `k`), wins with `{b,c,d}`, commits its election no-op under `C_a` (P1 ✓, P2 ✓, P3 ✓), then appends `C' = Remove(a) = {b,c,d}`. |
+
+`C` and `C'` are live, non-adjacent, and share the anchor `C_a`, so this
+is Case 1 — and `a`'s last log term is `2`, not `term(L) = 1`. W2 holds
+at every step (`C` is a single-shape child of the newest committed
+configuration in `a`'s log), so nothing earlier in this section excludes
+the schedule. The lemma's **conclusion** is unaffected; only this step's
+bound is.
+
+**The corrected step.** *Every candidate holding `C` has
+`lastLogTerm < term(L')`.* Every entry above idx `k` in such a
+candidate's log was appended by a leader that itself held `C` at that
+moment: the entry sits above `C`'s establishing entry with no
+configuration-establishing entry in between (otherwise the candidate's
+`activeConfig` would not be `C`, §6.3 step 1), and by log matching that
+leader held the same prefix. So the candidate's `lastLogTerm` is
+`term(L'')` for some leader `L''` that held `C`, with `L'' = L` when the
+branch was never extended, and it suffices to show `term(L'') <
+term(L')` for every such `L''`. Suppose not; `term(L'') = term(L')` is
+impossible (`RAFT ELECTION SAFETY`: two leaders never share a term), so
+suppose `term(L'') > term(L')`. Two orderings exhaust the schedule, and
+both are contradictory:
+
+- *`L''` was elected before `L'` committed its own term entry.* `L''`
+  was elected while holding `C`, so a majority of `C` voted for it and
+  advanced `currentTerm` to `term(L'')`. `C` and `C_a` are adjacent, so
+  by Lemma 1 **every** majority of `C_a` contains one of those nodes.
+  P1 requires `L'` to commit an entry of term `term(L')` under `C_a`
+  before appending `C'`, which requires a majority of `C_a` to accept an
+  `AppendEntries` of term `term(L') < term(L'')` — and every such
+  majority contains a node already at `term(L'')`, which rejects it
+  (existing term rule, unchanged). `L'` can therefore never satisfy P1,
+  so `C'` is never appended: contradiction.
+- *`L'` committed its own term entry first.* Then, by the paragraph
+  above, every majority of `C` already contained a node with
+  `lastLogTerm >= term(L')`, while `L''`'s own log at candidacy ended on
+  `C`'s branch at a term below `term(L')`. `isLogUpToDate` denies it
+  every such vote, so `L''` could not have been elected at all:
+  contradiction.
+
+Hence `term(L'') < term(L')` in every reachable schedule, and every
+candidate holding `C` presents `lastLogTerm < term(L')`.
+
+The existing `isLogUpToDate` rule compares last-log **term before
+index** (`internal/raft/core.go`, unchanged), so every node in `M`
+rejects every such candidate **regardless of how long its log is**. `C`
+therefore has no assemblable majority: it is superseded. In the worked
+schedule above that is exactly what happens — `{b,c,d}` holds term 3,
+every 2-subset of `{a,b,c}` meets it, and `a`'s term-4 candidacy
+carrying a term-2 tail is denied by term.
 
 **Case 2 — the anchors differ (`C_a` strictly precedes `C_b`).** `C_b`
 is an anchor and is therefore committed, and it is a strict descendant
@@ -3888,7 +3981,10 @@ not survive.**
      `checkPendingReads` *and* `1 < 2` for `advanceLeaderCommit`, so
      the `EntryConfig` never commits, no step-down occurs, and no
      `ErrLeadershipLost` is ever produced. The sub-case is therefore
-     **two phases against one read**, in this order:
+     **two phases against one single read**, in this order — and the
+     split between the caller-side and the node-side view of that one
+     read is what makes both phases simultaneously satisfiable
+     (§23/H3):
      - **Phase A (the F3 assertion).** 3→2 self-removal; deliver the
        `EntryConfig` to exactly one remaining voter, which acks. Assert
        `acked == 1 < majority(C_new) == 2` and that the read does
@@ -3898,17 +3994,39 @@ not survive.**
        leader has **not** stepped down, so the test pins that the read
        is blocked rather than quietly failed, and that this is the
        third row of §4.2a's table (blocks to the caller's deadline, not
-       an `ErrLeadershipLost`). Assert the deadline fires and the
-       caller observes a context error, never a result.
-     - **Phase B (the clean-failure assertion).** Heal the second
-       remaining voter so both ack. Hold the read at
-       `appliedIndex < pr.target` (the second row of §4.2a's table —
-       arrange it by keeping `pr.target` above the applied watermark,
-       e.g. by choosing the read's target at the `EntryConfig`'s own
-       index). Assert the `EntryConfig` now commits against a genuine
-       `C_new` majority **not counting the leader**, that the leader
-       steps down at that commit, and that the pending read fails
-       cleanly with `ErrLeadershipLost` on the next pass.
+       an `ErrLeadershipLost`). Assert the deadline fires and **the
+       caller observes a context error from `BeginReadIndex`**
+       (`ctx.Err()`), never a result.
+     - **Between the phases: the read is still alive on the node.**
+       `BeginReadIndex`'s caller-side deadline (its second `select`,
+       `internal/node/node.go`) returns `ctx.Err()` to the caller and
+       does **nothing** to `n.pendingReads`: the `pendingRead` entry
+       stays registered until `checkPendingReads` resolves or fails it,
+       and its `resultCh` is buffered (capacity 1), so a later
+       resolution neither blocks the event loop nor is lost. Phase A
+       ends the *caller's* wait, not the read — which is why the two
+       phases assert different outcomes without contradicting each
+       other.
+     - **Phase B (the clean-failure assertion), against that same
+       still-pending read.** Heal the second remaining voter so both
+       ack. Hold the read at `appliedIndex < pr.target` (the second row
+       of §4.2a's table — arrange it by keeping `pr.target` above the
+       applied watermark, e.g. by choosing the read's target at the
+       `EntryConfig`'s own index). Assert the `EntryConfig` now commits
+       against a genuine `C_new` majority **not counting the leader**,
+       that the leader steps down at that commit, and that the
+       **original** pending read fails cleanly with `ErrLeadershipLost`
+       on the next `checkPendingReads` pass — observed by receiving
+       that error **from that read's own buffered `resultCh`**, which
+       the harness retains from Phase A.
+     - **The test must not issue a second `BeginReadIndex` for Phase
+       B.** A fresh read would be registered *after* the configuration
+       change and would exercise a different schedule: §4.2a's row 2
+       requires a read whose `term`/`requiredSeq` were captured
+       **before** the self-removal, which is exactly the read Phase A
+       left pending. Re-reading would silently convert this sub-case
+       into a duplicate of the positive phase and lose row 2's
+       coverage entirely.
      - A third, positive phase asserts §4.2a's first row on a separate
        read: both voters ack and `appliedIndex >= pr.target`, so the
        read **resolves**, and the harness checks the resolving basis
@@ -4067,10 +4185,38 @@ suite (`docs/testing-strategy.md` §4/§6.3) with
   single-shot promote against `PromotionMaxLagEntries = 0` is a
   time-of-check/time-of-use race (§3.3, §23/G4). Retrying with the same
   `requestId` is always safe here because `425` is a pre-proposal
-  refusal that records nothing (§10). Assert that the promote
-  eventually returns `200`, and that every intervening refusal was
-  `425` with a decreasing-or-equal reported `lag` — never a `409`,
-  `412` or `500`.
+  refusal that records nothing (§10). The step's assertions, **stated
+  against explicitly-set inputs rather than against any monotonicity of
+  a moving observable (§23/H2)**, are:
+  - the promote **eventually returns `200`** within the step's bounded
+    polling deadline;
+  - **every intervening refusal is a `425`** — never a `409`, `412` or
+    `500`. This is the assertion that actually distinguishes the
+    retryable pre-proposal refusal from every terminal one, and it is
+    deterministic because the refusal's *kind* is a function of which
+    check failed, not of timing;
+  - **every reported `lag` is within a bound the test sets itself**
+    (`maxAllowedLag`), from inputs it controls: the background writer is
+    configured with a fixed in-flight write budget `W` (its `/propose`
+    calls are issued with bounded concurrency, not free-running), the
+    step asserts `lag <= W + 1` on every refusal, and the run fails if
+    any refusal exceeds it. `lag` is `LastIndex() - matchIndex` against
+    a `LastIndex()` the writer is still advancing, so it may legitimately
+    **rise** between two attempts; revision 4's "decreasing-or-equal"
+    assertion required a monotonicity nothing provides and is
+    withdrawn. What matters operationally — and what this bound
+    checks — is that the learner is *keeping up*, not that each
+    observation improves on the last;
+  - when the promote returns `200`, the learner's `matchIndex` **was**
+    equal to `LastIndex()` at the instant `Core` evaluated it (§3.3),
+    which is the state-based assertion "zero failed commits
+    attributable to the membership change itself" rests on.
+  A test that needs the refusal path itself to be deterministic sets
+  its own threshold rather than relying on the shipped default: it
+  configures `PromotionMaxLagEntries` explicitly (`0` to force the
+  strict gate, or a value above `W + 1` to force first-try success)
+  and asserts against the value it set. No assertion in this suite may
+  depend on the shipped default remaining `0` (§23/G4, §23/H2).
 - **Force a real leader failover** (`SIGKILL` the current leader,
   existing mechanism) with the 4-voter configuration active; assert a
   real election among the remaining 3 succeeds and writes resume.
@@ -5079,7 +5225,7 @@ this list**. Only genuinely free choices remain.
 
 ---
 
-## 23. Review traceability (revision 1 → revision 2 → revision 3 → revision 4)
+## 23. Review traceability (revision 1 → revision 2 → revision 3 → revision 4 → revision 5)
 
 Every finding from the correctness review of planning commit `6df4e68`
 (revision 1 → 2, below), from the closure review of `d41ec09`
@@ -5189,9 +5335,9 @@ contradicting itself, and none of them requiring a mechanism change.
 
 | ID | Finding | Resolution |
 |---|---|---|
-| **G2** | §4.2a claimed a read across a self-removal "either resolves against a genuine `C_new` majority or fails cleanly at step-down — never resolves against a phantom majority, and **never hangs**", and DM-17's self-removal sub-case asserted, of one schedule, both that the read does not resolve with one acking voter **and** that it then fails with `ErrLeadershipLost` "at the step-down that follows commit". Those are not simultaneously satisfiable: with `C_new = {b,c}`, one acking voter is `1 < 2` for `checkPendingReads` *and* `1 < 2` for `advanceLeaderCommit`, so the `EntryConfig` never commits, the leader never steps down, and no `ErrLeadershipLost` is ever produced — the read blocks to the caller's deadline. §16 carried the same overstatement ("every read failure is a clean `ErrLeadershipLost`-class error rather than a timeout"). | §4.2a now gives the **complete three-row case table** (resolve; `ErrLeadershipLost` at step-down; blocks to deadline when no `C_new` majority is reachable) and says plainly that the third row is not a hang in the Phase-8 sense but the ordinary behaviour of a linearizable read on a leader that cannot assemble its quorum — blocking is the conservative direction; resolving would be the bug. DM-17 sub-case 3 is restructured into **two phases plus a positive phase**, one per row. §16's SQL-reader and self-removal assertions are **scoped to the reachable-majority case**, which is every step that suite runs, with the blocked-read row deliberately left to DM-17 where a partition can be injected exactly. `QUORUM CONTINUITY` gains an explicit "what this invariant does and does not claim about liveness" paragraph; §18's read row restated. |
-| **G3** | §2.3's Lemma 3 reduced every non-adjacent pair of live configurations to "two distinct children of **one** common committed ancestor" by asserting that children of *different* committed elements "would differ by at most one voter along the chain". That is false: with a committed chain `{a,b,c} → {a,b,c,d} → {a,b,c,d,e}`, a partitioned node still holding the uncommitted child `{a,b,c,x}` of the first, and a child `{a,b,c,d,e,f}` of the third live on the majority side, the two are five voters apart and hang off different ancestors. The state is reachable (DM-22's shape plus two further committed transitions), so the proof covered nothing there — and the theorem's non-adjacent branch rests entirely on Lemma 3. | Lemma 3 rewritten with an explicit **anchor** definition and a complete case split: Case 1 (anchors coincide — revision 3's argument, retained verbatim and now correctly scoped); Case 2a (anchors differ, `C` a child of its anchor — reduced to Case 1 with `C' := C_{a+1}`, with the `term(L) < t` step proved from P1 plus `commitIndex` being a prefix bound); and **Case 2b** (anchors differ, `C` *is* its anchor — a committed configuration still live on a node that has not seen its successor), which revision 3 had no case for and which the term comparison alone cannot settle, because such a node may legitimately hold an entry of the successor's own term. Case 2b is closed by **index** domination: every node holding `C_a` necessarily lacks `C_{a+1}`'s entry at `(k, t)` (holding it would change its `activeConfig`), every majority of `C_a` meets the `C_{a+1}` majority that holds `(k, t)` by Lemma 1, and `isLogUpToDate` rejects on the index comparison at equal terms. A closing note records that a committed configuration is superseded only once its successor exists, which is why DM-22's three live configurations are safe *without* Lemma 3 being invoked on arrival. §17's `CONFIGURATION BRANCH CONFINEMENT` summary updated to name both rejection branches. |
-| **G4** | §3.3 pinned `PromotionMaxLagEntries = 0` **for test determinism**, on the claim that with `0` "the gate is a pure function of observable state (poll until `lag == 0`, then promote)". It is a time-of-check/time-of-use race: `lag == 0` is observed by one HTTP request and re-evaluated by `PromoteToVoter` on the event loop afterwards, and §16 runs a background `/propose` writer across the entire test, so `LastIndex()` advances in between and the promote returns `425`. The stricter the threshold, the tighter the window — so the pin made §19 gate 4 less reliable, not more, in the name of determinism. It is an operational statement too: with the shipped default, promotion on a continuously written cluster needs retry or quiescence. | Both halves of the decision are now pinned. The default **stays `0`** — it is the conservative, availability-protecting value, and loosening it would trade a real guarantee for a test convenience — and `425`/`ErrLearnerNotCaughtUp` is pinned as an **explicitly retryable, records-nothing pre-proposal refusal**, joining §2.6a's checks 2–3 as the third such refusal the admin layer may retry on the operator's behalf under the identical `RequestID`-untouched discipline. §2.6a's retry paragraph now enumerates all three; §9's status-code table names `425`/`503` as the retryable pair and `400`/`409`/`412` as terminal; §16's promote step retries under the existing bounded-polling discipline and asserts every intervening refusal was a `425` with non-increasing `lag`; §19 gate 8's `docs/membership.md` content list requires the runbook to say so; §22's F-NB1 entry records that revision 3's stated justification was wrong and where the determinism actually lives. |
+| **G2** | §4.2a claimed a read across a self-removal "either resolves against a genuine `C_new` majority or fails cleanly at step-down — never resolves against a phantom majority, and **never hangs**", and DM-17's self-removal sub-case asserted, of one schedule, both that the read does not resolve with one acking voter **and** that it then fails with `ErrLeadershipLost` "at the step-down that follows commit". Those are not simultaneously satisfiable: with `C_new = {b,c}`, one acking voter is `1 < 2` for `checkPendingReads` *and* `1 < 2` for `advanceLeaderCommit`, so the `EntryConfig` never commits, the leader never steps down, and no `ErrLeadershipLost` is ever produced — the read blocks to the caller's deadline. §16 carried the same overstatement ("every read failure is a clean `ErrLeadershipLost`-class error rather than a timeout"). | §4.2a now gives the **complete three-row case table** (resolve; `ErrLeadershipLost` at step-down; blocks to deadline when no `C_new` majority is reachable) and says plainly that the third row is not a hang in the Phase-8 sense but the ordinary behaviour of a linearizable read on a leader that cannot assemble its quorum — blocking is the conservative direction; resolving would be the bug. DM-17 sub-case 3 is restructured into **two phases plus a positive phase**, one per row (revision 5 additionally states which *view* of that one read each phase observes, and that no second read may be issued — §23/H3). §16's SQL-reader and self-removal assertions are **scoped to the reachable-majority case**, which is every step that suite runs, with the blocked-read row deliberately left to DM-17 where a partition can be injected exactly. `QUORUM CONTINUITY` gains an explicit "what this invariant does and does not claim about liveness" paragraph; §18's read row restated. |
+| **G3** | §2.3's Lemma 3 reduced every non-adjacent pair of live configurations to "two distinct children of **one** common committed ancestor" by asserting that children of *different* committed elements "would differ by at most one voter along the chain". That is false: with a committed chain `{a,b,c} → {a,b,c,d} → {a,b,c,d,e}`, a partitioned node still holding the uncommitted child `{a,b,c,x}` of the first, and a child `{a,b,c,d,e,f}` of the third live on the majority side, the two are five voters apart and hang off different ancestors. The state is reachable (DM-22's shape plus two further committed transitions), so the proof covered nothing there — and the theorem's non-adjacent branch rests entirely on Lemma 3. | Lemma 3 rewritten with an explicit **anchor** definition and a complete case split: Case 1 (anchors coincide — revision 3's argument, retained verbatim and now correctly scoped); Case 2a (anchors differ, `C` a child of its anchor — reduced to Case 1 with `C' := C_{a+1}`, with the `term(L) < t` step proved from P1 plus `commitIndex` being a prefix bound); and **Case 2b** (anchors differ, `C` *is* its anchor — a committed configuration still live on a node that has not seen its successor), which revision 3 had no case for and which the term comparison alone cannot settle, because such a node may legitimately hold an entry of the successor's own term. Case 2b is closed by **index** domination: every node holding `C_a` necessarily lacks `C_{a+1}`'s entry at `(k, t)` (holding it would change its `activeConfig`), every majority of `C_a` meets the `C_{a+1}` majority that holds `(k, t)` by Lemma 1, and `isLogUpToDate` rejects on the index comparison at equal terms. A closing note records that a committed configuration is superseded only once its successor exists, which is why DM-22's three live configurations are safe *without* Lemma 3 being invoked on arrival. §17's `CONFIGURATION BRANCH CONFINEMENT` summary updated to name both rejection branches. **Case 1's own candidate-side term bound was still misstated by this revision and is corrected in revision 5 (§23/H1); the lemma's conclusion is unchanged.** |
+| **G4** | §3.3 pinned `PromotionMaxLagEntries = 0` **for test determinism**, on the claim that with `0` "the gate is a pure function of observable state (poll until `lag == 0`, then promote)". It is a time-of-check/time-of-use race: `lag == 0` is observed by one HTTP request and re-evaluated by `PromoteToVoter` on the event loop afterwards, and §16 runs a background `/propose` writer across the entire test, so `LastIndex()` advances in between and the promote returns `425`. The stricter the threshold, the tighter the window — so the pin made §19 gate 4 less reliable, not more, in the name of determinism. It is an operational statement too: with the shipped default, promotion on a continuously written cluster needs retry or quiescence. | Both halves of the decision are now pinned. The default **stays `0`** — it is the conservative, availability-protecting value, and loosening it would trade a real guarantee for a test convenience — and `425`/`ErrLearnerNotCaughtUp` is pinned as an **explicitly retryable, records-nothing pre-proposal refusal**, joining §2.6a's checks 2–3 as the third such refusal the admin layer may retry on the operator's behalf under the identical `RequestID`-untouched discipline. §2.6a's retry paragraph now enumerates all three; §9's status-code table names `425`/`503` as the retryable pair and `400`/`409`/`412` as terminal; §16's promote step retries under the existing bounded-polling discipline and asserts every intervening refusal was a `425` (the non-increasing-`lag` half of that assertion is **withdrawn in revision 5** and replaced by a test-set bound — §23/H2); §19 gate 8's `docs/membership.md` content list requires the runbook to say so; §22's F-NB1 entry records that revision 3's stated justification was wrong and where the determinism actually lives. |
 
 #### Non-blocking items, all closed rather than deferred
 
@@ -5203,3 +5349,33 @@ contradicting itself, and none of them requiring a mechanism change.
 | **G8** | §7.2 described `MsgInstallSnapshotRequest` as gaining `Configuration` and cross-checked only that value against `Meta.Configuration`, while §8.1's generation-2 definition names `Configuration` **and** `HasConfiguration`. A flag-only disagreement with both configurations empty would pass a value-only check silently — and the flag is what decides whether the configuration is read at all (§6.3 step 2). | §7.2 now treats the two as a **pair** on the wire exactly as they are in the durable frame, and the `handleInstallSnapshot` check covers both fields; §21 slice 1's `messages.go` bullet, slice 4's check, DM-8 and §18's row all name the pair. |
 | **G9** | `Core.heardFromLeader` is cleared by `InputElectionTimeout`, which the existing test-only `PauseTicksForTest`/`electionTicksPaused` hook suppresses. Under a frozen election clock the flag stays `true` indefinitely and that node ignores every `RequestVoteRequest`, including higher-term ones — correct as a composition, but a real behavioural change for any test that freezes ticks on one node and expects another's election to succeed. | §2.7 gains a second interaction note stating the coupling, requiring it to be documented on **both** sides (`heardFromLeader`'s and `PauseTicksForTest`'s doc comments), adding a direct unit test that pins the composition, and requiring an audit of existing `PauseTicksForTest` callers when slice 1 lands — resuming ticks rather than weakening Rule 2 where a vote must be granted. Scoped as an implementation-time obligation: no production path freezes ticks, and on a Voter or a Leader the flag can never go stale. §18's Rule 2 row and §21 slice 1 updated. |
 | **G10** | §17 said "eleven in total" and §19 gate 8 said "§17's ten invariants", while §17 lists thirteen headings. | §17 states the count once and correctly — **twelve** added-or-rewritten catalog entries plus one pre-existing entry (`NO SILENT FORMAT MISINTERPRETATION`) amended in place — and notes that the "new in revision 2 / restated in revision 3" heading labels are relative to earlier revisions of *this plan*, not to `docs/invariants.md`, in which none of the twelve exists yet. §19 gate 8 repeats the same numbers. |
+
+### Revision 4 → revision 5 (focused re-review of `1900617`)
+
+The re-review confirmed **G1**–**G10** closed — the restore path's
+accept-side rule consistent across §2.5, §2.6, §6.3, §6.4, §7.2, §7.6,
+§17 and DM-21; §4.2a's three-row table and DM-17's matching phases
+satisfiable; Lemma 3's previously missing Case 2b explicit and proved
+by index domination; and the promotion default reduced to policy with
+determinism relocated to `425`'s retry semantics — and it verified the
+mechanical claims against the tree again (`copyWALSuffix` shared by
+`Export` and `buildStaging`; `handleRequestVoteResponse`'s
+`cfg.majority()` tally present at `internal/raft/core.go`;
+`checkPendingReads`' `acked := 1`; `BeginReadIndex`'s caller-side
+`ctx.Err()` return leaving `n.pendingReads` untouched). It returned one
+proof gap and three wording/test-spec items. **No mechanism, and no
+lemma conclusion, changes in revision 5.**
+
+#### Proof gap
+
+| ID | Finding | Resolution |
+|---|---|---|
+| **H1** | §2.3's Lemma 3 **Case 1** asserted that "any candidate holding `C` carries a log whose last entry is from a term `<= term(L)`", justified by "no leader of a later term extended that branch (a later leader extending it would have had `C` as *its* own anchor, which makes `C` committed)". The justification conflates a node's **anchor** (newest *committed* configuration) with its **`activeConfig`** (`ConfigAt(lastIndex())`, which may rest on an uncommitted entry). A leader elected on `C`'s uncommitted branch holds `C` as `activeConfig` while its anchor stays `C_a`, so the branch can carry terms above `term(L)` — reachable under this document's own gates, since P1/P2/P3 gate `EntryConfig` appends only: `a` appends `Remove(d)` at term 1 unreplicated, crashes, restarts as a Follower whose `activeConfig` is that uncommitted child, campaigns at term 2 (a shorter-logged `b` grants), appends a term-2 no-op, is partitioned; `c` then wins term 3 under `C_a`, commits its no-op (P1) and appends a different child. Case 1's stated bound is false there — the candidate's last term is 2, not 1. | Case 1 now proves the bound it actually needs, **`lastLogTerm < term(L')`**: every entry above `C`'s establishing entry in a `C`-holder's log was appended by a leader that itself held `C` (no configuration-establishing entry sits in between, or the holder's `activeConfig` would not be `C`), so the candidate's last term is `term(L'')` for some such leader, and `term(L'') > term(L')` is contradictory in both orderings — if `L''` was elected first, a majority of `C` sits at `term(L'')`, every majority of `C_a` meets it by Lemma 1, and `L'` can never commit its own term entry, so P1 fails and `C'` is never appended; if `L'` committed first, every majority of `C` already held `lastLogTerm >= term(L')` and `L''` could not have been elected. `isLogUpToDate`'s term-before-index comparison then rejects every `C`-candidate exactly as before. The reachable schedule is written out as a three-row table so the corrected bound is pinned against the state that breaks the old one. **Conclusion, Case 2a's reduction to Case 1, Case 2b, the theorem, and `CONFIGURATION BRANCH CONFINEMENT` are all unchanged.** |
+
+#### Test-spec and wording items
+
+| ID | Finding | Resolution |
+|---|---|---|
+| **H2** | §16's promote step asserted "every intervening refusal was `425` with a **decreasing-or-equal** reported `lag`". `lag` is `LastIndex() - matchIndex` against a `LastIndex()` that this suite's own background writer keeps advancing, so it may legitimately rise between two attempts; the assertion required a monotonicity nothing provides — the same "determinism from a moving observable" shape as G4, reintroduced by G4's own fix. | The monotonicity assertion is **withdrawn**. §16 now asserts: eventual `200` within the bounded polling deadline; **every intervening refusal is a `425`** (deterministic, because the refusal's kind is a function of which check failed); **`lag <= W + 1` on every refusal**, where `W` is the background writer's fixed in-flight write budget, an input the test sets itself; and, on success, that `matchIndex == LastIndex()` held at the instant `Core` evaluated it. A test that needs the refusal path itself to be deterministic **sets `PromotionMaxLagEntries` explicitly** rather than relying on the shipped default, and no assertion in the suite may depend on that default remaining `0`. |
+| **H3** | DM-17 sub-case 3 said "two phases against one read" while Phase A asserted a caller-visible context error and Phase B asserted `ErrLeadershipLost` for "the pending read" — satisfiable only because the caller's deadline does not deregister the read, which the plan never said. An implementer could reasonably have issued a second `BeginReadIndex` for Phase B, which would register a read *after* the configuration change and silently lose §4.2a row 2's coverage. | DM-17 sub-case 3 now states the split explicitly: Phase A observes `ctx.Err()` **from `BeginReadIndex`**; the `pendingRead` entry stays registered in `n.pendingReads` with its buffered (capacity-1) `resultCh` until `checkPendingReads` resolves or fails it; Phase B observes `ErrLeadershipLost` **from that original read's own buffered channel**, retained by the harness from Phase A; and the test **must not** issue a second read, with the reason (row 2 requires a read whose `term`/`requiredSeq` predate the self-removal) stated. |
+| **H4** | §2.2 said "**eight**, six in `internal/raft/core.go` and two mirrored copies in `internal/node`" above a table whose eight rows are seven `core.go` rows plus one `internal/node` row — two different counting conventions in one sentence, both landing on eight by coincidence. | §2.2 now states the convention once (a row is one quorum-or-fan-out **computation**: `handleElectionTimeout` contributes two rows, `becomeLeader`'s two loops are one, and `Node.majority()`/`checkPendingReads` are one), gives the per-function count as the alternative reading, and names the table as authoritative. The eight-row table itself, including row 3, is unchanged. |
