@@ -13,8 +13,8 @@ against itself. `docs/versioning.md` documented SemVer policy for what
 counts as a *breaking change*, but not how a *live cluster* survives a
 breaking change during a rolling deployment. `docs/enterprise-v1-plan.md`
 §7 ("Compatibility / Rolling Upgrades") is the designated resolution
-point, targeted at release `v0.4.0` (not yet tagged). This ADR records
-the architecture actually implemented for that phase.
+point, targeted at, and released as, `v0.4.0`. This ADR records the
+architecture actually implemented for that phase.
 
 This phase exists specifically so that a *later* phase (Dynamic
 Membership, §8, which adds new Raft/FSM command kinds of its own) has a

@@ -4,16 +4,14 @@ All notable changes to ChronicleDB are documented here. Format loosely
 follows [Keep a Changelog](https://keepachangelog.com/); versioning
 follows [`docs/versioning.md`](docs/versioning.md) (SemVer, pre-1.0).
 
-## [Unreleased]
+## [0.4.0] - 2026-09-10
 
 Compatibility / Rolling Upgrades — the third phase of the
 `docs/enterprise-v1-plan.md` Enterprise V1 roadmap (§7, target release
-`v0.4.0`, not yet tagged). See that document and
+`v0.4.0`). See that document and
 `docs/adr/0017-compatibility-and-rolling-upgrades.md` for the complete
-design and `docs/upgrades.md` for the operational runbook this work
-adds. This is **implementation work toward `v0.4.0`, not a release** —
-no maturity claim changes, nothing here is tagged, and Enterprise V1 is
-not claimed complete.
+design and `docs/upgrades.md` for the operational runbook this release
+adds.
 
 ### Added
 
@@ -57,6 +55,80 @@ node — plus a dedicated real-binary proof of safe pre-finalize rollback
 and correct, fail-closed post-finalize rollback refusal (the old
 binary's own unmodified command decoder rejects the replicated finalize
 command it cannot understand, and its process exits).
+
+### Fixed
+
+Found and fixed during two rounds of code review of the initial
+implementation commit (`5da92a7`), before this release was tagged —
+full regression suite, including the real mixed-binary proof, re-run
+clean after each fix:
+
+- `fsm.EncodeState`/`DecodeState` never serialized the
+  `SetClusterVersionCommand` idempotency table, so a retried finalize
+  proposal whose original commit predated a snapshot/restart could be
+  re-evaluated instead of returning its original outcome.
+- One `raft.Message` send site (a snapshot-install error reply)
+  bypassed the generation-stamping path, and
+  `/admin/upgrade/finalize` read a cached `Status()` racily instead of
+  live post-finalize state — both could transiently report a stale `0`
+  generation.
+- A follower adopting its cluster generation via `InstallSnapshot`
+  catch-up (rather than replaying the `SetClusterVersionCommand` entry
+  directly) never persisted that generation to its own WAL metadata,
+  silently defeating `wal.Open`'s `ErrUnsupportedGeneration`
+  rollback-refusal check for that node.
+- `FinalizeUpgrade`'s leadership precheck read cached status instead of
+  a live Raft role, and precheck computed the target generation as a
+  flat constant rather than `current+1` (harmless only because this
+  release's single reachable generation step makes the two identical).
+- `internal/backup.Restore` never persisted the source cluster's
+  generation into the freshly-opened staging WAL, so a restored data
+  directory silently reported generation 0 regardless of what was
+  backed up. Found during release qualification; not exploitable in
+  this release (the FSM-layer command decode already fails closed
+  independent of WAL metadata), but a real defense-in-depth gap.
+- CI's checkout used a shallow clone, so the real mixed-binary tests
+  (which build the previous release's binary via a `git worktree`)
+  failed before running; fixed by fetching full history. Test/CI-only;
+  no production code changed.
+
+### Compatibility
+
+Additive and non-breaking for any cluster that does not opt into an
+upgrade. "Generation 0" is, by definition, every WAL/snapshot/FSM-
+command format exactly as it existed through `v0.3.0` — an existing
+`v0.1.0`-`v0.3.0` data directory or deployment is unaffected by
+installing this binary until an operator actually drives a rolling
+upgrade. Within one generation, decode remains exact; across the one
+supported step (N/N+1), a `v0.4.0`+ decoder still reads a
+not-yet-finalized older generation's own exact bytes, and a genuine
+pre-`v0.4.0` binary can still rejoin and replicate normally against a
+cluster that has upgraded but not yet finalized. Rollback (redeploying
+the older binary) is safe before `finalize` and explicitly,
+fail-closed refused after it — see `docs/upgrades.md` §5 for the exact
+boundary. `v0.2.0` security/RBAC/audit and `v0.3.0` backup/restore/PITR
+behavior are unchanged and re-verified: both integration suites pass
+unchanged alongside the new mixed-version suite.
+
+### Known limitations at this point
+
+- No automatic/unattended upgrade orchestration — an operator or
+  external tool drives node-by-node restart; ChronicleDB provides the
+  safety mechanism, not the orchestration.
+- N/N+1 (adjacent-generation) upgrades only — skip-version (N/N+2)
+  upgrades are not supported.
+- No live schema migration (`ALTER TABLE`) tooling beyond the existing
+  SQL DDL.
+- The `-upgrade-precheck` CLI dry-run flag issues a plain HTTP GET with
+  no TLS/auth support; a deployment requiring `-auth-mode`/TLS on its
+  control-plane HTTP surface should query `/admin/upgrade/precheck`
+  directly with an authenticated HTTP client instead.
+- Every other `v0.3.0` known limitation (security opt-in, Snapshot
+  Isolation not Serializable, no SQL joins/subqueries/secondary
+  indexes, single static shard, Linux amd64 only actually tested,
+  backup format not encrypted at rest / no cloud object-store
+  integration) is unchanged — see the `v0.3.0` and `v0.2.0` entries
+  below.
 
 ## [0.3.0] - 2026-09-08
 

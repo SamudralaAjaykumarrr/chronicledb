@@ -1,6 +1,6 @@
 # Compatibility / Rolling Upgrades
 
-Status: `v0.4.0` (not yet tagged/released), `docs/enterprise-v1-plan.md`
+Status: `v0.4.0` (tagged and released), `docs/enterprise-v1-plan.md`
 §7, [`ADR-0017`](adr/0017-compatibility-and-rolling-upgrades.md).
 Implemented in `internal/version` (`MaxSupportedGeneration`),
 `internal/raft` (`Message.SenderGeneration`), `internal/fsm`

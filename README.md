@@ -364,6 +364,16 @@ untested.
   boundary. Backup artifacts are not encrypted at rest and there is no
   built-in cloud object-store integration — see
   [`docs/backup.md`](docs/backup.md) §9.
+- **Compatibility / Rolling Upgrades are implemented** (as of
+  `v0.4.0`) — explicit version/generation checking across the wire
+  protocol, WAL, snapshot, FSM-command, and metadata/schema formats,
+  admin-gated `/admin/upgrade/precheck`/`/admin/upgrade/finalize`
+  endpoints, and a `-upgrade-precheck` CLI dry-run flag, proven with a
+  real mixed-binary N/N+1 cluster including a forced leader failover
+  mid-upgrade (`docs/upgrades.md`). N/N+1 (adjacent-generation)
+  upgrades only, no automatic upgrade orchestration, and rollback is
+  explicitly, fail-closed refused past the last `finalize` boundary —
+  see [`docs/upgrades.md`](docs/upgrades.md) §5, §7.
 - **Snapshot Isolation, not Serializable** — see
   [`docs/mvcc.md`](docs/mvcc.md) §1.1.
 - **No joins, subqueries, secondary indexes, or PostgreSQL wire
