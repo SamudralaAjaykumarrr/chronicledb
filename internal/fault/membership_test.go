@@ -637,6 +637,177 @@ func TestDM13_SnapshotBoundaryCapturesConfigAtNotActiveConfig(t *testing.T) {
 	}
 }
 
+// TestDM8_InstallSnapshotAdoptsConfigurationUnconditionally regresses
+// DM-8 (§15, §7.2): installing a snapshot carrying a Configuration
+// different from the receiver's own current one is adopted
+// unconditionally — no merge, no backward scan, no attempt to
+// reconcile with whatever the receiver believed before.
+//
+// This covers only Core.handleInstallSnapshotRequest's own contract
+// (internal/raft), which is unconditional by construction (§7.2's
+// comment: "adopted unconditionally... No merge, no backward scan").
+// The companion assertion — that internal/node's driver-level
+// msg.Configuration/msg.HasConfiguration vs. the installed file's own
+// Meta pairwise check causes Node.fail on disagreement (§23/G8) — is
+// already implemented (internal/node/node.go's handleInstallSnapshot)
+// but is not covered here: internal/fault has no FSM/snapshot content
+// of its own (this package's doc comment) and exercising that check
+// safely requires driving a live internal/node.Node through its actual
+// message-receipt path without racing its own event-loop goroutine,
+// which is out of scope for this deterministic Core-only harness.
+func TestDM8_InstallSnapshotAdoptsConfigurationUnconditionally(t *testing.T) {
+	cl := NewCluster([]raft.NodeID{"a", "b", "c"}, ClusterOptions{ElectionTimeoutTicks: 10, ElectionTimeoutJitterTicks: 5, HeartbeatTimeoutTicks: 2, Seed: 8})
+	if !cl.SettleElection(50) {
+		t.Fatal("no leader emerged")
+	}
+	a := cl.Leaders()[0]
+	commitNoOpAndSettle(cl, a, []byte("x"))
+
+	var b raft.NodeID
+	for _, id := range cl.NodeIDs() {
+		if id != a {
+			b = id
+			break
+		}
+	}
+	staleCfg := cl.Node(b).Core().ActiveConfig()
+	if staleCfg.IsZero() {
+		t.Fatal("test setup: b must already have a real, non-zero configuration to overwrite")
+	}
+
+	// A configuration sharing no members at all with b's own stale one
+	// — the sharpest possible demonstration that adoption is
+	// unconditional replacement, never a union or a partial merge.
+	freshCfg := raft.Configuration{Voters: []raft.Member{
+		{ID: "x", Address: "x:0"}, {ID: "y", Address: "y:0"}, {ID: "z", Address: "z:0"},
+	}}
+
+	term := cl.Node(b).Core().CurrentTerm()
+	lastIncluded := cl.Node(b).Core().LastIndex() + 10 // well beyond b's own log: never stale/duplicate
+	cl.Node(b).Step(raft.Input{Kind: raft.InputMessage, Message: raft.Message{
+		Type: raft.MsgInstallSnapshotRequest, From: a, To: b, Term: term,
+		LastIncludedIndex: lastIncluded, LastIncludedTerm: term,
+		HasConfiguration: true, Configuration: freshCfg,
+	}})
+
+	got := cl.Node(b).Core().ActiveConfig()
+	if !got.Equal(freshCfg) {
+		t.Fatalf("ActiveConfig after InstallSnapshot = %+v, want exactly the installed %+v (unconditional adoption)", got, freshCfg)
+	}
+	for _, stale := range staleCfg.Voters {
+		if got.IsMember(stale.ID) {
+			t.Fatalf("a member (%s) of b's pre-install stale configuration survived into the post-install configuration — a merge was attempted where none should occur", stale.ID)
+		}
+	}
+
+	// HasConfiguration = false must adopt the bootstrap configuration,
+	// never the just-discarded prior activeConfig and never freshCfg.
+	term2 := cl.Node(b).Core().CurrentTerm()
+	cl.Node(b).Step(raft.Input{Kind: raft.InputMessage, Message: raft.Message{
+		Type: raft.MsgInstallSnapshotRequest, From: a, To: b, Term: term2,
+		LastIncludedIndex: lastIncluded + 10, LastIncludedTerm: term2,
+		HasConfiguration: false,
+	}})
+	got2 := cl.Node(b).Core().ActiveConfig()
+	if got2.Equal(freshCfg) {
+		t.Fatal("HasConfiguration=false install still shows the previous InstallSnapshot's configuration")
+	}
+	// b's Config.Bootstrap in this harness is the cluster's own original
+	// 3-voter set (NewCluster seeds every node's Bootstrap from the
+	// initial peer list) — a HasConfiguration=false install falls back
+	// to exactly that, never to the discarded prior activeConfig.
+	wantBootstrap := raft.Configuration{Voters: []raft.Member{
+		{ID: "a", Address: "a:0"}, {ID: "b", Address: "b:0"}, {ID: "c", Address: "c:0"},
+	}}
+	if !got2.Equal(wantBootstrap) {
+		t.Fatalf("HasConfiguration=false install's fallback = %+v, want the bootstrap configuration %+v", got2, wantBootstrap)
+	}
+}
+
+// TestDM11_DiskFaultDuringEntryConfigAppend regresses DM-11 (§15): a
+// genuine local persistence failure targeted specifically at a
+// leader's own append of an EntryConfig entry must never let that
+// node falsely believe the change succeeded, and the cluster must
+// continue correctly afterward — mirroring
+// TestChaos_DiskFaultDuringPersistence's existing pattern
+// (docs/failure-model.md §1.8), but aimed precisely at a config-change
+// entry rather than an ordinary one.
+func TestDM11_DiskFaultDuringEntryConfigAppend(t *testing.T) {
+	for seed := int64(1100); seed < 1105; seed++ {
+		seed := seed
+		t.Run(fmt.Sprintf("seed=%d", seed), func(t *testing.T) {
+			cl := NewCluster([]raft.NodeID{"a", "b", "c"}, ClusterOptions{ElectionTimeoutTicks: 10, ElectionTimeoutJitterTicks: 5, HeartbeatTimeoutTicks: 2, Seed: seed})
+			if !cl.SettleElection(50) {
+				t.Fatalf("seed %d: no leader emerged", seed)
+			}
+			a := cl.Leaders()[0]
+			commitNoOpAndSettle(cl, a, []byte("x")) // P1
+
+			// Target exactly the leader's own upcoming append of the
+			// EntryConfig entry (the very next Append call on its
+			// storage).
+			cl.Node(a).Storage().FailNextAppends(1)
+			if err := cl.ProposeConfigChange(a, raft.AddLearnerChange, "add-d", "d", "d:0"); err != nil {
+				t.Fatalf("seed %d: ProposeConfigChange: %v", seed, err)
+			}
+
+			if !cl.Node(a).Failed() {
+				t.Fatalf("seed %d: leader did not stop itself after its own EntryConfig append failed to persist", seed)
+			}
+			if cl.Node(a).FailErr() == nil {
+				t.Fatalf("seed %d: Failed() true but FailErr() is nil", seed)
+			}
+
+			for i := 0; i < 30; i++ {
+				cl.AdvanceTicks(1)
+				cl.DeliverEligible()
+			}
+
+			// "Restart" the affected node (real-process crash+restart
+			// modeling) and confirm the cluster converges to one
+			// consistent, correct state — whichever it turned out to be
+			// (the entry may have reached a majority of the other two
+			// voters despite the leader's own local failure, or may not
+			// have; both are legitimate, and either is fine, matching
+			// TestChaos_DiskFaultDuringPersistence's convergence-only
+			// assertion, not a fixed expected outcome).
+			cl.Crash(a)
+			cl.Restart(a)
+			for i := 0; i < 60; i++ {
+				cl.AdvanceTicks(1)
+				cl.DeliverEligible()
+			}
+			if !cl.SettleElection(100) {
+				t.Fatalf("seed %d: cluster never settled on a single leader after recovery", seed)
+			}
+			newLeader := cl.Leaders()[0]
+			commitNoOpAndSettle(cl, newLeader, []byte("after-recovery"))
+			finalIdx := cl.Node(newLeader).Core().CommitIndex()
+			for _, id := range cl.NodeIDs() {
+				if cl.Node(id).Crashed() {
+					continue
+				}
+				for i := 0; i < 30 && cl.Node(id).Core().CommitIndex() < finalIdx; i++ {
+					cl.AdvanceTicks(1)
+					cl.DeliverEligible()
+				}
+				if got := cl.Node(id).Core().CommitIndex(); got < finalIdx {
+					t.Fatalf("seed %d: node %s never caught up after recovery: commitIndex %d, want >= %d", seed, id, got, finalIdx)
+				}
+			}
+			// Every live node must agree on the resulting configuration
+			// lineage — no node stuck believing a divergent membership
+			// state.
+			want := cl.Node(newLeader).Core().ActiveConfig()
+			for _, id := range cl.NodeIDs() {
+				if got := cl.Node(id).Core().ActiveConfig(); !got.Equal(want) {
+					t.Fatalf("seed %d: node %s's post-recovery configuration = %+v, want %+v (agreement with the leader)", seed, id, got, want)
+				}
+			}
+		})
+	}
+}
+
 func otherThree(cl *Cluster, exclude raft.NodeID) []raft.NodeID {
 	var out []raft.NodeID
 	for _, id := range cl.NodeIDs() {
