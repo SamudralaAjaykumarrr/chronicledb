@@ -2,6 +2,8 @@ package raft
 
 import (
 	"errors"
+	"fmt"
+	"math/rand"
 	"testing"
 )
 
@@ -130,6 +132,147 @@ func TestConfigAtBoundaryAgreementAfterCompact(t *testing.T) {
 	}
 	if !got.Equal(c.activeConfig) {
 		t.Fatalf("ConfigAt(snapshotIndex) = %+v, want the config captured at the boundary %+v", got, c.activeConfig)
+	}
+}
+
+// TestConfigAtInvariantsProperty regresses DM-16 (§15, §6.3): a
+// randomized property test over §6.3's four stated invariants
+// (determinism, monotone provenance, prefix stability, boundary
+// agreement), across logs with and without a snapshot boundary and
+// with and without a bootstrap seed.
+func TestConfigAtInvariantsProperty(t *testing.T) {
+	for seed := int64(1600); seed < 1640; seed++ {
+		seed := seed
+		t.Run(fmt.Sprintf("seed=%d", seed), func(t *testing.T) {
+			rnd := rand.New(rand.NewSource(seed))
+			withBootstrap := seed%3 != 0
+
+			var boot Configuration
+			if withBootstrap {
+				boot = votersConfig([]NodeID{"a", "b", "c"})
+			}
+			c := newBootstrapCore(t, "a", boot)
+			c.becomeLeader(&Output{})
+
+			length := 6 + rnd.Intn(20)
+			compactAtStep := -1
+			if seed%2 == 0 && length > 3 {
+				compactAtStep = 1 + rnd.Intn(length-2)
+			}
+			nextLearner := 0
+			for i := 0; i < length; i++ {
+				var out Output
+				var err error
+				if rnd.Intn(3) == 0 {
+					id := NodeID(fmt.Sprintf("L%d", nextLearner))
+					nextLearner++
+					out, err = c.ProposeConfigChange(AddLearnerChange, fmt.Sprintf("req%d", i), id, string(id)+":0")
+				} else {
+					out = c.appendLeaderEntry(EntryNormal, []byte("x"))
+				}
+				if err != nil {
+					continue // an occasionally-refused proposal is fine; just skip this step
+				}
+				applyPersist(t, c, out)
+				c.commitIndex = c.lastIndex()
+				c.SetApplied(c.commitIndex)
+				if i == compactAtStep {
+					if !c.Compact(c.commitIndex) {
+						t.Fatalf("seed %d: Compact(%d) refused", seed, c.commitIndex)
+					}
+				}
+			}
+
+			// Determinism + monotone provenance, and cross-checked
+			// against an independently reconstructed second Core built
+			// from exactly the same durable state.
+			c2, err := NewCoreFromSnapshot(c.cfg, HardState{CurrentTerm: c.currentTerm, VotedFor: c.votedFor},
+				c.snapshotIndex, c.snapshotTerm, c.snapshotConfig, c.snapshotHasConfig, c.Entries())
+			if err != nil {
+				t.Fatalf("seed %d: NewCoreFromSnapshot: %v", seed, err)
+			}
+			for i := c.SnapshotIndex(); i <= c.LastIndex(); i++ {
+				cfg1, k1 := c.ConfigAt(i)
+				cfg1b, k1b := c.ConfigAt(i)
+				if !cfg1.Equal(cfg1b) || k1 != k1b {
+					t.Fatalf("seed %d: ConfigAt(%d) not deterministic within one Core: (%+v,%d) vs (%+v,%d)", seed, i, cfg1, k1, cfg1b, k1b)
+				}
+				cfg2, k2 := c2.ConfigAt(i)
+				if !cfg1.Equal(cfg2) || k1 != k2 {
+					t.Fatalf("seed %d: ConfigAt(%d) disagreed between two Cores built from byte-identical durable state: (%+v,%d) vs (%+v,%d)", seed, i, cfg1, k1, cfg2, k2)
+				}
+				if k1 > 0 {
+					if k1 > i {
+						t.Fatalf("seed %d: monotone provenance violated: ConfigAt(%d) returned index %d > %d", seed, i, k1, i)
+					}
+					e, ok := c.EntryAt(k1)
+					if !ok || e.Type != EntryConfig {
+						t.Fatalf("seed %d: ConfigAt(%d)'s provenance index %d is not an EntryConfig entry: ok=%v type=%v", seed, i, k1, ok, e.Type)
+					}
+				}
+			}
+
+			// Prefix stability: truncating at any index > i must never
+			// change ConfigAt(i). Modeled by building a fresh Core over
+			// an actual prefix of the log and checking agreement for
+			// every i within that prefix.
+			if c.LastIndex() > c.SnapshotIndex() {
+				m := c.SnapshotIndex() + 1 + Index(rnd.Intn(int(c.LastIndex()-c.SnapshotIndex())))
+				var prefixEntries []Entry
+				for _, e := range c.Entries() {
+					if e.Index <= m {
+						prefixEntries = append(prefixEntries, e)
+					}
+				}
+				cTrunc, err := NewCoreFromSnapshot(c.cfg, HardState{CurrentTerm: c.currentTerm},
+					c.snapshotIndex, c.snapshotTerm, c.snapshotConfig, c.snapshotHasConfig, prefixEntries)
+				if err != nil {
+					t.Fatalf("seed %d: NewCoreFromSnapshot (truncated prefix up to %d): %v", seed, m, err)
+				}
+				for i := c.SnapshotIndex(); i <= m; i++ {
+					want, wantIdx := c.ConfigAt(i)
+					got, gotIdx := cTrunc.ConfigAt(i)
+					if !got.Equal(want) || gotIdx != wantIdx {
+						t.Fatalf("seed %d: prefix stability violated: truncating past %d changed ConfigAt(%d) from (%+v,%d) to (%+v,%d)", seed, m, i, want, wantIdx, got, gotIdx)
+					}
+				}
+			}
+
+			// Boundary agreement.
+			if c.snapshotHasConfig {
+				got, idx := c.ConfigAt(c.SnapshotIndex())
+				if idx != 0 || !got.Equal(c.snapshotConfig) {
+					t.Fatalf("seed %d: boundary agreement violated: ConfigAt(snapshotIndex) = (%+v,%d), want (%+v,0) == snapshotConfig", seed, got, idx, c.snapshotConfig)
+				}
+			} else {
+				got, idx := c.ConfigAt(c.SnapshotIndex())
+				if idx != 0 || !got.Equal(c.bootstrapConfig) {
+					t.Fatalf("seed %d: boundary agreement (no snapshot config) violated: ConfigAt(snapshotIndex) = (%+v,%d), want bootstrapConfig (%+v,0)", seed, got, idx, c.bootstrapConfig)
+				}
+			}
+		})
+	}
+}
+
+// TestConfigAtSkipsVoidedEntriesFallingBackToBootstrap regresses
+// DM-16's explicit "never-snapshotted case that revision 1's two
+// divergent algorithms disagreed on" (§23/C2): a log containing only
+// Voided EntryConfig entries must yield Config.Bootstrap, never the
+// zero Configuration, since a Voided entry establishes nothing and
+// step 1's scan must skip it exactly as it skips an EntryNormal entry.
+func TestConfigAtSkipsVoidedEntriesFallingBackToBootstrap(t *testing.T) {
+	boot := votersConfig([]NodeID{"a", "b", "c"})
+	c := newBootstrapCore(t, "a", boot)
+	c.log = append(c.log,
+		Entry{Index: 1, Term: 1, Type: EntryConfig, Data: EncodeVoidedEntryConfigPayload()},
+		Entry{Index: 2, Term: 1, Type: EntryConfig, Data: EncodeVoidedEntryConfigPayload()},
+		Entry{Index: 3, Term: 1, Type: EntryNormal, Data: []byte("x")},
+	)
+	for _, i := range []Index{0, 1, 2, 3} {
+		got, idx := c.ConfigAt(i)
+		if idx != 0 || !got.Equal(boot) {
+			t.Fatalf("ConfigAt(%d) over a log of only Voided/EntryNormal entries = (%+v,%d), want (bootstrap,0)", i, got, idx)
+		}
 	}
 }
 

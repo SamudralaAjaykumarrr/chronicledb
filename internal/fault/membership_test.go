@@ -988,6 +988,102 @@ func TestDM11_DiskFaultDuringEntryConfigAppend(t *testing.T) {
 	}
 }
 
+// TestDM15_LearnerHoldingUncommittedPromoteEntryCampaignsAndCanWin
+// regresses DM-15 (§15): §2.3's table calls this outcome "surprising
+// but correct" — a learner that has appended (but not yet had commit
+// of) its own PromoteToVoter entry is, from that instant, a Voter in
+// its own activeConfig (append-time-effective, §2.2) and may
+// legitimately campaign and win, provided it gathers a real majority
+// of C_new. This is explicitly not a bug: it must never later be
+// "fixed."
+func TestDM15_LearnerHoldingUncommittedPromoteEntryCampaignsAndCanWin(t *testing.T) {
+	cl := NewCluster([]raft.NodeID{"a", "b", "c", "d"}, ClusterOptions{ElectionTimeoutTicks: 10, ElectionTimeoutJitterTicks: 5, HeartbeatTimeoutTicks: 2, Seed: 15})
+	if !cl.SettleElection(50) {
+		t.Fatal("no leader emerged")
+	}
+	leader := cl.Leaders()[0]
+	commitNoOpAndSettle(cl, leader, []byte("warmup"))
+
+	cl.AddNode("e")
+	if err := cl.ProposeConfigChange(leader, raft.AddLearnerChange, "add-e", "e", "e:0"); err != nil {
+		t.Fatalf("AddLearner: %v", err)
+	}
+	for i := 0; i < 20; i++ {
+		cl.AdvanceTicks(1)
+		cl.DeliverEligible()
+	}
+	if !cl.Node(leader).Core().ActiveConfig().IsMember("e") {
+		t.Fatal("test setup: AddLearner did not commit")
+	}
+	commitNoOpAndSettle(cl, leader, []byte("more"))
+
+	others := otherThree(cl, leader)
+	dOut, b, c := others[0], others[1], others[2]
+	cl.IsolateNode(dOut)
+
+	if err := cl.ProposeConfigChange(leader, raft.PromoteToVoterChange, "promote-e", "e", ""); err != nil {
+		t.Fatalf("ProposeConfigChange Promote(e): %v", err)
+	}
+	pendingIdx := cl.Node(leader).Core().LastIndex()
+
+	// Force-deliver exactly the outbound requests to b, c, and e — not
+	// their responses back to leader — so all three durably hold the
+	// entry (recognizing e as a legitimate C1 Voter in their own
+	// activeConfig too) while leader's own commit computation never
+	// advances (dOut, isolated, never gets it at all).
+	for _, pm := range cl.Transport().Pending() {
+		if pm.Message.To == b || pm.Message.To == c || pm.Message.To == "e" {
+			cl.Deliver(pm.ID)
+		}
+	}
+	for _, id := range []raft.NodeID{b, c, "e"} {
+		if got := cl.Node(id).Core().LastIndex(); got != pendingIdx {
+			t.Fatalf("test setup: %s did not receive the pending Promote(e) entry: got %d want %d", id, got, pendingIdx)
+		}
+		if !cl.Node(id).Core().ActiveConfig().IsMember("e") {
+			t.Fatalf("test setup: %s does not recognize e as a member via the pending entry", id)
+		}
+	}
+	if cl.Node(leader).Core().CommitIndex() >= pendingIdx {
+		t.Fatal("test setup: the pending entry must not have committed on leader")
+	}
+
+	// Take leader out of the picture entirely (crashed, standing in for
+	// "unreachable"); dOut stays isolated throughout.
+	cl.Crash(leader)
+
+	// e campaigns — it is a Voter in its own (pending) activeConfig, so
+	// §2.7 Rule 1's third clause does not disarm it.
+	cl.Node("e").Step(raft.Input{Kind: raft.InputElectionTimeout})
+	for i := 0; i < 30; i++ {
+		cl.DeliverEligible()
+		cl.AdvanceTicks(1)
+		cl.DeliverEligible()
+	}
+
+	if cl.Node("e").Core().Role() != raft.Leader {
+		t.Fatalf("learner e did not win its election despite gathering a genuine majority of C_new (e,%s,%s): role=%v", b, c, cl.Node("e").Core().Role())
+	}
+	if got := cl.Node("e").Core().CurrentTerm(); got < 2 {
+		t.Fatalf("e's winning term = %d, want a genuinely bumped term", got)
+	}
+
+	// No safety-oracle violation: b and c must agree with e's own view
+	// of the configuration lineage — a valid chain, not a fork.
+	want := cl.Node("e").Core().ActiveConfig()
+	for _, id := range []raft.NodeID{b, c} {
+		if got := cl.Node(id).Core().ActiveConfig(); !got.Equal(want) {
+			t.Fatalf("%s's activeConfig = %+v, want agreement with e's %+v", id, got, want)
+		}
+	}
+
+	// The new (learner-turned-leader) can still make further progress.
+	commitNoOpAndSettle(cl, "e", []byte("after-learner-leader"))
+	if got := cl.Node("e").Core().CommitIndex(); got < pendingIdx {
+		t.Fatalf("cluster failed to make further progress under the learner-turned-leader: commitIndex %d, want >= %d", got, pendingIdx)
+	}
+}
+
 func otherThree(cl *Cluster, exclude raft.NodeID) []raft.NodeID {
 	var out []raft.NodeID
 	for _, id := range cl.NodeIDs() {
