@@ -59,6 +59,14 @@ type Source struct {
 	BaseMeta snapshot.Meta
 	BaseFSM  *fsm.FSM
 	WAL      *wal.WAL
+	// SnapshotWriteVersion is the snapshot.FormatVersion Export uses
+	// when re-encoding BaseMeta/BaseFSM into the backup's own snapshot
+	// file (dynamic-membership plan §7.1's write-version gate — the
+	// same one internal/node.maybeSnapshot applies to its own local
+	// snapshots). Zero defaults to 1 (snapshot.MinReadVersion), the
+	// value every caller that predates this field already implicitly
+	// used.
+	SnapshotWriteVersion uint8
 }
 
 // ExportOptions configures Export.
@@ -109,7 +117,11 @@ func Export(src Source, outDir string, opts ExportOptions) (Manifest, error) {
 	if err != nil {
 		return Manifest{}, fmt.Errorf("backup: preparing snapshot directory: %w", err)
 	}
-	if _, err := snapMgr.Create(src.BaseMeta, src.BaseFSM); err != nil {
+	writeVersion := src.SnapshotWriteVersion
+	if writeVersion == 0 {
+		writeVersion = snapshot.MinReadVersion
+	}
+	if _, err := snapMgr.Create(src.BaseMeta, src.BaseFSM, writeVersion); err != nil {
 		return Manifest{}, fmt.Errorf("backup: writing base snapshot: %w", err)
 	}
 	snapFileName, snapBytes, err := readSoleSnapshotFile(snapDir)
@@ -122,7 +134,7 @@ func Export(src Source, outDir string, opts ExportOptions) (Manifest, error) {
 	if err != nil {
 		return Manifest{}, err
 	}
-	walUntil, err := copyWALSuffix(src.WAL, bw, src.BaseMeta.LastIncludedIndex, opts.UntilIndex)
+	walUntil, err := copyWALSuffix(src.WAL, bw, src.BaseMeta.LastIncludedIndex, opts.UntilIndex, nil)
 	if err != nil {
 		bw.Close()
 		return Manifest{}, err
@@ -194,7 +206,15 @@ func newBaseWAL(dir string, baseIndex uint64) (*wal.WAL, error) {
 // (unless untilIndex is UntilLatest, in which case every entry src
 // currently holds is copied). It returns the last index actually copied
 // (or baseIndex, unchanged, if none were).
-func copyWALSuffix(src, dst *wal.WAL, baseIndex, untilIndex uint64) (uint64, error) {
+// copyWALSuffix is shared by Export (which must copy every entry
+// through unchanged — a backup must not lose the source's own
+// recoverable membership history) and buildStaging/Restore (which must
+// void any EntryConfig entry it copies — dynamic-membership plan §7.6).
+// transform is applied to each record's raw payload before it is
+// appended; passing nil is the identity transform, used by Export.
+// Voiding is therefore never baked unconditionally into this shared
+// helper (§23/G6) — only buildStaging ever passes a non-nil transform.
+func copyWALSuffix(src, dst *wal.WAL, baseIndex, untilIndex uint64, transform func([]byte) []byte) (uint64, error) {
 	it, err := src.Replay(baseIndex + 1)
 	if err != nil {
 		return 0, fmt.Errorf("backup: opening source WAL replay from %d: %w", baseIndex+1, err)
@@ -213,7 +233,11 @@ func copyWALSuffix(src, dst *wal.WAL, baseIndex, untilIndex uint64) (uint64, err
 		if untilIndex != UntilLatest && rec.Index > untilIndex {
 			break
 		}
-		idx, err := dst.AppendLogEntry(rec.Payload)
+		payload := rec.Payload
+		if transform != nil {
+			payload = transform(payload)
+		}
+		idx, err := dst.AppendLogEntry(payload)
 		if err != nil {
 			return 0, fmt.Errorf("backup: copying WAL entry %d: %w", rec.Index, err)
 		}

@@ -47,7 +47,7 @@ func BenchmarkEncode(b *testing.B) {
 			b.ReportAllocs()
 			b.ResetTimer()
 			for i := 0; i < b.N; i++ {
-				_ = Encode(meta, f)
+				_ = Encode(meta, f, FormatVersion)
 			}
 		})
 	}
@@ -62,7 +62,7 @@ func BenchmarkDecode(b *testing.B) {
 		b.Run(fmt.Sprintf("keys=%d", n), func(b *testing.B) {
 			f := fsmWithKeys(n)
 			meta := Meta{LastIncludedIndex: uint64(n), LastIncludedTerm: 1}
-			data := Encode(meta, f)
+			data := Encode(meta, f, FormatVersion)
 			b.ReportAllocs()
 			b.ResetTimer()
 			for i := 0; i < b.N; i++ {

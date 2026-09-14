@@ -159,8 +159,10 @@ func (m *Manager) pruneExcept(keepIndex uint64) error {
 // (docs/snapshots.md §4); a crash after the rename but before pruning
 // simply leaves the old snapshot around too, which Load tolerates
 // (newest-first, and the old one is still perfectly valid).
-func (m *Manager) Create(meta Meta, f *fsm.FSM) (Meta, error) {
-	data := Encode(meta, f)
+// writeVersion is passed through to Encode unchanged — see that
+// function's doc comment for the generation-gating rule it implements.
+func (m *Manager) Create(meta Meta, f *fsm.FSM, writeVersion uint8) (Meta, error) {
+	data := Encode(meta, f, writeVersion)
 	if err := m.writeDurable(meta.LastIncludedIndex, data); err != nil {
 		return Meta{}, err
 	}

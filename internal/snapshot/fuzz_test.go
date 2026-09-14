@@ -20,7 +20,7 @@ import (
 // this phase.
 func FuzzDecode(f *testing.F) {
 	empty := fsm.New(mvcc.NewStore())
-	f.Add(Encode(Meta{}, empty))
+	f.Add(Encode(Meta{}, empty, FormatVersion))
 
 	populated := fsm.New(mvcc.NewStore())
 	if _, err := populated.Apply(1, fsm.CommitTxnCommand{
@@ -32,7 +32,7 @@ func FuzzDecode(f *testing.F) {
 	}); err != nil {
 		f.Fatalf("Apply: %v", err)
 	}
-	f.Add(Encode(Meta{LastIncludedIndex: 1, LastIncludedTerm: 1}, populated))
+	f.Add(Encode(Meta{LastIncludedIndex: 1, LastIncludedTerm: 1}, populated, FormatVersion))
 
 	f.Add([]byte{})
 	f.Add([]byte("CSNP"))
@@ -40,7 +40,7 @@ func FuzzDecode(f *testing.F) {
 	f.Add(make([]byte, headerSize+checksumSize))
 
 	// A corrupted checksum on an otherwise well-formed snapshot.
-	corrupted := Encode(Meta{LastIncludedIndex: 1, LastIncludedTerm: 1}, populated)
+	corrupted := Encode(Meta{LastIncludedIndex: 1, LastIncludedTerm: 1}, populated, FormatVersion)
 	if len(corrupted) > 0 {
 		corrupted[len(corrupted)-1] ^= 0xFF
 	}
@@ -52,7 +52,7 @@ func FuzzDecode(f *testing.F) {
 	// fsmStateLen(8) ...) claiming far more bytes than actually follow
 	// — the exact "don't trust a length field beyond the bytes present"
 	// attack this fuzz target exists to guard against.
-	oversizedLen := Encode(Meta{LastIncludedIndex: 1, LastIncludedTerm: 1}, populated)
+	oversizedLen := Encode(Meta{LastIncludedIndex: 1, LastIncludedTerm: 1}, populated, FormatVersion)
 	const fsmStateLenOffset = 4 + 1 + 8 + 8
 	if len(oversizedLen) >= fsmStateLenOffset+8 {
 		for i := fsmStateLenOffset; i < fsmStateLenOffset+8; i++ {

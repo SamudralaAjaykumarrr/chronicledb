@@ -23,14 +23,14 @@ func TestManagerCreateAndLoad(t *testing.T) {
 	m := newManager(t)
 	f := buildFSM(t)
 	meta := Meta{LastIncludedIndex: 3, LastIncludedTerm: 1}
-	if _, err := m.Create(meta, f); err != nil {
+	if _, err := m.Create(meta, f, FormatVersion); err != nil {
 		t.Fatalf("Create: %v", err)
 	}
 	snap, ok, err := m.Load(3)
 	if err != nil || !ok {
 		t.Fatalf("Load: ok=%v err=%v", ok, err)
 	}
-	if snap.Meta != meta {
+	if !metasEqual(snap.Meta, meta) {
 		t.Fatalf("Meta mismatch: %+v", snap.Meta)
 	}
 }
@@ -45,7 +45,7 @@ func TestManagerLoadZeroPointerReturnsNothing(t *testing.T) {
 func TestManagerLoadIgnoresSnapshotNewerThanPointer(t *testing.T) {
 	m := newManager(t)
 	f := buildFSM(t)
-	if _, err := m.Create(Meta{LastIncludedIndex: 3, LastIncludedTerm: 1}, f); err != nil {
+	if _, err := m.Create(Meta{LastIncludedIndex: 3, LastIncludedTerm: 1}, f, FormatVersion); err != nil {
 		t.Fatalf("Create: %v", err)
 	}
 	// pointerIndex older than the file on disk: simulates a crash after
@@ -58,14 +58,14 @@ func TestManagerLoadIgnoresSnapshotNewerThanPointer(t *testing.T) {
 func TestManagerRetainsOnlyLatestAfterNewCreate(t *testing.T) {
 	m := newManager(t)
 	f1 := buildFSM(t)
-	if _, err := m.Create(Meta{LastIncludedIndex: 3, LastIncludedTerm: 1}, f1); err != nil {
+	if _, err := m.Create(Meta{LastIncludedIndex: 3, LastIncludedTerm: 1}, f1, FormatVersion); err != nil {
 		t.Fatalf("Create 1: %v", err)
 	}
 	f2 := fsm.New(mvcc.NewStore())
 	if _, err := f2.Apply(1, fsm.CommitTxnCommand{RequestID: "x", Mutations: []mvcc.Mutation{{Key: "z", Value: []byte("v")}}}); err != nil {
 		t.Fatalf("apply: %v", err)
 	}
-	if _, err := m.Create(Meta{LastIncludedIndex: 10, LastIncludedTerm: 2}, f2); err != nil {
+	if _, err := m.Create(Meta{LastIncludedIndex: 10, LastIncludedTerm: 2}, f2, FormatVersion); err != nil {
 		t.Fatalf("Create 2: %v", err)
 	}
 	cands, err := m.candidatesDescending()
@@ -80,13 +80,13 @@ func TestManagerRetainsOnlyLatestAfterNewCreate(t *testing.T) {
 func TestManagerLoadFallsBackOnCorruption(t *testing.T) {
 	m := newManager(t)
 	f1 := buildFSM(t)
-	if _, err := m.Create(Meta{LastIncludedIndex: 3, LastIncludedTerm: 1}, f1); err != nil {
+	if _, err := m.Create(Meta{LastIncludedIndex: 3, LastIncludedTerm: 1}, f1, FormatVersion); err != nil {
 		t.Fatalf("Create 1: %v", err)
 	}
 	// Manually place a second, newer, corrupted snapshot file bypassing
 	// pruning (simulating two generations coexisting).
 	f2 := buildFSM(t)
-	data := Encode(Meta{LastIncludedIndex: 10, LastIncludedTerm: 2}, f2)
+	data := Encode(Meta{LastIncludedIndex: 10, LastIncludedTerm: 2}, f2, FormatVersion)
 	data[len(data)-1] ^= 0xFF // corrupt checksum
 	if err := os.WriteFile(m.path(10), data, 0o644); err != nil {
 		t.Fatalf("write corrupt file: %v", err)
@@ -106,7 +106,7 @@ func TestManagerLoadFallsBackOnCorruption(t *testing.T) {
 func TestManagerInstallValidatesBeforeWriting(t *testing.T) {
 	m := newManager(t)
 	f := buildFSM(t)
-	data := Encode(Meta{LastIncludedIndex: 3, LastIncludedTerm: 1}, f)
+	data := Encode(Meta{LastIncludedIndex: 3, LastIncludedTerm: 1}, f, FormatVersion)
 	data[len(data)-1] ^= 0xFF
 	if _, err := m.Install(data); err == nil {
 		t.Fatal("expected Install to reject corrupted data")
@@ -122,7 +122,7 @@ func TestManagerInstallValidatesBeforeWriting(t *testing.T) {
 func TestManagerInstallSucceedsAndIsLoadable(t *testing.T) {
 	m := newManager(t)
 	f := buildFSM(t)
-	data := Encode(Meta{LastIncludedIndex: 3, LastIncludedTerm: 1}, f)
+	data := Encode(Meta{LastIncludedIndex: 3, LastIncludedTerm: 1}, f, FormatVersion)
 	snap, err := m.Install(data)
 	if err != nil {
 		t.Fatalf("Install: %v", err)
@@ -134,7 +134,7 @@ func TestManagerInstallSucceedsAndIsLoadable(t *testing.T) {
 	if err != nil || !ok {
 		t.Fatalf("Load after Install: ok=%v err=%v", ok, err)
 	}
-	if loaded.Meta != snap.Meta {
+	if !metasEqual(loaded.Meta, snap.Meta) {
 		t.Fatalf("meta mismatch after reload")
 	}
 }
@@ -165,7 +165,7 @@ func TestManagerBytesRoundTrip(t *testing.T) {
 	m := newManager(t)
 	f := buildFSM(t)
 	meta := Meta{LastIncludedIndex: 3, LastIncludedTerm: 1}
-	if _, err := m.Create(meta, f); err != nil {
+	if _, err := m.Create(meta, f, FormatVersion); err != nil {
 		t.Fatalf("Create: %v", err)
 	}
 	raw, ok, err := m.Bytes(3)
@@ -176,7 +176,7 @@ func TestManagerBytesRoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Decode(Bytes()): %v", err)
 	}
-	if snap.Meta != meta {
+	if !metasEqual(snap.Meta, meta) {
 		t.Fatalf("meta mismatch via Bytes round trip")
 	}
 	if _, ok, err := m.Bytes(999); ok || err != nil {
@@ -187,7 +187,7 @@ func TestManagerBytesRoundTrip(t *testing.T) {
 func TestManagerCreateLeavesNoTempFileOnSuccess(t *testing.T) {
 	m := newManager(t)
 	f := buildFSM(t)
-	if _, err := m.Create(Meta{LastIncludedIndex: 3, LastIncludedTerm: 1}, f); err != nil {
+	if _, err := m.Create(Meta{LastIncludedIndex: 3, LastIncludedTerm: 1}, f, FormatVersion); err != nil {
 		t.Fatalf("Create: %v", err)
 	}
 	entries, err := os.ReadDir(m.tmpDir())

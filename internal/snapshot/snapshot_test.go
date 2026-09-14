@@ -1,11 +1,16 @@
 package snapshot
 
 import (
+	"reflect"
 	"testing"
 
 	"github.com/SamudralaAjaykumarrr/chronicledb/internal/fsm"
 	"github.com/SamudralaAjaykumarrr/chronicledb/internal/mvcc"
 )
+
+// metasEqual compares two Meta values by content — Meta is no longer
+// comparable with == now that Configuration carries slice fields.
+func metasEqual(a, b Meta) bool { return reflect.DeepEqual(a, b) }
 
 func buildFSM(t *testing.T) *fsm.FSM {
 	t.Helper()
@@ -26,13 +31,13 @@ func buildFSM(t *testing.T) *fsm.FSM {
 func TestEncodeDecodeRoundTrip(t *testing.T) {
 	f := buildFSM(t)
 	meta := Meta{LastIncludedIndex: 3, LastIncludedTerm: 1}
-	data := Encode(meta, f)
+	data := Encode(meta, f, FormatVersion)
 
 	snap, err := Decode(data)
 	if err != nil {
 		t.Fatalf("Decode: %v", err)
 	}
-	if snap.Meta != meta {
+	if !metasEqual(snap.Meta, meta) {
 		t.Fatalf("Meta mismatch: got %+v, want %+v", snap.Meta, meta)
 	}
 	if _, found := snap.FSM.Store().Visible("a", 3); found {
@@ -51,7 +56,7 @@ func TestEncodeDecodeRoundTrip(t *testing.T) {
 
 func TestDecodeRejectsBadMagic(t *testing.T) {
 	f := buildFSM(t)
-	data := Encode(Meta{LastIncludedIndex: 3}, f)
+	data := Encode(Meta{LastIncludedIndex: 3}, f, FormatVersion)
 	data[0] ^= 0xFF
 	if _, err := Decode(data); err == nil {
 		t.Fatal("expected error for corrupted magic")
@@ -60,7 +65,7 @@ func TestDecodeRejectsBadMagic(t *testing.T) {
 
 func TestDecodeRejectsBadChecksum(t *testing.T) {
 	f := buildFSM(t)
-	data := Encode(Meta{LastIncludedIndex: 3}, f)
+	data := Encode(Meta{LastIncludedIndex: 3}, f, FormatVersion)
 	data[len(data)-1] ^= 0xFF
 	if _, err := Decode(data); err == nil {
 		t.Fatal("expected error for corrupted checksum")
@@ -69,7 +74,7 @@ func TestDecodeRejectsBadChecksum(t *testing.T) {
 
 func TestDecodeRejectsTruncated(t *testing.T) {
 	f := buildFSM(t)
-	data := Encode(Meta{LastIncludedIndex: 3}, f)
+	data := Encode(Meta{LastIncludedIndex: 3}, f, FormatVersion)
 	for _, n := range []int{0, 1, headerSize, headerSize + 5, len(data) - 1} {
 		if n > len(data) {
 			continue
@@ -82,7 +87,7 @@ func TestDecodeRejectsTruncated(t *testing.T) {
 
 func TestDecodeRejectsUnsupportedVersion(t *testing.T) {
 	f := buildFSM(t)
-	data := Encode(Meta{LastIncludedIndex: 3}, f)
+	data := Encode(Meta{LastIncludedIndex: 3}, f, FormatVersion)
 	data[4] = 99 // version byte
 	// Recompute nothing: this should fail on version check before checksum.
 	if _, err := Decode(data); err == nil {
@@ -93,7 +98,7 @@ func TestDecodeRejectsUnsupportedVersion(t *testing.T) {
 func TestDecodeRejectsBoundaryViolation(t *testing.T) {
 	f := buildFSM(t)
 	// Claim a boundary lower than the actual max CommitSeq present (3).
-	data := Encode(Meta{LastIncludedIndex: 2, LastIncludedTerm: 1}, f)
+	data := Encode(Meta{LastIncludedIndex: 2, LastIncludedTerm: 1}, f, FormatVersion)
 	if _, err := Decode(data); err == nil {
 		t.Fatal("expected error for a snapshot claiming a boundary its own content exceeds")
 	}
@@ -102,8 +107,8 @@ func TestDecodeRejectsBoundaryViolation(t *testing.T) {
 func TestEncodeDeterministic(t *testing.T) {
 	f1 := buildFSM(t)
 	f2 := buildFSM(t)
-	d1 := Encode(Meta{LastIncludedIndex: 3, LastIncludedTerm: 1}, f1)
-	d2 := Encode(Meta{LastIncludedIndex: 3, LastIncludedTerm: 1}, f2)
+	d1 := Encode(Meta{LastIncludedIndex: 3, LastIncludedTerm: 1}, f1, FormatVersion)
+	d2 := Encode(Meta{LastIncludedIndex: 3, LastIncludedTerm: 1}, f2, FormatVersion)
 	if string(d1) != string(d2) {
 		t.Fatal("expected byte-identical encoding for independently constructed, identically-applied FSMs")
 	}

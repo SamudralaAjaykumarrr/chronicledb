@@ -204,7 +204,11 @@ func buildStaging(staging, backupDir string, m Manifest, snapBytes []byte, until
 	if err != nil {
 		return fmt.Errorf("backup: preparing staging snapshot directory: %w", err)
 	}
-	installedSnap, err := snapMgr.Install(snapBytes)
+	stagedSnapBytes, err := stripSnapshotConfiguration(snapBytes)
+	if err != nil {
+		return fmt.Errorf("backup: stripping source membership from staged snapshot: %w", err)
+	}
+	installedSnap, err := snapMgr.Install(stagedSnapBytes)
 	if err != nil {
 		return fmt.Errorf("backup: installing snapshot into staging: %w", err)
 	}
@@ -240,7 +244,16 @@ func buildStaging(staging, backupDir string, m Manifest, snapBytes []byte, until
 		sw.Close()
 		return fmt.Errorf("backup: opening backup WAL for replay: %w", err)
 	}
-	if _, err := copyWALSuffix(srcWAL, sw, m.LastIncludedIndex, until); err != nil {
+	transform := voidConfigEntryPayload
+	if !voidRestoredMembershipEntries {
+		// Test-only hook for DM-21's negative control (dynamic-membership
+		// plan §15/§19 gate 3): with part 2 of the transform disabled, a
+		// restored cluster must be demonstrably broken (every node
+		// reports selfRemoved() and no leader is ever elected), proving
+		// this transform — not coincidence — is what makes restore safe.
+		transform = nil
+	}
+	if _, err := copyWALSuffix(srcWAL, sw, m.LastIncludedIndex, until, transform); err != nil {
 		srcWAL.Close()
 		sw.Close()
 		return err
