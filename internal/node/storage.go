@@ -9,6 +9,7 @@ package node
 import (
 	"encoding/binary"
 	"fmt"
+	"sync/atomic"
 
 	"github.com/SamudralaAjaykumarrr/chronicledb/internal/fsm"
 	"github.com/SamudralaAjaykumarrr/chronicledb/internal/raft"
@@ -253,7 +254,19 @@ func (s *WALStorage) Append(entries []raft.Entry) error {
 		want++
 	}
 	for _, e := range entries {
-		idx, err := s.w.AppendLogEntry(encodeEntryPayload(e.Term, e.Type, e.Data))
+		typ := e.Type
+		if testStripTypedHeaderOnStaleGeneration.Load() && typ != raft.EntryNormal {
+			// DM-20's negative control (dynamic-membership plan §23/F2):
+			// reproduces revision 2's rejected §6.1a rule — gating the
+			// typed-entry header on this node's durable cluster
+			// generation, which processOutput updates only *after*
+			// persisting the very entries a generation-2 finalize
+			// commits alongside, i.e. always stale-by-one-pass exactly
+			// when it matters. Set only by that test; never by
+			// production code.
+			typ = raft.EntryNormal
+		}
+		idx, err := s.w.AppendLogEntry(encodeEntryPayload(e.Term, typ, e.Data))
 		if err != nil {
 			return fmt.Errorf("node: appending log entry %d: %w", e.Index, err)
 		}
@@ -296,6 +309,12 @@ func init() {
 	// sequentially-incrementing integer starting at 1 — realistically
 	// never reaching 0xFF within CommitTxn's own version lineage.
 }
+
+// testStripTypedHeaderOnStaleGeneration, when true, makes
+// WALStorage.Append reproduce revision 2's rejected §6.1a gating rule
+// instead of the shipped one (dynamic-membership plan §23/F2) — DM-20's
+// negative control only. Production code must never set this.
+var testStripTypedHeaderOnStaleGeneration atomic.Bool
 
 // ErrUnknownEntryType indicates a log entry payload's typed-entry
 // header names an EntryType this build does not recognize — a decode
