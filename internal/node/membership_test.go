@@ -4,6 +4,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"math/rand"
+	"strings"
 	"testing"
 	"time"
 
@@ -366,4 +368,107 @@ func TestMembershipRequestIDRetryAcrossLeaderFailover(t *testing.T) {
 			t.Fatalf("RemoveServer retry outcome = %+v, want Committed", outcome)
 		}
 	})
+}
+
+// TestDM18_MembershipChangeGenerationGateBothSides regresses DM-18
+// (§15, §8.2, §23/P3): a membership change must be refused before
+// generation-2 finalization on the leader-propose side (a live
+// assertion, mirroring TestAddLearnerRefusedBeforeGeneration2's own
+// coverage, re-asserted here under DM-18's name for direct
+// traceability) and, separately and independently, a committed
+// EntryConfig delivered to a node whose own durable generation is
+// still below 2 must cause that node to fail rather than silently
+// accept it (applyConfigEntry's own defense-in-depth check). The
+// follower-side half can never be reached via genuine replication — a
+// v0.5.0 leader only ever proposes an EntryConfig once its own
+// committed generation is already >= 2, and every node necessarily
+// applies the generation-2 finalize (an earlier log entry) before it
+// ever applies a later EntryConfig — so this half is proven by feeding
+// applyConfigEntry a legitimately-encoded EntryConfig entry (harvested
+// from a real, properly finalized cluster) directly, against a
+// hand-built Node whose clusterGeneration is pinned at 1 and which was
+// never started (so calling its unexported apply method directly from
+// the test goroutine is race-free).
+func TestDM18_MembershipChangeGenerationGateBothSides(t *testing.T) {
+	t.Run("leader-side: refused before finalize", func(t *testing.T) {
+		tc := newTestCluster(t, 3)
+		leader := tc.leaderNode(5 * time.Second)
+
+		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+		defer cancel()
+		_, err := leader.AddLearner(ctx, "dm18-add-early", "n4", "127.0.0.1:0")
+		if !errors.Is(err, ErrMembershipNotPermitted) {
+			t.Fatalf("AddLearner before finalize: err = %v, want ErrMembershipNotPermitted", err)
+		}
+	})
+
+	t.Run("follower-side: apply-time gate on a synthetic sub-generation-2 node", func(t *testing.T) {
+		// Harvest one genuinely-encoded, committed EntryConfig entry
+		// from a real, properly finalized cluster.
+		tc := newTestCluster(t, 3)
+		leader := tc.leaderNode(5 * time.Second)
+		mustFinalizeToMax(t, tc, leader)
+
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		outcome, err := leader.AddLearner(ctx, "dm18-add", "harvested-learner", "127.0.0.1:1")
+		if err != nil {
+			t.Fatalf("AddLearner: %v", err)
+		}
+		if outcome.Status != fsm.StatusCommitted {
+			t.Fatalf("AddLearner outcome = %+v, want Committed", outcome)
+		}
+		var entry raft.Entry
+		found := false
+		for _, e := range leader.core.Entries() {
+			if uint64(e.Index) == outcome.CommitSeq {
+				entry = e
+				found = true
+				break
+			}
+		}
+		if !found {
+			t.Fatalf("could not locate the committed AddLearner entry at index %d in the leader's own log", outcome.CommitSeq)
+		}
+		if entry.Type != raft.EntryConfig {
+			t.Fatalf("harvested entry Type = %v, want EntryConfig", entry.Type)
+		}
+
+		// A minimal, never-started Node: applyConfigEntry only touches
+		// n.core (SetApplied) and n.clusterGeneration before it reaches
+		// the generation check, so nothing else needs to be real.
+		synthCore, err := raft.NewCore(raft.Config{
+			ID:                         "synthetic",
+			ElectionTimeoutTicks:       10,
+			ElectionTimeoutJitterTicks: 5,
+			HeartbeatTimeoutTicks:      1,
+			Rand:                       rand.New(rand.NewSource(1)),
+		}, raft.HardState{}, nil)
+		if err != nil {
+			t.Fatalf("constructing a standalone raft.Core: %v", err)
+		}
+		synth := &Node{
+			cfg:               Config{ID: "synthetic"},
+			core:              synthCore,
+			clusterGeneration: 1, // deliberately below the generation-2 requirement
+			stopCh:            make(chan struct{}),
+		}
+
+		ok := synth.applyConfigEntry(entry)
+		if ok {
+			t.Fatal("applyConfigEntry accepted a committed EntryConfig on a node whose own durable generation is below 2")
+		}
+		err = synth.Err()
+		if !containsGenerationGateMessage(err) {
+			t.Fatalf("applyConfigEntry's fatal error = %v, want a generation-gate message", err)
+		}
+	})
+}
+
+// containsGenerationGateMessage reports whether err's message names the
+// generation-2 requirement applyConfigEntry's follower-side gate
+// produces — a substring check, since the error is constructed with
+// fmt.Errorf rather than a sentinel (dynamic-membership plan §8.2).
+func containsGenerationGateMessage(err error) bool {
+	return err != nil && strings.Contains(err.Error(), "requires cluster generation >= 2")
 }
