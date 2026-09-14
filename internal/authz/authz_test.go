@@ -23,6 +23,11 @@ func TestDecisionTable_EveryRoleEveryEndpoint(t *testing.T) {
 		EndpointBackup:          {RoleAdmin: true, RoleOperator: true, RoleReadOnly: false},
 		EndpointUpgradePrecheck: {RoleAdmin: true, RoleOperator: false, RoleReadOnly: false},
 		EndpointUpgradeFinalize: {RoleAdmin: true, RoleOperator: false, RoleReadOnly: false},
+
+		EndpointMembershipAdd:     {RoleAdmin: true, RoleOperator: false, RoleReadOnly: false},
+		EndpointMembershipPromote: {RoleAdmin: true, RoleOperator: false, RoleReadOnly: false},
+		EndpointMembershipRemove:  {RoleAdmin: true, RoleOperator: false, RoleReadOnly: false},
+		EndpointMembershipStatus:  {RoleAdmin: true, RoleOperator: true, RoleReadOnly: true},
 	}
 	if len(want) != len(AllEndpoints) {
 		t.Fatalf("this test's want table has %d endpoints, AllEndpoints has %d — keep them in sync", len(want), len(AllEndpoints))

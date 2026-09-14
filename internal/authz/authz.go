@@ -62,6 +62,18 @@ const (
 	// (docs/enterprise-v1-plan.md §7, same RBAC note as
 	// EndpointUpgradePrecheck).
 	EndpointUpgradeFinalize = "admin.upgrade.finalize"
+	// EndpointMembershipAdd/Promote/Remove gate the three mutating
+	// dynamic-membership endpoints (dynamic-membership plan §13.1):
+	// admin-only, like upgrade precheck/finalize — membership changes
+	// alter the cluster's consensus boundary, not merely its data.
+	EndpointMembershipAdd     = "admin.membership.add"
+	EndpointMembershipPromote = "admin.membership.promote"
+	EndpointMembershipRemove  = "admin.membership.remove"
+	// EndpointMembershipStatus gates GET /admin/membership/status — pure
+	// observability, mirroring /status's own openness (readable by all
+	// three roles) rather than the stricter admin-only precedent of the
+	// three mutating endpoints above.
+	EndpointMembershipStatus = "admin.membership.status"
 )
 
 // AllEndpoints lists every endpoint the decision table below covers —
@@ -75,6 +87,7 @@ var AllEndpoints = []string{
 	EndpointFault, EndpointReloadTLS,
 	EndpointBackup,
 	EndpointUpgradePrecheck, EndpointUpgradeFinalize,
+	EndpointMembershipAdd, EndpointMembershipPromote, EndpointMembershipRemove, EndpointMembershipStatus,
 }
 
 // AllRoles lists every fixed V1 role.
@@ -110,6 +123,13 @@ var decisionTable = map[string]map[Role]bool{
 	// version-compatibility boundary.
 	EndpointUpgradePrecheck: {RoleAdmin: true, RoleOperator: false, RoleReadOnly: false},
 	EndpointUpgradeFinalize: {RoleAdmin: true, RoleOperator: false, RoleReadOnly: false},
+	// Dynamic-membership plan §9/§13.1: the three mutating endpoints are
+	// admin-only; status is readable by every role, mirroring /status's
+	// existing openness.
+	EndpointMembershipAdd:     {RoleAdmin: true, RoleOperator: false, RoleReadOnly: false},
+	EndpointMembershipPromote: {RoleAdmin: true, RoleOperator: false, RoleReadOnly: false},
+	EndpointMembershipRemove:  {RoleAdmin: true, RoleOperator: false, RoleReadOnly: false},
+	EndpointMembershipStatus:  {RoleAdmin: true, RoleOperator: true, RoleReadOnly: true},
 }
 
 // Allowed reports whether role may call endpoint, per the fixed V1 RBAC

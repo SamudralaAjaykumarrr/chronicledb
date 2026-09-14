@@ -326,6 +326,10 @@ func newControlServer(n *node.Node, logger *log.Logger, sec *security, clientTLS
 	s.mux.HandleFunc("/admin/backup", sec.wrap(authz.EndpointBackup, s.handleBackup))
 	s.mux.HandleFunc("/admin/upgrade/precheck", sec.wrap(authz.EndpointUpgradePrecheck, s.handleUpgradePrecheck))
 	s.mux.HandleFunc("/admin/upgrade/finalize", sec.wrap(authz.EndpointUpgradeFinalize, s.handleUpgradeFinalize))
+	s.mux.HandleFunc("/admin/membership/add", sec.wrap(authz.EndpointMembershipAdd, s.handleMembershipAdd))
+	s.mux.HandleFunc("/admin/membership/promote", sec.wrap(authz.EndpointMembershipPromote, s.handleMembershipPromote))
+	s.mux.HandleFunc("/admin/membership/remove", sec.wrap(authz.EndpointMembershipRemove, s.handleMembershipRemove))
+	s.mux.HandleFunc("/admin/membership/status", sec.wrap(authz.EndpointMembershipStatus, s.handleMembershipStatus))
 	if enableFault {
 		s.mux.HandleFunc("/fault", sec.wrap(authz.EndpointFault, s.handleFault))
 	}

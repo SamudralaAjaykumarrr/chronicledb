@@ -6,6 +6,7 @@
 package main
 
 import (
+	"context"
 	"crypto/tls"
 	"fmt"
 	"log"
@@ -245,8 +246,28 @@ func (s *security) wrap(endpoint string, next http.HandlerFunc) http.HandlerFunc
 			http.Error(w, genericUnauthorizedMessage, http.StatusForbidden)
 			return
 		}
-		next(w, r)
+		next(w, r.WithContext(context.WithValue(r.Context(), principalContextKey{}, principalInfo{name: principal.Name, role: string(role)})))
 	}
+}
+
+// principalContextKey/principalInfo let a handler recover the identity
+// wrap already authenticated and authorized it under, for a
+// supplementary, outcome-carrying audit record beyond wrap's own
+// generic per-call allow/deny entry (dynamic-membership plan §13.4
+// needs the actual committed/aborted/rejected outcome and a
+// machine-readable reason, which are only known once the handler
+// itself runs, after wrap's own record is already written).
+type principalContextKey struct{}
+type principalInfo struct{ name, role string }
+
+// principalFromRequest returns the authenticated principal name and
+// role wrap attached to r, or ("", "") if security is disabled
+// (sec == nil / auth-mode none, in which case wrap never runs at all).
+func principalFromRequest(r *http.Request) (name, role string) {
+	if p, ok := r.Context().Value(principalContextKey{}).(principalInfo); ok {
+		return p.name, p.role
+	}
+	return "", ""
 }
 
 // buildTLSConfig builds a hot-reloadable *tls.Config for the

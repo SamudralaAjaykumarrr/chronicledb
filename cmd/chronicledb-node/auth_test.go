@@ -85,6 +85,14 @@ var endpointHTTP = map[string]struct {
 	authz.EndpointBackup:          {"POST", "/admin/backup?dir=" + rbacTestBackupDir},
 	authz.EndpointUpgradePrecheck: {"GET", "/admin/upgrade/precheck"},
 	authz.EndpointUpgradeFinalize: {"POST", "/admin/upgrade/finalize"},
+	// Bodies are empty like every other non-Propose mutating endpoint
+	// above — this test asserts only the AUTH layer's decision (see the
+	// comment further down), so a request that clears RBAC but then
+	// fails to decode as valid JSON is exactly as expected here.
+	authz.EndpointMembershipAdd:     {"POST", "/admin/membership/add"},
+	authz.EndpointMembershipPromote: {"POST", "/admin/membership/promote"},
+	authz.EndpointMembershipRemove:  {"POST", "/admin/membership/remove"},
+	authz.EndpointMembershipStatus:  {"GET", "/admin/membership/status"},
 }
 
 func TestRBAC_DecisionTable_HTTPLayer_EveryRoleEveryEndpoint(t *testing.T) {
