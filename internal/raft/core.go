@@ -103,6 +103,54 @@ type Core struct {
 	persistSeq   uint64 // next PersistRequest.Seq to assign
 	persistedSeq uint64 // highest Seq acknowledged via InputPersistenceComplete
 	pending      []pendingItem
+
+	// --- Dynamic membership state (dynamic-membership plan §2.2, §6) ---
+
+	// activeConfig governs every LIVE decision this node makes right
+	// now: who is sent AppendEntriesRPC/RequestVoteRPC, whose
+	// matchIndex counts toward majority(), whether this node may
+	// campaign at all. Append-time-effective; always exactly
+	// ConfigAt(lastIndex()), maintained as a cache of that one function
+	// via the fast-path activation helpers rather than recomputed from
+	// scratch on every call.
+	activeConfig Configuration
+	// activeConfigIndex is the log index of the EntryConfig entry that
+	// produced activeConfig, or 0 when activeConfig came from the
+	// snapshot boundary or Config.Bootstrap.
+	activeConfigIndex Index
+	// snapshotConfig is the configuration effective AT snapshotIndex —
+	// i.e. ConfigAt(snapshotIndex) as computed at the moment that
+	// boundary was established. Never assigned from activeConfig.
+	snapshotConfig Configuration
+	// snapshotHasConfig records whether the snapshot boundary carries a
+	// configuration at all — an explicit fact, never inferred from
+	// snapshotConfig being empty (which is a legitimate value and a
+	// different statement).
+	snapshotHasConfig bool
+	// bootstrapConfig holds Config.Bootstrap verbatim, so ConfigAt's
+	// step 3 is available at every call site, not only at construction.
+	bootstrapConfig Configuration
+	// pendingConfIndex is the leader-only serialization floor (P2), set
+	// to lastIndex() at becomeLeader. No EntryConfig may be appended by
+	// this leader while commitIndex < pendingConfIndex.
+	pendingConfIndex Index
+	// heardFromLeader is §2.7 Rule 2's leader-contact state: set when
+	// this node accepts an AppendEntries/InstallSnapshot from the
+	// leader of its current term, cleared on InputElectionTimeout and on
+	// any step-down to a new term. Core owns no tick counter and no
+	// clock — internal/node owns the election clock
+	// (electionArmed/electionTicksLeft) — so this flag is derived
+	// entirely from events Core already receives. It composes with
+	// internal/node's PauseTicksForTest/electionTicksPaused test-only
+	// election-clock freeze: while that freeze is engaged,
+	// InputElectionTimeout never arrives, so heardFromLeader stays true
+	// indefinitely once any leader message has been accepted, and this
+	// node ignores every RequestVoteRequest — including higher-term
+	// ones — for as long as the freeze lasts. That is the correct,
+	// intended composition of the two mechanisms; see
+	// internal/node.PauseTicksForTest's doc comment for the other side
+	// of this coupling.
+	heardFromLeader bool
 }
 
 // NewCore constructs a Core from cfg and previously persisted state
@@ -116,7 +164,7 @@ type Core struct {
 // election (docs/recovery.md §2) — NewCore never trusts a cached
 // commitIndex from disk, because none is ever persisted (ADR-0008).
 func NewCore(cfg Config, hs HardState, entries []Entry) (*Core, error) {
-	return NewCoreFromSnapshot(cfg, hs, 0, 0, entries)
+	return NewCoreFromSnapshot(cfg, hs, 0, 0, Configuration{}, false, entries)
 }
 
 // NewCoreFromSnapshot is NewCore's general form (docs/raft.md §5.1,
@@ -135,7 +183,7 @@ func NewCore(cfg Config, hs HardState, entries []Entry) (*Core, error) {
 // appliedIndex <= commitIndex true immediately after construction.
 // commitIndex still only advances further via legitimate leader contact
 // or this node's own election, exactly as before.
-func NewCoreFromSnapshot(cfg Config, hs HardState, snapshotIndex Index, snapshotTerm Term, entries []Entry) (*Core, error) {
+func NewCoreFromSnapshot(cfg Config, hs HardState, snapshotIndex Index, snapshotTerm Term, snapshotConfig Configuration, snapshotHasConfig bool, entries []Entry) (*Core, error) {
 	if err := cfg.validate(); err != nil {
 		return nil, fmt.Errorf("%w: %v", ErrInvalidConfig, err)
 	}
@@ -148,20 +196,25 @@ func NewCoreFromSnapshot(cfg Config, hs HardState, snapshotIndex Index, snapshot
 		}
 		log = append(log, e)
 	}
-	return &Core{
-		cfg:           cfg,
-		role:          Follower,
-		currentTerm:   hs.CurrentTerm,
-		votedFor:      hs.VotedFor,
-		log:           log,
-		snapshotIndex: snapshotIndex,
-		snapshotTerm:  snapshotTerm,
-		commitIndex:   snapshotIndex,
-		appliedIndex:  snapshotIndex,
-		nextIndex:     make(map[NodeID]Index),
-		matchIndex:    make(map[NodeID]Index),
-		votesReceived: make(map[NodeID]bool),
-	}, nil
+	c := &Core{
+		cfg:               cfg,
+		role:              Follower,
+		currentTerm:       hs.CurrentTerm,
+		votedFor:          hs.VotedFor,
+		log:               log,
+		snapshotIndex:     snapshotIndex,
+		snapshotTerm:      snapshotTerm,
+		snapshotConfig:    snapshotConfig.clone(),
+		snapshotHasConfig: snapshotHasConfig,
+		bootstrapConfig:   cfg.Bootstrap.clone(),
+		commitIndex:       snapshotIndex,
+		appliedIndex:      snapshotIndex,
+		nextIndex:         make(map[NodeID]Index),
+		matchIndex:        make(map[NodeID]Index),
+		votesReceived:     make(map[NodeID]bool),
+	}
+	c.activeConfig, c.activeConfigIndex = c.ConfigAt(c.lastIndex())
+	return c, nil
 }
 
 // --- Read-only accessors (observability, tests, harness bookkeeping) ---
@@ -212,6 +265,10 @@ func (c *Core) Compact(uptoIndex Index) bool {
 	if uptoIndex <= c.snapshotIndex || uptoIndex > c.appliedIndex {
 		return false
 	}
+	// Computed before any mutation below, per ConfigAt's read-only
+	// contract (dynamic-membership plan §7.4) — never activeConfig,
+	// which may reflect an uncommitted entry above uptoIndex.
+	cfg, _ := c.ConfigAt(uptoIndex)
 	p := c.pos(uptoIndex)
 	term := c.log[p].Term
 	newLog := make([]Entry, len(c.log)-p)
@@ -220,6 +277,11 @@ func (c *Core) Compact(uptoIndex Index) bool {
 	c.log = newLog
 	c.snapshotIndex = uptoIndex
 	c.snapshotTerm = term
+	c.snapshotConfig = cfg
+	c.snapshotHasConfig = true
+	if c.activeConfigIndex <= uptoIndex {
+		c.activeConfigIndex = 0
+	}
 	return true
 }
 
@@ -313,6 +375,7 @@ func (c *Core) stepDownTo(term Term) bool {
 	c.votedFor = noVote
 	c.leaderID = ""
 	c.votesReceived = nil
+	c.heardFromLeader = false
 	return wasLeaderOrCandidate
 }
 
@@ -358,6 +421,15 @@ func (c *Core) handleElectionTimeout() Output {
 	if c.role == Leader {
 		return Output{}
 	}
+	// §2.7 Rule 2: a fresh election timeout is exactly the event that
+	// makes prior leader contact stale.
+	c.heardFromLeader = false
+	// §2.7 Rule 1's third clause: a node that is not a Voter in its own
+	// activeConfig (a Learner, or one that has observed its own
+	// removal) never starts an election.
+	if !c.activeConfig.isVoter(c.cfg.ID) {
+		return Output{}
+	}
 
 	c.role = Candidate
 	c.currentTerm++
@@ -373,20 +445,20 @@ func (c *Core) handleElectionTimeout() Output {
 		ResetElectionTimer:   true,
 		ElectionTimeoutTicks: c.cfg.electionTimeout(),
 	}
-	for _, p := range c.cfg.Peers {
-		if p == c.cfg.ID {
+	for _, m := range c.activeConfig.Voters {
+		if m.ID == c.cfg.ID {
 			continue
 		}
 		out.Messages = append(out.Messages, Message{
 			Type:         MsgRequestVoteRequest,
 			From:         c.cfg.ID,
-			To:           p,
+			To:           m.ID,
 			Term:         c.currentTerm,
 			LastLogIndex: c.lastIndex(),
 			LastLogTerm:  c.lastTerm(),
 		})
 	}
-	if len(c.votesReceived) >= c.cfg.majority() {
+	if len(c.votesReceived) >= c.activeConfig.majority() {
 		// Single-node cluster: a candidacy of one is already a majority.
 		c.becomeLeader(&out)
 	}
@@ -398,11 +470,14 @@ func (c *Core) handleHeartbeatTimeout() Output {
 		return Output{}
 	}
 	out := Output{ResetHeartbeatTimer: true, HeartbeatTimeoutTicks: c.cfg.HeartbeatTimeoutTicks}
-	for _, p := range c.cfg.Peers {
-		if p == c.cfg.ID {
+	for _, m := range c.activeConfig.Voters {
+		if m.ID == c.cfg.ID {
 			continue
 		}
-		out.Messages = append(out.Messages, c.appendEntriesMessage(p))
+		out.Messages = append(out.Messages, c.appendEntriesMessage(m.ID))
+	}
+	for _, m := range c.activeConfig.Learners {
+		out.Messages = append(out.Messages, c.appendEntriesMessage(m.ID))
 	}
 	return out
 }
@@ -411,20 +486,50 @@ func (c *Core) handlePropose(data []byte) Output {
 	if c.role != Leader {
 		return Output{ProposalRejected: true, LeaderHint: c.leaderID}
 	}
-	idx := c.lastIndex() + 1
-	entry := Entry{Index: idx, Term: c.currentTerm, Data: append([]byte(nil), data...)}
+	return c.appendLeaderEntry(EntryNormal, append([]byte(nil), data...))
+}
+
+// appendLeaderEntry appends a new entry of type t at this Leader's
+// lastIndex()+1 and does everything handlePropose/ProposeConfigChange
+// share: optimistic self-matchIndex, append-time configuration
+// activation for an EntryConfig entry (dynamic-membership plan §2.2),
+// the durability request, and replication fan-out to every current
+// Voter and Learner (never RequestVoteRPC, and never a duplicate send
+// to self).
+func (c *Core) appendLeaderEntry(t EntryType, data []byte) Output {
+	prevLast := c.lastIndex()
+	idx := prevLast + 1
+	entry := Entry{Index: idx, Term: c.currentTerm, Type: t, Data: data}
 	c.log = append(c.log, entry)
 	c.matchIndex[c.cfg.ID] = idx // optimistic; confirmed via pendingSelfMatch below
+
+	if t == EntryConfig {
+		_, _, _, _, cfg, establishes, err := decodeConfigChange(data)
+		if err != nil || !establishes {
+			panic("raft: appendLeaderEntry: EntryConfig payload does not establish a configuration — this must never happen for a leader-constructed entry")
+		}
+		c.activeConfig = cfg
+		c.activeConfigIndex = idx
+		for _, m := range cfg.Voters {
+			c.initReplicationStateFor(m.ID, prevLast)
+		}
+		for _, m := range cfg.Learners {
+			c.initReplicationStateFor(m.ID, prevLast)
+		}
+	}
 
 	seq := c.nextPersistSeq()
 	c.pending = append(c.pending, pendingItem{kind: pendingSelfMatch, seq: seq, term: c.currentTerm, index: idx, entryTerm: c.currentTerm})
 
 	out := Output{PersistRequest: &PersistRequest{Seq: seq, Entries: []Entry{entry}}}
-	for _, p := range c.cfg.Peers {
-		if p == c.cfg.ID {
+	for _, m := range c.activeConfig.Voters {
+		if m.ID == c.cfg.ID {
 			continue
 		}
-		out.Messages = append(out.Messages, c.appendEntriesMessage(p))
+		out.Messages = append(out.Messages, c.appendEntriesMessage(m.ID))
+	}
+	for _, m := range c.activeConfig.Learners {
+		out.Messages = append(out.Messages, c.appendEntriesMessage(m.ID))
 	}
 	return out
 }
@@ -449,6 +554,11 @@ func (c *Core) appendEntriesMessage(peer NodeID) Message {
 		return Message{
 			Type: MsgInstallSnapshotRequest, From: c.cfg.ID, To: peer, Term: c.currentTerm,
 			LastIncludedIndex: c.snapshotIndex, LastIncludedTerm: c.snapshotTerm,
+			// Dynamic-membership plan §7.2: populated from this sending
+			// node's own ConfigAt(snapshotIndex) — i.e. exactly
+			// snapshotConfig/snapshotHasConfig — never activeConfig.
+			Configuration:    c.snapshotConfig.clone(),
+			HasConfiguration: c.snapshotHasConfig,
 		}
 	}
 	prevIndex := next - 1
@@ -483,23 +593,35 @@ func (c *Core) becomeLeader(out *Output) {
 	c.role = Leader
 	c.leaderID = c.cfg.ID
 	c.votesReceived = nil
-	c.nextIndex = make(map[NodeID]Index, len(c.cfg.Peers))
-	c.matchIndex = make(map[NodeID]Index, len(c.cfg.Peers))
 	last := c.lastIndex()
-	for _, p := range c.cfg.Peers {
-		c.nextIndex[p] = last + 1
-		c.matchIndex[p] = 0
+	// P2 (dynamic-membership plan §2.2a): the inherited-suffix floor,
+	// set BEFORE any current-term entry is appended.
+	c.pendingConfIndex = last
+
+	n := len(c.activeConfig.Voters) + len(c.activeConfig.Learners)
+	c.nextIndex = make(map[NodeID]Index, n)
+	c.matchIndex = make(map[NodeID]Index, n)
+	for _, m := range c.activeConfig.Voters {
+		c.nextIndex[m.ID] = last + 1
+		c.matchIndex[m.ID] = 0
+	}
+	for _, m := range c.activeConfig.Learners {
+		c.nextIndex[m.ID] = last + 1
+		c.matchIndex[m.ID] = 0
 	}
 	c.matchIndex[c.cfg.ID] = last
 
 	out.BecameLeader = true
 	out.ResetHeartbeatTimer = true
 	out.HeartbeatTimeoutTicks = c.cfg.HeartbeatTimeoutTicks
-	for _, p := range c.cfg.Peers {
-		if p == c.cfg.ID {
+	for _, m := range c.activeConfig.Voters {
+		if m.ID == c.cfg.ID {
 			continue
 		}
-		out.Messages = append(out.Messages, c.appendEntriesMessage(p))
+		out.Messages = append(out.Messages, c.appendEntriesMessage(m.ID))
+	}
+	for _, m := range c.activeConfig.Learners {
+		out.Messages = append(out.Messages, c.appendEntriesMessage(m.ID))
 	}
 }
 
@@ -531,6 +653,22 @@ func (c *Core) handleMessage(msg Message) Output {
 func (c *Core) handleRequestVoteRequest(msg Message) Output {
 	var out Output
 
+	// §2.7 Rule 1, first clause: drop outright — no term bump, no vote
+	// decision, no reply — a request from a sender that is not a Voter
+	// in this receiver's own activeConfig. A Learner is likewise never
+	// a legitimate candidate, so this one condition covers both "removed
+	// node" and "learner campaigning."
+	if !c.activeConfig.isVoter(msg.From) {
+		return out
+	}
+	// §2.7 Rule 2 (Raft §4.2.3 leader-contact suppression): a node that
+	// has heard from its current leader within the minimum election
+	// timeout ignores any RequestVoteRequest, including a higher-term
+	// one — no term bump, no vote decision, no reply.
+	if c.heardFromLeader {
+		return out
+	}
+
 	if msg.Term < c.currentTerm {
 		out.Messages = append(out.Messages, Message{
 			Type: MsgRequestVoteResponse, From: c.cfg.ID, To: msg.From,
@@ -547,7 +685,10 @@ func (c *Core) handleRequestVoteRequest(msg Message) Output {
 		steppedDown = true
 	}
 
-	canVote := c.votedFor == noVote || c.votedFor == msg.From
+	// §2.7 Rule 1, second clause: a node that is not itself a Voter in
+	// its own activeConfig (a Learner, or one that has observed its own
+	// removal) never grants a vote, regardless of log state.
+	canVote := (c.votedFor == noVote || c.votedFor == msg.From) && c.activeConfig.isVoter(c.cfg.ID)
 	logOK := c.isLogUpToDate(msg.LastLogIndex, msg.LastLogTerm)
 
 	if canVote && logOK {
@@ -614,7 +755,7 @@ func (c *Core) handleRequestVoteResponse(msg Message) Output {
 		return out // stale, not a candidate anymore, or a rejection
 	}
 	c.votesReceived[msg.From] = true // map dedupes: a peer's vote is never counted twice
-	if len(c.votesReceived) >= c.cfg.majority() {
+	if len(c.votesReceived) >= c.activeConfig.majority() {
 		c.becomeLeader(&out)
 	}
 	return out
@@ -654,6 +795,7 @@ func (c *Core) handleAppendEntriesRequest(msg Message) Output {
 	}
 
 	c.leaderID = msg.From
+	c.heardFromLeader = true
 	out.ResetElectionTimer = true
 	out.ElectionTimeoutTicks = c.cfg.electionTimeout()
 
@@ -715,6 +857,19 @@ func (c *Core) handleAppendEntriesRequest(msg Message) Output {
 	if appendStart < len(msg.Entries) {
 		newEntries = append([]Entry(nil), msg.Entries[appendStart:]...)
 		c.log = append(c.log, newEntries...)
+	}
+
+	// Dynamic-membership plan §2.2: append-time-effective activation and
+	// revert-on-truncate, both defined purely in terms of ConfigAt so
+	// there is exactly one reconstruction algorithm (§6.3). A truncation
+	// requires the full backward scan (rare — only on a log-matching
+	// conflict); a clean append with no truncation can only have
+	// introduced a newer configuration-establishing entry within the
+	// batch just appended, so the fast path scans only that batch.
+	if truncateFrom != 0 {
+		c.activeConfig, c.activeConfigIndex = c.ConfigAt(c.lastIndex())
+	} else if len(newEntries) != 0 {
+		c.activateFromAppendedEntries(newEntries)
 	}
 
 	lastNew := msg.PrevLogIndex + Index(len(msg.Entries))
@@ -858,29 +1013,53 @@ func (c *Core) handleAppendEntriesResponse(msg Message) Output {
 
 // advanceLeaderCommit implements the current-term commit rule exactly
 // (docs/raft.md §4): the Leader may advance commitIndex to N only if a
-// majority (including itself) has matchIndex >= N and the entry at N
-// belongs to the Leader's own currentTerm.
+// majority of the currently active configuration's Voters has
+// matchIndex >= N and the entry at N belongs to the Leader's own
+// currentTerm. Counting only over c.activeConfig.Voters is what gives
+// QUORUM CONTINUITY / the leader-self-removal exclusion (dynamic-
+// membership plan §2.2/§4.2) for free: a self-removing leader is simply
+// absent from this range from the instant of append, with no special
+// case — its own matchIndex, still tracked in c.matchIndex, is never
+// consulted once it is no longer a Voter.
 func (c *Core) advanceLeaderCommit(out *Output) {
 	for n := c.lastIndex(); n > c.commitIndex; n-- {
 		if c.termAt(n) != c.currentTerm {
 			continue
 		}
 		count := 0
-		for _, p := range c.cfg.Peers {
-			if c.matchIndex[p] >= n {
+		for _, v := range c.activeConfig.Voters {
+			if c.matchIndex[v.ID] >= n {
 				count++
 			}
 		}
-		if count >= c.cfg.majority() {
+		if count >= c.activeConfig.majority() {
 			start := c.commitIndex + 1
 			if start <= c.snapshotIndex {
 				start = c.snapshotIndex + 1
 			}
 			out.CommittedEntries = append(out.CommittedEntries, c.log[c.pos(start):c.pos(n)+1]...)
 			c.commitIndex = n
+			c.maybeStepDownAfterSelfRemoval(out)
 			return
 		}
 	}
+}
+
+// maybeStepDownAfterSelfRemoval implements §4.2's step-down rule: once
+// a committed EntryConfig entry excludes this Leader's own ID from
+// Voters, it steps down to Follower immediately (waiting for commit,
+// not merely append, specifically avoids needlessly giving up
+// leadership for a change that might never actually succeed).
+func (c *Core) maybeStepDownAfterSelfRemoval(out *Output) {
+	if c.role != Leader || c.activeConfig.isVoter(c.cfg.ID) {
+		return
+	}
+	c.role = Follower
+	c.leaderID = ""
+	c.nextIndex = nil
+	c.matchIndex = nil
+	c.votesReceived = nil
+	out.SteppedDown = true
 }
 
 // handleInstallSnapshotRequest implements the follower side of
@@ -919,6 +1098,7 @@ func (c *Core) handleInstallSnapshotRequest(msg Message) Output {
 		}
 	}
 	c.leaderID = msg.From
+	c.heardFromLeader = true
 	out.ResetElectionTimer = true
 	out.ElectionTimeoutTicks = c.cfg.electionTimeout()
 
@@ -955,6 +1135,22 @@ func (c *Core) handleInstallSnapshotRequest(msg Message) Output {
 		c.commitIndex = c.snapshotIndex
 	}
 	c.SetApplied(c.snapshotIndex)
+
+	// Dynamic-membership plan §7.2: the installed snapshot's own
+	// Configuration/HasConfiguration pair is exactly what the driver has
+	// already durably installed and cross-checked before ever calling
+	// Step for this message (internal/node's job, not Core's — Core has
+	// no access to snapshot bytes) — adopted unconditionally, discarding
+	// whatever activeConfig this node had before. No merge, no backward
+	// scan: the log it would scan has just been discarded.
+	c.snapshotConfig = msg.Configuration.clone()
+	c.snapshotHasConfig = msg.HasConfiguration
+	c.activeConfigIndex = 0
+	if c.snapshotHasConfig {
+		c.activeConfig = c.snapshotConfig.clone()
+	} else {
+		c.activeConfig = c.bootstrapConfig.clone()
+	}
 
 	if stateChanged {
 		seq := c.nextPersistSeq()

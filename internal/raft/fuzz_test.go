@@ -2,6 +2,31 @@ package raft
 
 import "testing"
 
+// FuzzDecodeEntryConfig feeds arbitrary bytes into decodeConfigChange
+// (dynamic-membership plan §2.5/§6.1a): it must never panic and must
+// never yield establishes=true with a structurally-invalid
+// Configuration without also returning an error.
+func FuzzDecodeEntryConfig(f *testing.F) {
+	f.Add(encodeConfigChange(membershipKindAddLearner, "r1", "d", "d:1", Configuration{Voters: []Member{{ID: "a"}, {ID: "b"}}}))
+	f.Add(EncodeVoidedEntryConfigPayload())
+	f.Add([]byte{})
+	f.Add([]byte{controlCommandMarkerMirror})
+	f.Add([]byte{controlCommandMarkerMirror, membershipKindVoided})
+
+	f.Fuzz(func(t *testing.T, b []byte) {
+		_, _, _, _, cfg, establishes, err := decodeConfigChange(b)
+		if err != nil {
+			return
+		}
+		if establishes && len(cfg.Voters) == 0 {
+			// A successfully decoded, establishing Configuration with zero
+			// voters is a structurally invalid Configuration that should
+			// never come back without an error.
+			t.Fatalf("decodeConfigChange(%x) returned establishes=true with zero voters and no error", b)
+		}
+	})
+}
+
 // FuzzAppendEntriesReconciliation feeds arbitrary (including
 // malformed-by-a-real-leader's-standards) AppendEntriesRequest shapes
 // at a freshly constructed follower Core and asserts Step never panics

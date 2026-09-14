@@ -9,10 +9,21 @@ type zeroRand struct{}
 
 func (zeroRand) Intn(int) int { return 0 }
 
+// votersConfig builds a Configuration whose Voters are ids, each with a
+// placeholder address (tests never dial it — Core carries Address
+// opaquely).
+func votersConfig(ids []NodeID) Configuration {
+	voters := make([]Member, len(ids))
+	for i, id := range ids {
+		voters[i] = Member{ID: id, Address: string(id) + ":0"}
+	}
+	return Configuration{Voters: voters}
+}
+
 func testConfig(id NodeID, peers []NodeID) Config {
 	return Config{
 		ID:                         id,
-		Peers:                      peers,
+		Bootstrap:                  votersConfig(peers),
 		ElectionTimeoutTicks:       10,
 		ElectionTimeoutJitterTicks: 5,
 		HeartbeatTimeoutTicks:      2,

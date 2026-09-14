@@ -6,11 +6,16 @@ import "fmt"
 // (including reconstruction after a restart) — Config itself carries
 // no persistent state.
 type Config struct {
-	// ID is this node's identity. Must be a member of Peers.
+	// ID is this node's identity.
 	ID NodeID
-	// Peers lists every voting member of the cluster, including ID
-	// itself (docs/architecture.md §1: static membership in V1).
-	Peers []NodeID
+	// Bootstrap is the starting Configuration, consulted ONLY when a
+	// Core is constructed with no prior log entries and no snapshot at
+	// all (a brand-new, never-before-run cluster, or one produced by
+	// -restore-from, whose staged snapshot deliberately carries no
+	// Configuration — dynamic-membership plan §1.1/§1.8/§7.6). Every
+	// later restart derives the active Configuration from durable state
+	// instead (ConfigAt), never from this field again.
+	Bootstrap Configuration
 
 	// ElectionTimeoutTicks is the minimum number of logical ticks a
 	// Follower/Candidate waits, without a valid contact from a current
@@ -30,19 +35,22 @@ type Config struct {
 	Rand Rand
 }
 
+// validate is a bootstrap-seed well-formedness check ("if you are
+// seeding a cluster, you must be in it"), not a membership check
+// (dynamic-membership plan §1.1): a node joining an already-running
+// cluster as a learner is constructed with a deliberately empty
+// Bootstrap and never takes this branch at all — an entirely empty
+// Bootstrap is valid and is the required state for that case. Only a
+// non-empty Bootstrap (a genuine fresh-cluster seed, or a restored
+// directory's operator-supplied peer set) must include Config.ID.
 func (c Config) validate() error {
 	if c.ID == "" {
 		return fmt.Errorf("raft: Config.ID must not be empty")
 	}
-	found := false
-	for _, p := range c.Peers {
-		if p == c.ID {
-			found = true
-			break
+	if len(c.Bootstrap.Voters) > 0 || len(c.Bootstrap.Learners) > 0 {
+		if !c.Bootstrap.isMember(c.ID) {
+			return fmt.Errorf("raft: non-empty Config.Bootstrap must include Config.ID (%q)", c.ID)
 		}
-	}
-	if !found {
-		return fmt.Errorf("raft: Config.Peers must include Config.ID (%q)", c.ID)
 	}
 	if c.ElectionTimeoutTicks <= 0 {
 		return fmt.Errorf("raft: Config.ElectionTimeoutTicks must be > 0")
@@ -64,10 +72,4 @@ func (c Config) electionTimeout() int {
 		return c.ElectionTimeoutTicks
 	}
 	return c.ElectionTimeoutTicks + c.Rand.Intn(c.ElectionTimeoutJitterTicks+1)
-}
-
-// majority returns the smallest count that constitutes a majority of
-// len(c.Peers).
-func (c Config) majority() int {
-	return len(c.Peers)/2 + 1
 }

@@ -104,6 +104,16 @@ type Message struct {
 	LastIncludedIndex Index
 	LastIncludedTerm  Term
 	SnapshotData      []byte
+	// Configuration/HasConfiguration mirror the sending node's own
+	// ConfigAt(snapshotIndex) (dynamic-membership plan §7.2) — always
+	// populated as a pair, never the configuration alone. They exist
+	// only so Core can reason about the transfer without the driver
+	// handing it snapshot bytes it must not parse (docs/raft.md §1);
+	// the receiving driver's own durably-installed snapshot Meta is the
+	// value actually adopted, cross-checked against this pair before
+	// Core.Step is ever called for the message that carries it.
+	Configuration    Configuration
+	HasConfiguration bool
 
 	// Seq is a driver-assigned (internal/node), Core-opaque correlation
 	// token: Core itself never reads or writes it (always 0 on any

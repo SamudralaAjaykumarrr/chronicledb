@@ -20,7 +20,7 @@ import "testing"
 // MatchIndex=SnapshotIndex so the leader can advance past it, per
 // SNAPSHOT-SAFETY and RECOVERY-NON-INVENTION.
 func TestStaleAppendEntriesBelowSnapshotBoundaryReportsMatchIndexWithoutMutation(t *testing.T) {
-	c, err := NewCoreFromSnapshot(testConfig("A", threePeers()), HardState{CurrentTerm: 5}, 10, 3, []Entry{
+	c, err := NewCoreFromSnapshot(testConfig("A", threePeers()), HardState{CurrentTerm: 5}, 10, 3, Configuration{}, false, []Entry{
 		{Index: 11, Term: 5, Data: []byte("x")},
 	})
 	if err != nil {
@@ -84,7 +84,7 @@ func TestStaleAppendEntriesBelowSnapshotBoundaryReportsMatchIndexWithoutMutation
 // stale-snapshot short-circuit — both must agree the entry is
 // accepted.
 func TestStaleAppendEntriesExactlyAtSnapshotBoundaryIsAccepted(t *testing.T) {
-	c, err := NewCoreFromSnapshot(testConfig("A", threePeers()), HardState{CurrentTerm: 2}, 5, 1, nil)
+	c, err := NewCoreFromSnapshot(testConfig("A", threePeers()), HardState{CurrentTerm: 2}, 5, 1, Configuration{}, false, nil)
 	if err != nil {
 		t.Fatalf("NewCoreFromSnapshot: %v", err)
 	}

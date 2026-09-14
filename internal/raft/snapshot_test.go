@@ -5,7 +5,7 @@ import "testing"
 // --- NewCoreFromSnapshot ---
 
 func TestNewCoreFromSnapshotStartsCommitAndAppliedAtBoundary(t *testing.T) {
-	c, err := NewCoreFromSnapshot(testConfig("A", threePeers()), HardState{CurrentTerm: 2}, 5, 1, []Entry{{Index: 6, Term: 2, Data: []byte("x")}})
+	c, err := NewCoreFromSnapshot(testConfig("A", threePeers()), HardState{CurrentTerm: 2}, 5, 1, Configuration{}, false, []Entry{{Index: 6, Term: 2, Data: []byte("x")}})
 	if err != nil {
 		t.Fatalf("NewCoreFromSnapshot: %v", err)
 	}
@@ -28,13 +28,13 @@ func TestNewCoreFromSnapshotStartsCommitAndAppliedAtBoundary(t *testing.T) {
 }
 
 func TestNewCoreFromSnapshotRejectsNonContiguousEntries(t *testing.T) {
-	if _, err := NewCoreFromSnapshot(testConfig("A", threePeers()), HardState{}, 5, 1, []Entry{{Index: 7, Term: 1}}); err == nil {
+	if _, err := NewCoreFromSnapshot(testConfig("A", threePeers()), HardState{}, 5, 1, Configuration{}, false, []Entry{{Index: 7, Term: 1}}); err == nil {
 		t.Fatal("expected an error for entries not starting at snapshotIndex+1")
 	}
 }
 
 func TestNewCoreZeroSnapshotMatchesOriginalNewCore(t *testing.T) {
-	c, err := NewCoreFromSnapshot(testConfig("A", threePeers()), HardState{}, 0, 0, nil)
+	c, err := NewCoreFromSnapshot(testConfig("A", threePeers()), HardState{}, 0, 0, Configuration{}, false, nil)
 	if err != nil {
 		t.Fatalf("NewCoreFromSnapshot: %v", err)
 	}
