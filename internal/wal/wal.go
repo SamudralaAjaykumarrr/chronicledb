@@ -535,33 +535,47 @@ func (w *WAL) AppendMetadataSnapshot(uptoIndex uint64) error {
 // replay if the binary restarting is now older than what this data
 // directory was finalized to.
 //
-// generation must be monotonically non-decreasing, mirroring
-// FSM.ApplySetClusterVersion's own ROLLBACK BOUNDARY HONESTY rule — a
-// caller asking to move it backward is a local programming error, not
-// a legitimate operation, so it is rejected rather than silently
-// accepted.
+// The durably recorded generation itself is monotonically
+// non-decreasing (ROLLBACK BOUNDARY HONESTY): this method never lowers
+// it. generation <= the current durable value is accepted as a no-op
+// rather than rejected, because it is not only reachable as the
+// single-retried-command case described below — restart replay
+// (internal/node.applyCommitted/applyControlEntry, driven by
+// raft.Core's own re-derivation of already-committed entries after any
+// restart, docs/recovery.md) walks every committed control-command
+// entry in LOG order, including ones the WAL's own metadata pointer,
+// persisted before the restart, has already moved past — e.g. a node
+// finalized 0->1 then 1->2 before crashing restarts with durable
+// ClusterGeneration already at 2, then replays the committed
+// generation-1 entry before it ever reaches the generation-2 one. That
+// is ordinary idempotent re-derivation of history this node has
+// already durably recorded, not a new attempt to move the value
+// backward, and only ever became reachable once more than one
+// generation transition could exist in a single node's lifetime
+// (dynamic-membership plan §8.1's MaxSupportedGeneration bump past 1 is
+// the first phase this becomes possible). A genuine caller error
+// (asking to move the value backward via a value that was never
+// legitimately recorded) is structurally indistinguishable from this
+// case from this method's point of view — both present a
+// non-increasing request — so both are silently accepted; the actual
+// safety property (this binary's own committed history, and any
+// command it applies, only ever calls this with a value validated by
+// FSM.ApplySetClusterVersion's own N/N+1-only, current-or-forward rule)
+// is enforced upstream, not here.
 func (w *WAL) SetClusterGeneration(generation uint32) error {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	if w.closed {
 		return ErrClosed
 	}
-	if generation == w.metadata.ClusterGeneration {
-		// Idempotent no-op: internal/node.applyControlEntry calls this
-		// unconditionally whenever a control command's outcome is
-		// StatusCommitted, including a retried proposal resolved from
-		// FSM.ApplySetClusterVersion's own idempotency table rather than
-		// freshly evaluated (docs/enterprise-v1-plan.md §7's own
-		// "finalize... a retry is idempotent" requirement can produce
-		// exactly this: two separate committed log entries under the
-		// same RequestID, both landing on the identical already-current
-		// generation). Skipping the append+fsync here avoids paying for
-		// that redundant durability round-trip on the single event-loop
-		// goroutine a second time for no state change at all.
+	if generation <= w.metadata.ClusterGeneration {
+		// Idempotent no-op — see the doc comment above for the two
+		// distinct cases this covers (a retried command landing on the
+		// already-current generation, and restart replay of a
+		// since-superseded historical entry). Skipping the append+fsync
+		// here avoids paying for a redundant durability round-trip on the
+		// single event-loop goroutine for no state change at all.
 		return nil
-	}
-	if generation < w.metadata.ClusterGeneration {
-		return fmt.Errorf("wal: SetClusterGeneration: %d is behind current generation %d", generation, w.metadata.ClusterGeneration)
 	}
 	if generation > version.MaxSupportedGeneration {
 		// Defense in depth: internal/node already refuses to apply a

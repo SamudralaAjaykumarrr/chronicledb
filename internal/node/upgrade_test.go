@@ -41,8 +41,8 @@ func TestUpgradePrecheckAndFinalize_RealCluster(t *testing.T) {
 	if err != nil {
 		t.Fatalf("UpgradePrecheck: %v", err)
 	}
-	if pre.TargetGeneration != version.MaxSupportedGeneration {
-		t.Fatalf("TargetGeneration = %d, want %d", pre.TargetGeneration, version.MaxSupportedGeneration)
+	if pre.TargetGeneration != pre.LocalClusterGeneration+1 {
+		t.Fatalf("TargetGeneration = %d, want LocalClusterGeneration+1 = %d (single-step N/N+1-only policy)", pre.TargetGeneration, pre.LocalClusterGeneration+1)
 	}
 	for _, id := range tc.ids {
 		if id == leaderID {
@@ -80,9 +80,14 @@ func TestUpgradePrecheckAndFinalize_RealCluster(t *testing.T) {
 		t.Fatalf("FinalizeUpgrade outcome = %+v, want Committed", outcome)
 	}
 
+	// The N/N+1-only policy means one FinalizeUpgrade call advances the
+	// cluster by exactly one generation; repeat until this binary's own
+	// MaxSupportedGeneration is reached (2 calls today).
+	finalizeToMax(t, leader, ctx)
+
 	for _, id := range tc.ids {
 		id := id
-		awaitCondition(t, 5*time.Second, "node "+string(id)+" converges on ClusterGeneration=1", func() bool {
+		awaitCondition(t, 5*time.Second, "node "+string(id)+" converges on ClusterGeneration=max", func() bool {
 			return tc.node(id).Status().ClusterGeneration == version.MaxSupportedGeneration
 		})
 	}
@@ -113,12 +118,10 @@ func TestFinalizeUpgrade_RestartPersistsGeneration(t *testing.T) {
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	if _, err := leader.FinalizeUpgrade(ctx); err != nil {
-		t.Fatalf("FinalizeUpgrade: %v", err)
-	}
+	finalizeToMax(t, leader, ctx)
 	for _, id := range tc.ids {
 		id := id
-		awaitCondition(t, 5*time.Second, "node "+string(id)+" converges on ClusterGeneration=1", func() bool {
+		awaitCondition(t, 5*time.Second, "node "+string(id)+" converges on ClusterGeneration=max", func() bool {
 			return tc.node(id).Status().ClusterGeneration == version.MaxSupportedGeneration
 		})
 	}
@@ -138,9 +141,28 @@ func TestFinalizeUpgrade_RestartPersistsGeneration(t *testing.T) {
 	// that happens asynchronously once its event loop starts replaying
 	// the log, exactly like AppliedIndex catch-up after any other
 	// restart — so this polls rather than reading Status() immediately.
-	awaitCondition(t, 5*time.Second, "restarted node recovers ClusterGeneration=1 from local durable state", func() bool {
+	awaitCondition(t, 5*time.Second, "restarted node recovers ClusterGeneration=max from local durable state", func() bool {
 		return restarted.Status().ClusterGeneration == version.MaxSupportedGeneration
 	})
+}
+
+// finalizeToMax repeatedly calls FinalizeUpgrade against leader until it
+// reports ErrAlreadyFinalized, accommodating the N/N+1-only single-step
+// policy (fsm.ApplySetClusterVersion) when this binary's
+// MaxSupportedGeneration is more than one generation above a fresh
+// cluster's starting generation 0.
+func finalizeToMax(t *testing.T, leader *Node, ctx context.Context) {
+	t.Helper()
+	for i := 0; i < int(version.MaxSupportedGeneration)+1; i++ {
+		_, err := leader.FinalizeUpgrade(ctx)
+		if errors.Is(err, ErrAlreadyFinalized) {
+			return
+		}
+		if err != nil {
+			t.Fatalf("FinalizeUpgrade step %d: %v", i, err)
+		}
+	}
+	t.Fatalf("finalizeToMax: did not reach ErrAlreadyFinalized within %d steps", version.MaxSupportedGeneration+1)
 }
 
 // TestFinalizeUpgrade_FollowerAdoptsGenerationViaSnapshotInstall is a
@@ -194,11 +216,9 @@ func TestFinalizeUpgrade_FollowerAdoptsGenerationViaSnapshotInstall(t *testing.T
 	{
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
-		if _, err := leader.FinalizeUpgrade(ctx); err != nil {
-			t.Fatalf("FinalizeUpgrade: %v", err)
-		}
+		finalizeToMax(t, leader, ctx)
 	}
-	awaitCondition(t, 5*time.Second, "leader converges on ClusterGeneration=1", func() bool {
+	awaitCondition(t, 5*time.Second, "leader converges on ClusterGeneration=max", func() bool {
 		return leader.Status().ClusterGeneration == version.MaxSupportedGeneration
 	})
 	if got := tc.node(follower).Status().ClusterGeneration; got != 0 {

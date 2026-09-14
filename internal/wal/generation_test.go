@@ -110,12 +110,26 @@ func TestOpenRefusesDataDirectoryFinalizedBeyondThisBinary(t *testing.T) {
 	}
 }
 
-// TestSetClusterGeneration_RejectsBackwardMove and
+// TestSetClusterGeneration_BackwardMoveIsIdempotentNoOp and
 // TestSetClusterGeneration_RejectsBeyondThisBinary pin
 // SetClusterGeneration's own two guardrails directly (ROLLBACK BOUNDARY
 // HONESTY and defense-in-depth against exceeding this binary's own
 // capability — see its doc comment).
-func TestSetClusterGeneration_RejectsBackwardMove(t *testing.T) {
+//
+// A request at or below the current durable generation is a silent
+// no-op, never an error (dynamic-membership plan §8.1's
+// MaxSupportedGeneration bump past 1 first made this reachable via
+// ordinary restart replay: a node that finalized 0->1 then 1->2 before
+// crashing restarts with durable ClusterGeneration already at 2, then
+// replays the committed generation-1 entry before it ever reaches the
+// generation-2 one — legitimate idempotent re-derivation of history
+// this node already durably recorded, not a new attempt to move the
+// value backward; erroring here previously stopped every such node
+// dead via Node.fail). The actual safety property — this binary's own
+// code only ever calls this with a value FSM.ApplySetClusterVersion's
+// own N/N+1-only rule already validated — is enforced upstream, not
+// here.
+func TestSetClusterGeneration_BackwardMoveIsIdempotentNoOp(t *testing.T) {
 	dir := t.TempDir()
 	w, _, err := Open(dir, Options{})
 	if err != nil {
@@ -125,11 +139,11 @@ func TestSetClusterGeneration_RejectsBackwardMove(t *testing.T) {
 	if err := w.SetClusterGeneration(1); err != nil {
 		t.Fatalf("SetClusterGeneration(1): %v", err)
 	}
-	if err := w.SetClusterGeneration(0); err == nil {
-		t.Fatal("SetClusterGeneration(0) after already at 1: expected error, got nil")
+	if err := w.SetClusterGeneration(0); err != nil {
+		t.Fatalf("SetClusterGeneration(0) after already at 1: expected a silent no-op, got error: %v", err)
 	}
 	if got := w.Metadata().ClusterGeneration; got != 1 {
-		t.Fatalf("Metadata().ClusterGeneration after rejected backward move = %d, want unchanged 1", got)
+		t.Fatalf("Metadata().ClusterGeneration after a no-op backward request = %d, want unchanged 1 (the durable value must never actually decrease)", got)
 	}
 }
 

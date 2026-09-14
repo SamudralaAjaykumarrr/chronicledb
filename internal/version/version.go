@@ -56,7 +56,16 @@ var Date = "unknown"
 // metadata — it is a Go constant, not an ldflags-overridable var, so
 // it cannot be accidentally misconfigured per-deployment the way a
 // flag could.
-const MaxSupportedGeneration uint32 = 1
+//
+// Generation 2 (dynamic-membership plan §8.1) is defined as: this
+// binary understands Entry.Type and its typed entry-payload framing
+// (§6.1a), EntryConfig entries including the Voided kind (§2.5, §7.6),
+// Message.Configuration/Message.HasConfiguration on
+// MsgInstallSnapshotRequest (§7.2), and snapshot.FormatVersion 2
+// including its HasConfiguration bit (§7.1). No membership change may
+// be proposed (§8.2's leader-side gate) or applied (§8.2's follower-
+// side gate) below this generation.
+const MaxSupportedGeneration uint32 = 2
 
 // String returns a single human-readable line combining Version,
 // Commit, and Date, suitable for a --version flag.
