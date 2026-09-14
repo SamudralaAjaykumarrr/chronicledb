@@ -982,7 +982,11 @@ func (c *Core) handleAppendEntriesResponse(msg Message) Output {
 			c.nextIndex[msg.From] = msg.MatchIndex + 1
 		}
 		c.advanceLeaderCommit(&out)
-		if c.nextIndex[msg.From] <= c.lastIndex() {
+		// advanceLeaderCommit may have just triggered a self-removal
+		// step-down (dynamic-membership plan §4.2), which nils out
+		// nextIndex/matchIndex — this node is no longer Leader and has
+		// nothing further to send.
+		if c.role == Leader && c.nextIndex[msg.From] <= c.lastIndex() {
 			out.Messages = append(out.Messages, c.appendEntriesMessage(msg.From))
 		}
 		return out
@@ -1197,7 +1201,10 @@ func (c *Core) handleInstallSnapshotResponse(msg Message) Output {
 		c.nextIndex[msg.From] = msg.MatchIndex + 1
 	}
 	c.advanceLeaderCommit(&out)
-	if c.nextIndex[msg.From] <= c.lastIndex() {
+	// See handleAppendEntriesResponse's identical guard: advanceLeaderCommit
+	// may have just triggered a self-removal step-down, nilling
+	// nextIndex/matchIndex.
+	if c.role == Leader && c.nextIndex[msg.From] <= c.lastIndex() {
 		out.Messages = append(out.Messages, c.appendEntriesMessage(msg.From))
 	}
 	return out

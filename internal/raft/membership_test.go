@@ -327,6 +327,80 @@ func TestLearnerNeverGrantsVoteAndNeverCampaigns(t *testing.T) {
 	}
 }
 
+// TestNewLearnerFirstCatchUpBatchIncludingItsOwnAddEntry regresses a
+// real bug found by real-process integration testing: a brand-new,
+// never-joined node's very first AppendEntries batch can legitimately
+// contain, among older ordinary entries, the very EntryConfig entry
+// that adds it — activateFromAppendedEntries must not treat that as a
+// structurally invalid transition merely because this receiver's own
+// prior (zero) configuration gives it no independent basis to validate
+// against.
+func TestNewLearnerFirstCatchUpBatchIncludingItsOwnAddEntry(t *testing.T) {
+	c := newBootstrapCore(t, "d", Configuration{}) // never joined: empty Bootstrap
+	newCfg := Configuration{Voters: []Member{m("a"), m("b"), m("c")}, Learners: []Member{m("d")}}
+	payload := encodeConfigChange(membershipKindAddLearner, "add-d", "d", "d:0", newCfg)
+	batch := []Entry{
+		{Index: 1, Term: 1, Type: EntryNormal, Data: []byte("x")},
+		{Index: 2, Term: 1, Type: EntryNormal, Data: []byte("y")},
+		{Index: 3, Term: 1, Type: EntryConfig, Data: payload},
+	}
+	out := c.Step(Input{Kind: InputMessage, Message: Message{
+		Type: MsgAppendEntriesRequest, From: "a", To: "d", Term: 1,
+		PrevLogIndex: 0, PrevLogTerm: 0, Entries: batch, LeaderCommit: 3,
+	}})
+	if out.PersistRequest == nil {
+		t.Fatal("expected a PersistRequest for a fresh append")
+	}
+	if !c.activeConfig.Equal(newCfg) {
+		t.Fatalf("activeConfig = %+v, want %+v", c.activeConfig, newCfg)
+	}
+	if c.activeConfigIndex != 3 {
+		t.Fatalf("activeConfigIndex = %d, want 3", c.activeConfigIndex)
+	}
+}
+
+// TestSelfRemovalDoesNotPanicOnLateArrivingResponse regresses a real
+// bug found by real-process integration testing: advanceLeaderCommit
+// can trigger an immediate self-removal step-down (nilling
+// nextIndex/matchIndex) in the middle of handleAppendEntriesResponse/
+// handleInstallSnapshotResponse, which must not then unconditionally
+// keep indexing those now-nil maps in the same call.
+func TestSelfRemovalDoesNotPanicOnLateArrivingResponse(t *testing.T) {
+	c := leaderReadyForConfigChange(t, []NodeID{"a", "b", "c"})
+	out, err := c.ProposeConfigChange(RemoveServerChange, "self-remove", "a", "")
+	if err != nil {
+		t.Fatalf("ProposeConfigChange: %v", err)
+	}
+	applyPersist(t, c, out)
+	idx := c.activeConfigIndex
+
+	// b acks first: not yet a majority of {b,c} (needs both).
+	c.Step(Input{Kind: InputMessage, Message: Message{
+		Type: MsgAppendEntriesResponse, From: "b", To: "a", Term: c.currentTerm,
+		Success: true, MatchIndex: idx,
+	}})
+	if c.role != Leader {
+		t.Fatal("must not step down before a genuine C_new majority acks")
+	}
+
+	// c's ack arrives, completing the majority and triggering step-down
+	// mid-call; this must not panic.
+	func() {
+		defer func() {
+			if r := recover(); r != nil {
+				t.Fatalf("handling the completing AppendEntriesResponse panicked: %v", r)
+			}
+		}()
+		c.Step(Input{Kind: InputMessage, Message: Message{
+			Type: MsgAppendEntriesResponse, From: "c", To: "a", Term: c.currentTerm,
+			Success: true, MatchIndex: idx,
+		}})
+	}()
+	if c.role != Follower {
+		t.Fatalf("role after self-removal commit = %v, want Follower", c.role)
+	}
+}
+
 func TestHeardFromLeaderSuppressesHigherTermRequestVote(t *testing.T) {
 	c := newBootstrapCore(t, "a", votersConfig([]NodeID{"a", "b", "c"}))
 	// Accept a leader AppendEntries at term 1: heardFromLeader becomes true.

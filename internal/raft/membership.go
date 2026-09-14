@@ -631,13 +631,33 @@ func (c *Core) initReplicationStateFor(id NodeID, prevLast Index) {
 // old lastIndex() before this batch, the newest configuration-
 // establishing entry can only be found within the batch itself (or is
 // unchanged, if none of the batch qualifies) — never requiring a full
-// backward scan. This is also where every replica's defense-in-depth
-// four-shape re-check happens (§2.6): a structurally invalid
-// EntryConfig entry, or one that fails to decode, can only mean a
+// backward scan.
+//
+// This is also where a replica's defense-in-depth four-shape re-check
+// runs (§2.6) — but only once this replica has an independent basis to
+// evaluate it against. A node whose own prior configuration is still
+// the zero value (neverJoined(), §3.1) has, by construction, no
+// locally-derivable "before" state to compare against: its own
+// Config.Bootstrap is empty (it is joining, not founding), so its
+// first-ever configuration-establishing entry legitimately arrives as
+// part of a bulk catch-up batch that also replicates everything the
+// cluster did before this node existed — a real, reachable production
+// path (a brand-new learner's very first AppendEntries batch), not a
+// corner case. Validating that entry against a zero prior would always
+// fail (no shape has zero voters on one side and a real voter set on
+// the other), which would make catching up a new learner
+// indistinguishable, from this check's point of view, from a
+// corrupted message — a false positive this check must not produce.
+// Once this node's own prior becomes real (from that same entry
+// onward), every SUBSEQUENT EntryConfig entry in this or a later batch
+// is validated normally: this node now has a genuine local basis, and
+// a structurally invalid entry at that point can only mean a
 // leader-side bug or a corrupted/adversarial message, never a state a
 // correct leader would produce, so it fails closed exactly like the
 // existing "refusing to truncate a committed entry" panic just above in
-// this file's sibling core.go.
+// this file's sibling core.go. Decode failures fail closed
+// unconditionally, in both cases — a malformed payload is never
+// legitimate regardless of this node's own prior state.
 func (c *Core) activateFromAppendedEntries(entries []Entry) {
 	prior := c.activeConfig
 	for _, e := range entries {
@@ -651,8 +671,10 @@ func (c *Core) activateFromAppendedEntries(entries []Entry) {
 		if !establishes {
 			continue // Voided: accepted unconditionally, establishes nothing (§7.6)
 		}
-		if err := classifyTransition(prior, cfg); err != nil {
-			panic(fmt.Sprintf("raft: entry %d: EntryConfig is not a valid single-server transition relative to the preceding configuration: %v", e.Index, err))
+		if !prior.IsZero() {
+			if err := classifyTransition(prior, cfg); err != nil {
+				panic(fmt.Sprintf("raft: entry %d: EntryConfig is not a valid single-server transition relative to the preceding configuration: %v", e.Index, err))
+			}
 		}
 		prior = cfg
 		c.activeConfig = cfg
