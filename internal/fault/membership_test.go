@@ -461,32 +461,44 @@ func TestDM3_PartitionedLearnerDoesNotBlockVoterCommitAndCatchesUpOnceHealed(t *
 }
 
 // TestDM4_RemovalOfIsolatedVoterCommitsWithoutItAndItRemainsHarmless
-// regresses DM-4 (§15, §4.3): removing a voter that is currently
+// regresses DM-4 (§15, §4.3, §4.4): removing a voter that is currently
 // unreachable must still commit via the remaining majority of C_new —
-// the removed voter's own acknowledgement is never required — and the
-// isolated node, once healed, remains harmless even though it still
-// believes itself a member (§4.5/DM-9's guarantee, exercised here from
-// the "still isolated at commit time" angle rather than DM-9's
-// "already excluded before it ever campaigns" angle).
+// the removed voter's own acknowledgement is never required and is
+// never solicited — and the isolated node, once healed, remains
+// harmless while still believing itself a member.
 //
-// This test deliberately does NOT assert that c, once healed, adopts
-// its own removal: §1.8 references "§4.4's drain semantics" for a
-// mechanism that would keep replicating to a departing voter until it
-// acknowledges the very entry that removes it, but §4.4's own prose
-// never actually specifies that mechanism, and the current
-// implementation's replication fan-out (dynamic-membership plan §2.2's
-// rows 4/5, `handleHeartbeatTimeout`/`appendLeaderEntry`) targets only
-// `activeConfig.Voters`/`Learners` — which already excludes a removed
-// member from the very entry that removes it. A removed voter that was
-// offline/partitioned at commit time therefore has no way, at Core
-// level, to ever learn of its removal via ordinary Raft traffic: it is
-// permanently in the "never reconnects" branch of §4.4, which the plan
-// itself documents as safe (Lemma 1 + W, §2.7's two rules) but not
-// self-healing. This is a real gap between §4.4's prose and the
-// implemented mechanism, left as-is here rather than freelanced,
-// since closing it would mean changing safety-adjacent replication
-// fan-out logic and the dial-address "drain" contract without the same
-// multi-revision review the rest of this plan received.
+// The second half of this test pins §4.4's retirement semantics
+// positively rather than working around a gap. Removal is authoritative
+// CLUSTER-side: a node is removed the instant the EntryConfig entry
+// removing it commits under a majority of C_new, and that is never
+// conditioned on the removed node observing, receiving, or
+// acknowledging the entry. A removed follower does NOT automatically
+// adopt its own removal, and there is no mechanism by which it could:
+// activeConfig is append-time-effective (§2.2), so every replication
+// fan-out site (appendLeaderEntry/handleHeartbeatTimeout/becomeLeader)
+// iterates a Voters/Learners set that already excludes the target by
+// the time the removal entry is sent. The entry that would tell it is
+// therefore addressed to C_new only (§4.1). This holds for an ONLINE
+// removed follower exactly as it does for the isolated one here; the
+// isolation in this test is about the COMMIT path (§4.3), not about
+// why c never learns.
+//
+// c consequently stays on its stale configuration, campaigns forever,
+// and is denied — by §2.7 Rule 1 at every member whose activeConfig
+// already excludes it, by Rule 2 at any member still carrying it but
+// hearing from a leader, and unconditionally by §2.3 Lemma 3 Case 2b,
+// which supersedes c's configuration by log comparison (by term, or by
+// index when terms are equal) with no filtering at all. Terminating
+// that process and wiping or archiving its data directory are operator
+// steps (docs/membership.md §7), not protocol steps.
+//
+// So: this test deliberately does NOT assert that c adopts its own
+// removal, and must not be "fixed" to. It also asserts nothing about
+// ErrNodeRemoved, which by §4.6 is unreachable for an ordinary removed
+// follower. §4.4 records a deferred, explicitly-not-v0.5.0 one-shot
+// best-effort notification that would close only the online case; if
+// that ever lands, this test's expectations for an online removed
+// follower change and this one's (isolated at commit time) do not.
 func TestDM4_RemovalOfIsolatedVoterCommitsWithoutItAndItRemainsHarmless(t *testing.T) {
 	cl := NewCluster([]raft.NodeID{"a", "b", "c"}, ClusterOptions{ElectionTimeoutTicks: 30, ElectionTimeoutJitterTicks: 5, HeartbeatTimeoutTicks: 2, Seed: 4})
 	if !cl.SettleElection(50) {
@@ -546,6 +558,43 @@ func TestDM4_RemovalOfIsolatedVoterCommitsWithoutItAndItRemainsHarmless(t *testi
 	}
 	if cl.Node(a).Core().Role() != raft.Leader {
 		t.Fatal("legitimate leader was disrupted by the removed node's stale elections")
+	}
+
+	// §4.4, pinned explicitly rather than left as an unstated assumption:
+	// c does NOT adopt its own removal. Even fully healed and exchanging
+	// traffic, it never receives the removal entry, so it still holds its
+	// stale pre-removal configuration and still sees itself as a Voter.
+	// This is the Core-level condition gating internal/node's
+	// selfRemoved()/ErrNodeRemoved (§4.6), so asserting it here is what
+	// pins "a removed follower does not report ErrNodeRemoved."
+	staleCfg := cl.Node(c).Core().ActiveConfig()
+	if staleCfg.IsZero() || !staleCfg.IsVoter(c) {
+		t.Fatalf("removed follower c adopted its own removal, which no v0.5.0 mechanism provides (§4.1/§4.4): activeConfig = %+v", staleCfg)
+	}
+	if got := cl.Node(c).Core().LastIndex(); got >= entryIdx {
+		t.Fatalf("removed follower c received log entries up to %d; the removal entry at %d must never be addressed to it (§4.1)", got, entryIdx)
+	}
+
+	// And the same after a restart from its own unwiped durable state:
+	// ConfigAt(lastIndex()) deterministically re-derives the identical
+	// stale configuration, so retirement stays a cluster-side fact that
+	// this process never learns (§4.4's "restarts from stale durable
+	// state" row, §7.5). Wiping or archiving that directory is an
+	// operator step (docs/membership.md §7), not a protocol step.
+	cl.Restart(c)
+	for i := 0; i < 15; i++ {
+		cl.AdvanceTicks(1)
+		cl.DeliverEligible()
+	}
+	restartedCfg := cl.Node(c).Core().ActiveConfig()
+	if restartedCfg.IsZero() || !restartedCfg.IsVoter(c) {
+		t.Fatalf("removed follower c lost its stale Voter status across a restart; ConfigAt(lastIndex()) must re-derive it verbatim (§4.4, §7.5): activeConfig = %+v", restartedCfg)
+	}
+	if got := cl.Node(a).Core().CurrentTerm(); got != beforeTerm {
+		t.Fatalf("legitimate leader's term changed from %d to %d after the removed node restarted on stale durable state", beforeTerm, got)
+	}
+	if cl.Node(a).Core().Role() != raft.Leader {
+		t.Fatal("legitimate leader was disrupted by the restarted removed node")
 	}
 }
 

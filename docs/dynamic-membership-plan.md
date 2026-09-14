@@ -471,11 +471,15 @@ process start. From `v0.5.0` onward:
   fixed at construction from `PeerAddrs` alone: `internal/node.Node`
   updates it live whenever the active `Configuration` changes (new
   learner added → new dial target; member removed → dial target
-  retained but no longer used, per §4.4's drain semantics — the
-  `Transport` itself does not need a "remove peer" operation for
-  `v0.5.0`; an address the current `Configuration` no longer names is
-  simply never dialed again by anything that consults `Configuration`
-  first, which every send path does).
+  **retained but no longer used**). The dial table is deliberately
+  **additive only** — `Transport.SetPeerAddr` adds or updates, and
+  there is no "remove peer" operation in `v0.5.0` and no need for one:
+  an address the current `Configuration` no longer names is simply
+  never dialed again, because every send path consults
+  `Configuration` first. Retaining the entry is a garbage-collection
+  non-decision, **not** a drain mechanism: nothing continues to
+  replicate to a removed member (§4.4), and no `v0.5.0` behavior
+  depends on that entry still being present.
 
 ---
 
@@ -1876,9 +1880,22 @@ shape 3 or 4, `MINIMUM VOTER INVARIANT` for a voter target), proposes,
 commits using the **new** (post-removal) configuration's majority
 (§2.2/§2.3 — the removed member's own `matchIndex`/vote no longer
 counts from the instant of append). Once committed, the removed
-member's `ID` no longer appears in anyone's `activeConfig`; ordinary
-replication to it simply stops (its dial-address entry is dropped from
-`internal/transport`'s active target set, §1.8).
+member's `ID` no longer appears in anyone's `activeConfig`.
+
+**Replication to the removed member stops at *append*, not at commit —
+and therefore stops *before* the entry that removes it is ever
+addressed to it.** `activeConfig` is append-time-effective (§2.2), and
+every replication fan-out site (`appendLeaderEntry`,
+`handleHeartbeatTimeout`, `becomeLeader`) iterates
+`activeConfig.Voters`/`.Learners`, which by that instant already
+exclude the target. The `AppendEntries` carrying the removal entry is
+consequently sent to `C_new` only, and the removed follower never
+receives it. This is a direct, intended consequence of the mechanism
+§2.2 chose — it is what makes §4.3 ("the removed voter's
+acknowledgement is never required") and §4.2 ("no self-exemption for a
+self-removing leader") both true — and it is stated here because
+revisions 1–5 left it implicit and then wrote prose elsewhere that
+assumed the opposite. §4.4 states the resulting semantics normatively.
 
 ### 4.2 Leader / self removal
 
@@ -2067,56 +2084,147 @@ commit count (§4.2). An unavailable
 *learner* being removed is even simpler: learners never affect any
 majority calculation regardless.
 
-### 4.4 Removal followed by restart
+### 4.4 Retirement is authoritative cluster-side; removal followed by restart
 
-The removed process, if it later restarts (having never learned of its
-own removal — e.g. it was already offline when the entry committed),
-restarts with whatever it had durably persisted before going offline.
-`ConfigAt(lastIndex())` (§6.3) over that durable state may still show
-it as a member, since it never received the removal entry. It resumes
-as a `Follower` and attempts to reconnect. The instant it reconnects to
-any current, legitimate member and receives real Raft traffic, one of
-two things happens depending on how far behind it is:
+**Revisions 1–5 of this section described a repair path that no
+mechanism in this document ever provided.** They asserted that a
+removed node, on reconnecting, would be handed its own removal entry by
+ordinary `AppendEntriesRPC` or by `MsgInstallSnapshotRequest`, and
+§1.8, §4.5, §7.5 and §13.3 each restated that premise. It is false, and
+for a reason §4.1 now states directly: replication to the removed
+member stops at *append*, so the entry that would tell it is never
+addressed to it. The repair paths below §4.1 are reachable **only** if
+the operator later re-adds the node. This section is rewritten around
+what the mechanism actually guarantees.
 
-- If the leader's retained log still spans back far enough, ordinary
-  `AppendEntriesRPC` delivers the removal entry and the node adopts the
-  new configuration excluding itself (§2.2). **This works
-  unconditionally under revision 2's §2.7**, which never filters
-  `AppendEntriesRPC` on a membership basis — under revision 1's
-  blanket filter this repair path was reachable only by accident, and
-  in the symmetric case (§2.7's DM-14 trace) not reachable at all.
-- If the leader has already compacted past the required range, a
-  `MsgInstallSnapshotRequest` (carrying the snapshot's own
-  `Meta.Configuration`, §7.2) achieves the identical outcome in one
-  step.
+#### The rule
 
-From the instant it adopts a configuration excluding itself, the node
-is `selfRemoved()` (§3.1) and:
+> A node is removed from the cluster at the instant the `EntryConfig`
+> entry removing it **commits** under a majority of `C_new`. Removal is
+> a property of the cluster's committed configuration chain, **not** of
+> the removed node's local durable state, and it is **never**
+> conditioned on the removed node observing, receiving, or
+> acknowledging that entry. A removed node whose own disk never learns
+> of its removal is nonetheless **retired**: it is not a member, it can
+> never again become one without an explicit operator re-add, and every
+> current member treats it as a non-member from the instant that member
+> adopts `C_new`. The removed node's own belief about its own
+> membership carries no authority and has no effect on the cluster.
 
-- it never campaigns again (§2.7 Rule 1's third clause);
-- it never grants a vote (§2.7 Rule 1's second clause);
-- any client still pointing at it receives `ErrNodeRemoved` (§4.6)
-  rather than silently timing out forever.
+This is the same rule §4.3 already states from the availability side
+("an unavailable voter being removed does not need to acknowledge its
+own removal at all"), stated here from the identity side. The two must
+not be allowed to drift apart again: a design that *required* the
+departing voter's acknowledgement would break "remove the node that
+died," which is the primary reason removal exists.
 
-**If it never reconnects at all** (fully, permanently partitioned): it
-may continue believing itself a Voter and periodically call elections
-forever. This is harmless to cluster **safety** by construction (§2.3:
-a permanently isolated node can never gather a majority of any live
-configuration) and is bounded in its effect on the rest of the
-cluster's **liveness** by §2.7's two rules acting together:
+#### What a removed follower actually does
 
-- Every current member whose own `activeConfig` no longer contains the
-  removed node drops its `RequestVoteRequest`s outright (Rule 1) — no
-  term bump, no disruption.
-- Every current member whose `activeConfig` *still* contains it — a
-  member that itself has not yet caught up on the removal — ignores
-  those `RequestVoteRequest`s anyway for as long as it is hearing from
-  a current leader (Rule 2, the standard Raft §4.2.3 treatment). This
-  is the case revision 1's rule could not cover at all, because such a
-  receiver has no way to know the sender was removed.
+It does **not** automatically adopt its own removal. It keeps whatever
+configuration it last durably held, in which it is still a Voter.
+Concretely, and exhaustively:
 
-Together these bound the disruption without ever filtering leader
-replication, which is what makes the repair paths above reachable.
+| Removed node's situation | What it observes | What it does |
+|---|---|---|
+| **Online and reachable throughout the removal** | Nothing. The removal entry is sent to `C_new` only (§4.1). | Keeps its stale configuration. Heartbeats stop arriving, its election timer fires, it campaigns — indefinitely. Answers client requests as an ordinary follower (`NotLeaderError`), **not** `ErrNodeRemoved`. |
+| **Offline or partitioned at commit time** | Nothing, for the same reason plus unreachability. | Identical to the row above once it comes back. |
+| **Restarts from stale durable state** | `ConfigAt(lastIndex())` (§6.3) over its own log/snapshot/bootstrap seed returns the pre-removal configuration, in which it is a Voter. | Resumes as a `Follower` with stale membership, times out, campaigns. Deterministic and identical across restarts — this is *not* an ambiguous recovery state (§7.5), it is a correct reconstruction of a stale input. |
+| **Received the removal entry** (self-removing leader, §4.2; a re-added-then-removed node; or the incidental response path noted below) | `activeConfig` excludes its own `ID`. | `selfRemoved()` (§3.1) — never campaigns, never grants a vote, answers `ErrNodeRemoved` (§4.6). Survives restart, because `ConfigAt(lastIndex())` re-derives the same conclusion from the same durable entry. |
+| **Re-added by the operator** | The leader's `activeConfig` contains it again, so ordinary replication resumes and log repair delivers everything it missed. | Converges normally, transiting `selfRemoved()` on the way if the removal entry is in the repaired range. This is the **only** path by which a removed follower ever learns of its removal. |
+
+One incidental, non-guaranteed exception, recorded so it is not
+mistaken for a mechanism: `handleAppendEntriesResponse` /
+`handleInstallSnapshotResponse` reply to `msg.From` without consulting
+membership, so a response that was already *in flight* when the removal
+was appended can draw a reply carrying the removal entry. This is an
+accident of the reactive path, it does not occur in the deterministic
+harness, and **nothing may be built on it**. Removing that accident (by
+guarding those reply sites on `activeConfig.IsMember(msg.From)`) would
+be a correct tightening; keeping it is also correct. Either way it is
+not a notification mechanism.
+
+#### Why a stale removed node never regains authority
+
+Three independent layers, all already implemented, in dependency order
+— the first alone is sufficient, and the other two are liveness:
+
+1. **Safety, unconditional (§2.3 Lemma 3, Case 2b).** A stale node
+   holding `C_a` necessarily **lacks** the removal entry at `(k, t)` —
+   holding it would have made `C_{a+1}` its `activeConfig`. `C_{a+1}`
+   is committed, so a majority `M` of `C_{a+1}` durably holds `(k, t)`;
+   `C_a` and `C_{a+1}` are adjacent, so by Lemma 1 **every** majority
+   of `C_a` meets `M`. `isLogUpToDate` therefore denies the stale
+   candidate every such vote — **by term** when its last-log term is
+   lower, and **by index** when the terms are equal, since it lacks
+   `(k, t)` and logs are gap-free. `C_a` is superseded: no majority of
+   it will ever be assembled again. **This holds with message
+   filtering removed entirely.**
+2. **Liveness — `MEMBERSHIP-SCOPED VOTE ACCEPTANCE` (§2.7 Rule 1).**
+   Every current member whose own `activeConfig` no longer contains the
+   removed node drops its `RequestVoteRequest`s outright, **before any
+   term or log state is touched** — no term bump, no vote decision, no
+   reply.
+3. **Liveness — leader-contact suppression (§2.7 Rule 2).** Every
+   member currently hearing from a legitimate leader ignores those
+   requests regardless, including higher-term ones. This is the only
+   rule that covers a receiver whose own `activeConfig` *still*
+   contains the removed node, which Rule 1 cannot help with.
+
+**The residual, stated honestly rather than implied away.** A member
+that is *simultaneously* behind on membership **and** out of leader
+contact — e.g. mid-election after a leader crash — escapes both Rule 1
+and Rule 2 and may grant the stale node a vote and bump its own term.
+It cannot make the stale node a leader (layer 1 is unconditional), but
+it can cost the cluster one election round. This is exactly the
+residual disruption plain Raft has, it is bounded and liveness-only,
+and revisions 1–5 wrote it out of existence by presenting Rules 1 and 2
+as jointly exhaustive. They are not, and no drain mechanism would
+change this: the escaping node is a *current member* that is behind,
+not the removed node.
+
+#### Operational consequence
+
+A retired process does not shut itself down, does not report itself
+retired, and does not stop campaigning. Terminating it, and wiping or
+archiving its data directory, are **operator** steps, because the
+cluster has no mechanism — and needs none — to perform them. See
+`docs/membership.md` §7. The data directory in particular must be wiped
+or archived before the node is reused operationally in any form: its
+durable log still asserts the pre-removal configuration and will be
+re-adopted verbatim by `ConfigAt(lastIndex())` on any restart.
+
+#### Deferred, explicitly not `v0.5.0`: best-effort removal notification
+
+The one case the rule above leaves operationally rough is a removed
+follower that is **online and healthy** at removal: it could cheaply be
+told, and is not. A future phase may close exactly that case with a
+**one-shot best-effort notification** — the leader emits a single
+additional `appendEntriesMessage(T)` alongside the `C_new` fan-out when
+it appends `Remove(T)`, built from `T`'s *pre-append* replication
+state. Bounds that any such mechanism must satisfy, recorded now so the
+option is not re-litigated as a design question later:
+
+- **best-effort only** — one message, no retry, no timer, no
+  acknowledgement tracking;
+- **never counted for quorum** — structurally impossible, since
+  `advanceLeaderCommit` and `checkPendingReads` iterate
+  `activeConfig.Voters`, which excludes `T`; `T`'s residual
+  `matchIndex`/`nextIndex` map entries are unread data;
+- **never required for safety or progress** — §2.3's proof must remain
+  valid with the mechanism deleted;
+- **no durable `DRAINING`/`RETIRING` state**, and no per-peer lifetime,
+  termination condition, or leader-change handoff;
+- **no replication-state-machine extension** — no new role, no new
+  `Input` kind, no new `Core` field;
+- **failure to deliver does not invalidate the removal**, does not
+  delay its commit, and imposes no obligation on any successor leader;
+- it must **not** send a snapshot: if `nextIndex[T] <= snapshotIndex`,
+  the notification is skipped entirely rather than escalated.
+
+`v0.5.0` does **not** implement this (§20). Until it does, §4.6's
+`ErrNodeRemoved` is reachable for a self-removing leader and for a
+re-added-then-removed node, and **not** for an ordinary removed
+follower.
 
 ### 4.5 Stale removed node sending old Raft traffic (full treatment)
 
@@ -2130,25 +2238,59 @@ revision 1's:
 - **Liveness**: a removed node's indefinitely-retried elections cannot
   force repeated re-elections among current members, because every
   current member either drops its votes on a membership basis (Rule 1)
-  or ignores them on a leader-contact basis (Rule 2).
-- **Non-interference with repair**: a removed, stale, or
-  behind-on-membership node is *always* reachable by a legitimate
-  leader's `AppendEntriesRPC`/`MsgInstallSnapshotRequest`, because
-  those are never filtered. This is a property revision 1 lacked and
-  §2.7's DM-14 trace demonstrates the cost of lacking it.
+  or ignores them on a leader-contact basis (Rule 2) — **except** a
+  member that is simultaneously behind on membership *and* out of
+  leader contact, which escapes both and may grant one vote and bump
+  its own term. That residual is bounded, is liveness-only, cannot
+  elect the removed node (§4.4's layer 1), and is stated rather than
+  implied away; see §4.4.
+- **Non-interference with repair**: a **behind-on-membership current
+  member** is always reachable by a legitimate leader's
+  `AppendEntriesRPC`/`MsgInstallSnapshotRequest`, because those are
+  never filtered. This is a property revision 1 lacked and §2.7's
+  DM-14 trace demonstrates the cost of lacking it. It does **not**
+  extend to a *removed* node: the cluster stops replicating to a
+  removed member at append time (§4.1), so §2.7's non-filtering
+  guarantees that such a node *would* be reachable if anyone sent to
+  it, and nobody does (§4.4). The asymmetry is deliberate and is
+  exactly what makes §4.4's rule sound — the cluster only stops
+  replicating to nodes it already considers removed, and for those its
+  own view is authoritative.
 
 
 ### 4.6 Client-visible behavior against a removed node
 
 A client (or a stray internal caller) that continues to send
 `/propose`/`/outcome`/SQL requests to a process whose own node has
-observed its own removal receives a new, distinct error —
+**observed** its own removal receives a new, distinct error —
 `ErrNodeRemoved` — rather than the existing `NotLeaderError` (which
 implies "ask someone else who might currently be leader," a category
 error for a node that is not even a cluster member anymore and never
 will be again without an explicit operator re-add). This is a small,
 explicit addition to `internal/node.Node`'s existing propose-rejection
 paths.
+
+**"Observed" is the whole of the condition, and it is narrower than
+revisions 1–5 implied.** `selfRemoved()` is `activeConfig` excluding
+this node's own `ID`, and by §4.4 a removed *follower* never reaches
+that state on its own. `ErrNodeRemoved` is therefore reachable for:
+
+- a **self-removing leader** (§4.2 — it adopts `C_new` at append time
+  and steps down at commit);
+- a node **re-added and then removed again**, or otherwise repaired
+  into a configuration that excludes it;
+- a **restored** node whose staged state excludes its own `ID` — the
+  failure mode `RESTORE MEMBERSHIP ISOLATION` (§7.6, §17) exists to
+  prevent;
+- a node reached by the incidental in-flight-response path (§4.4),
+  which is not a mechanism and must not be relied upon.
+
+It is **not** reachable for an ordinary removed follower, which
+continues to answer `NotLeaderError` until an operator stops it. Any
+document, runbook, or test that promises otherwise is wrong; see
+`docs/membership.md` §7 for the corrected operator procedure. This
+scoping is what §4.4's deferred best-effort notification would change,
+and nothing else.
 
 ### 4.7 Quorum changes during removal
 
@@ -2894,10 +3036,22 @@ over its own durable log/snapshot/bootstrap seed, deterministically,
 with the identical priority order used by every other call site. If
 that happens to be genuinely behind the *cluster's* current
 configuration (this node missed changes while it was down), that is not
-staleness in the node's own recovery — it is ordinary catch-up,
-resolved the moment it reconnects (§4.4), identical in kind to any node
-that missed ordinary committed writes while offline, and reachable
-because §2.7 never filters the leader replication that performs it.
+staleness in the node's own recovery — it is a correct reconstruction
+of a stale input, deterministic and identical across restarts.
+
+Whether it is ever *repaired* depends on whether the cluster still
+considers this node a member, and the two cases are not symmetric:
+
+- **Still a member** (it merely missed changes): ordinary catch-up,
+  resolved the moment it reconnects, identical in kind to any node that
+  missed ordinary committed writes while offline, and reachable because
+  §2.7 never filters the leader replication that performs it.
+- **Removed** (§4.4): never repaired, because nobody replicates to it
+  — replication stopped at the instant its removal was *appended*
+  (§4.1). It restarts with stale membership, campaigns, and is denied
+  by §4.4's three layers. This is retirement, not staleness, and it is
+  resolved by the operator (`docs/membership.md` §7), not by the
+  protocol.
 
 ### 7.6 Backup and restore: state restoration and membership bootstrap are separate concerns
 
@@ -3713,13 +3867,19 @@ by this phase — both already exist and simply continue to apply:
    one). §2.7 is what makes this *optional for safety* (the cluster is
    already safe against a removed node's Raft traffic without it) but
    still *recommended for defense in depth and to reduce useless
-   background connection attempts*. Revision 2 additionally notes that
-   §2.7 deliberately does **not** filter `AppendEntriesRPC`/
-   `MsgInstallSnapshotRequest` on a membership basis, so a removed node
-   that reconnects is always reachable by a legitimate leader and can
-   always be told about its own removal (§4.4) — filtering that traffic
-   would have made the removed node *harder* to decommission cleanly,
-   not easier.
+   background connection attempts*. §2.7 deliberately does **not**
+   filter `AppendEntriesRPC`/`MsgInstallSnapshotRequest` on a
+   membership basis, which is what keeps a **behind-on-membership
+   current member** repairable by a legitimate leader (§2.7's DM-14
+   trace is the cost of lacking that). Revisions 2–5 additionally
+   claimed this meant a *removed* node "can always be told about its
+   own removal"; that claim is **withdrawn** — replication to a removed
+   member stops at append (§4.1), so nothing is sent to it to be
+   filtered in the first place. Retirement is authoritative
+   cluster-side and does not depend on the removed node being told
+   (§4.4); certificate revocation and stopping the process remain the
+   operator steps that make decommissioning clean
+   (`docs/membership.md` §7).
 
 ### 13.4 Audit completeness
 
@@ -3825,9 +3985,17 @@ not survive.**
   effect on voter-side commit progress (`LEARNER NON-INTERFERENCE`);
   assert the learner catches up fully once healed.
 - **DM-4 Partition isolating a voter being removed, before the removal commits**
-  — assert the removal still commits via the remaining majority-of-`C_new`
-  (§4.3); assert the isolated node, once healed, correctly observes and
-  adopts its own removal (§4.4).
+  — assert the removal still commits via the remaining
+  majority-of-`C_new` (§4.3): the removed voter's own acknowledgement
+  is never required and is never solicited. Then assert §4.4's
+  retirement semantics positively, **not** a repair that does not
+  exist: once healed, the isolated node still holds its stale
+  pre-removal configuration, still believes itself a Voter,
+  campaigns — and is denied, with **zero term bumps and zero
+  leadership disruption** on the live cluster (§4.4's layers 1 and 2).
+  The scenario must **not** assert that the node adopts its own
+  removal; revisions 1–5 required exactly that, and it is unreachable
+  by construction (§4.1).
 - **DM-5 Election during an in-flight (uncommitted) config change** —
   randomized elections interleaved with a pending `AddLearner`/
   `RemoveServer`; assert `LEADER COMPLETENESS` extended to config
@@ -4226,7 +4394,21 @@ suite (`docs/testing-strategy.md` §4/§6.3) with
   second configuration entry stacked on an inherited one. This is
   DM-12's real-process counterpart.
 - **Remove one of the original three voters** (not the new one) via a
-  real admin call against the new leader.
+  real admin call against the new leader. This step is also §4.4's
+  real-process proof, and its assertions are deliberately the opposite
+  of what revisions 1–5 implied. With the removed process **left
+  running and fully reachable**, assert: it never receives the removal
+  entry (its `LastIndex()` stays below the leader's); its
+  `/admin/membership/status` still reports the **stale** pre-removal
+  configuration; a client request against it returns `NotLeaderError`
+  and **not** `ErrNodeRemoved`; and the live cluster's term and
+  leadership are undisturbed throughout. Then **kill it and restart it
+  against its own unwiped data directory** and assert the identical
+  state — stale configuration, campaigning, denied, still not
+  `ErrNodeRemoved` — which is §4.4's "restarts from stale durable
+  state" row end to end. If §4.4's deferred best-effort notification is
+  ever implemented, the two `ErrNodeRemoved` assertions in this step
+  invert (and only those two); until then they pin the real behavior.
 - **Have the leader remove itself**, with the background SQL reader
   still running (§4.2, §4.2a). This step runs against a **healthy**
   cluster — every remaining voter reachable — which is precisely
@@ -4556,6 +4738,14 @@ filtering at all.
 Revision 1 classified this as safety and extended it to all message
 classes, which broke legitimate transition traffic and could strand a
 member awaiting log repair (§23/C3, §2.7's DM-14 trace).
+**Complement (revision 6)**: no invariant in this document requires a
+removed node to receive, observe, or acknowledge its own removal.
+Retirement is a property of the cluster's committed configuration chain
+(§4.4), never of the removed node's local durable state; a stale
+removed node that campaigns forever violates nothing. The residual that
+neither rule covers — a member simultaneously behind on membership and
+out of leader contact, which may grant one vote and bump its term — is
+bounded, liveness-only, and cannot elect the removed node (§4.4, §4.5).
 **Mechanism ownership (§23/F6)**: Rule 1 is pure `Core` state. Rule 2
 is `Core`'s single `heardFromLeader` boolean (§2.2), set when a
 leader's `AppendEntries`/`InstallSnapshot` is accepted in the current
@@ -4685,7 +4875,7 @@ new one, which is the §23/F2 defect.
 | Restored application state remains exact (§7.6) | ✓ (`BACKUP INTEGRITY`/`BACKUP CONSISTENCY` regression, unchanged assertions) | — | — | — | §16 | — |
 | ReadIndex / linearizable reads across a configuration change (§4.2a) | ✓ (`checkPendingReads` against a changed voter set; newly promoted voter with `ackSeq == 0`; **self-removing leader's own self-ack not counted** — assert a 3→2 self-removal with one remaining acker does *not* resolve **and that no step-down and no `ErrLeadershipLost` follow, because the entry cannot commit either**, §4.2a's third row; one configuration read per pass) | **DM-17** (all three sub-cases; sub-case 3 in its **two phases plus the positive phase**, one per row of §4.2a's table, §23/G2; plus interleaved failover) | — | — | **§16's background SQL reader**, incl. the leader self-removal step (healthy-cluster rows 1–2 only, by construction) | `-race` |
 | Leader self-removal (§4.2, corrected match-index boundary) | ✓ (propose self-removal, assert the leader's own `matchIndex` is **not** counted; assert commit requires a true `C_new` majority) | DM-2 (incl. the lost-remaining-voter variant), DM-14 | — | — | §16 | — |
-| Stale removed node rejoin attempt (§4.4, §4.5) | ✓ | DM-9, DM-14 | — | — | ✓ (kill + restart-with-old-data-dir a removed node) | — |
+| Stale removed node rejoin attempt / cluster-side retirement (§4.4, §4.5) | ✓ | DM-4, DM-9, DM-14 | — | — | ✓ (kill + restart-with-old-data-dir a removed node; assert it comes back with its **stale** configuration, campaigns, is denied, and does **not** report `ErrNodeRemoved`) | — |
 | Uncommitted-promote learner campaigns (§2.3's "surprising but correct") | ✓ | **DM-15** | — | — | — | — |
 | `ROLLBACK BOUNDARY HONESTY` (extended to generation 2 / snapshot v2 / entry-payload sentinel) | ✓ (byte-identical-at-generation-1 output for WAL payloads **and** snapshots) | — | — | — | §16's mixed-binary variant | — |
 | Even-voter-count warning (§12.1) | ✓ (response field assertion) | — | — | — | — | — |
@@ -4853,6 +5043,17 @@ design:
   HTTP, exactly like every existing admin endpoint).
 - **In-place address mutation for an existing member** — §1.6;
   requires remove + re-add.
+- **Drain / `DRAINING` / `RETIRING` replication state for a departing
+  member** — §4.4. Continued replication to a removed peer until it
+  acknowledges its own removal is **not** implemented and **not**
+  required: §2.3's proof never invokes it, §4.3 depends on its absence
+  ("remove the node that died" must work), and it could not help the
+  offline case at all. Retirement is authoritative cluster-side
+  (§4.4). Revisions 1–5 of §1.8 referenced "§4.4's drain semantics" for
+  a mechanism §4.4 never specified and no code ever implemented; that
+  reference is deleted. The bounded, deferred alternative — a one-shot
+  best-effort notification that closes only the *online* case — is
+  specified in §4.4 and is likewise not `v0.5.0`.
 - **A permanent removed-`ID` tombstone/ledger** — §1.5; mTLS identity
   binding plus §2.7's two rules are the accepted defenses instead
   (and, per §4.5, the property they provide is bounded disruption —
