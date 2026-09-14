@@ -84,6 +84,32 @@ func NewCluster(peers []raft.NodeID, opts ClusterOptions) *Cluster {
 // Node returns the Node for id, or nil if id is not a cluster member.
 func (cl *Cluster) Node(id raft.NodeID) *Node { return cl.nodes[id] }
 
+// AddNode constructs a brand-new node with an empty Config.Bootstrap
+// (dynamic-membership plan §3.1: "does a not-yet-added learner process
+// run a Core at all?" — yes, from an empty, inert zero-value
+// activeConfig) and wires it into this Cluster's existing Transport, so
+// it can receive AppendEntriesRPC/InstallSnapshot immediately once some
+// existing member proposes a membership-change entry naming it. This
+// call alone does not add id to anyone's Configuration — a test still
+// needs ProposeConfigChange(existingLeader, raft.AddLearnerChange, ...,
+// id, addr) against an existing member for id to actually join.
+func (cl *Cluster) AddNode(id raft.NodeID) *Node {
+	base := cl.nodes[cl.order[0]].cfg
+	cfg := raft.Config{
+		ID:                         id,
+		Bootstrap:                  raft.Configuration{},
+		ElectionTimeoutTicks:       base.ElectionTimeoutTicks,
+		ElectionTimeoutJitterTicks: base.ElectionTimeoutJitterTicks,
+		HeartbeatTimeoutTicks:      base.HeartbeatTimeoutTicks,
+		Rand:                       cl.rnd,
+	}
+	n := newNode(cfg)
+	cl.nodes[id] = n
+	cl.order = append(cl.order, id)
+	sort.Slice(cl.order, func(i, j int) bool { return cl.order[i] < cl.order[j] })
+	return n
+}
+
 // NodeIDs returns every cluster member, in a stable (sorted) order.
 func (cl *Cluster) NodeIDs() []raft.NodeID { return append([]raft.NodeID(nil), cl.order...) }
 
