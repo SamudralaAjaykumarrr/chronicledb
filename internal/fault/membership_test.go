@@ -458,6 +458,185 @@ func TestDM5_ElectionDuringInFlightConfigChange(t *testing.T) {
 	})
 }
 
+// TestDM7_CrashRestartAtEveryReconfigurationBoundary regresses DM-7
+// (§15, §5): one subtest per row of §5's boundary table that is not
+// already covered by a dedicated scenario elsewhere — "before
+// configuration proposal" and "after commit, before apply" here;
+// "after proposal, before commit" is DM-1, "candidate election during
+// change" is DM-5, "leader elected with an inherited uncommitted
+// EntryConfig" is DM-12, and the two snapshot rows are DM-13.
+func TestDM7_CrashRestartAtEveryReconfigurationBoundary(t *testing.T) {
+	t.Run("before configuration proposal: as if the admin call never happened", func(t *testing.T) {
+		cl := NewCluster([]raft.NodeID{"a", "b", "c"}, ClusterOptions{ElectionTimeoutTicks: 10, ElectionTimeoutJitterTicks: 5, HeartbeatTimeoutTicks: 2, Seed: 71})
+		if !cl.SettleElection(50) {
+			t.Fatal("no leader emerged")
+		}
+		a := cl.Leaders()[0]
+		commitNoOpAndSettle(cl, a, []byte("x")) // P1
+		preLen := cl.Node(a).Core().LastIndex()
+
+		// Leader crashes before Core.ProposeConfigChange is ever called —
+		// modeled directly by simply never calling it and crashing
+		// instead: nothing was attempted, so nothing needs undoing.
+		cl.Crash(a)
+		others := otherThree(cl, a)
+		newLeader := settleAmong(cl, others, 100)
+		if newLeader == "" {
+			t.Fatal("remaining voters never elected a leader among themselves")
+		}
+		if got := cl.Node(newLeader).Core().LastIndex(); got < preLen {
+			t.Fatalf("new leader's log regressed: LastIndex %d, want >= %d", got, preLen)
+		}
+		// The operator's RequestID was never used; a fresh attempt
+		// against the new leader must be accepted as a genuinely first
+		// attempt (no idempotency-table row could possibly exist for
+		// it — internal/fault has no FSM, so the only observable proxy
+		// here is that ProposeConfigChange itself succeeds normally).
+		commitNoOpAndSettle(cl, newLeader, []byte("noop"))
+		if err := cl.ProposeConfigChange(newLeader, raft.AddLearnerChange, "never-attempted", "d", "d:0"); err != nil {
+			t.Fatalf("ProposeConfigChange for a request that was never even attempted against the crashed leader: %v", err)
+		}
+	})
+
+	t.Run("after commit, before apply: committed entry survives and is applied deterministically on the new leader", func(t *testing.T) {
+		cl := NewCluster([]raft.NodeID{"a", "b", "c"}, ClusterOptions{ElectionTimeoutTicks: 10, ElectionTimeoutJitterTicks: 5, HeartbeatTimeoutTicks: 2, Seed: 72})
+		if !cl.SettleElection(50) {
+			t.Fatal("no leader emerged")
+		}
+		a := cl.Leaders()[0]
+		commitNoOpAndSettle(cl, a, []byte("x")) // P1
+
+		if err := cl.ProposeConfigChange(a, raft.AddLearnerChange, "add-d", "d", "d:0"); err != nil {
+			t.Fatalf("ProposeConfigChange: %v", err)
+		}
+		entryIdx := cl.Node(a).Core().LastIndex()
+		cl.DeliverEligible()
+		cl.DeliverEligible()
+		if got := cl.Node(a).Core().CommitIndex(); got < entryIdx {
+			t.Fatalf("test setup: entry did not commit before the crash: commitIndex %d, want >= %d", got, entryIdx)
+		}
+
+		// Crash the (by construction, LEADER COMPLETENESS-eligible)
+		// leader immediately after commit — before internal/fault's
+		// equivalent of applyCommitted (there is none; the analogue
+		// here is simply that this Core instance is discarded) ever
+		// "observes" it locally again.
+		cl.Crash(a)
+		others := otherThree(cl, a)
+		newLeader := settleAmong(cl, others, 100)
+		if newLeader == "" {
+			t.Fatal("remaining voters never elected a leader among themselves")
+		}
+		// LEADER COMPLETENESS: the new leader's log necessarily contains
+		// the committed entry, and it is applied deterministically —
+		// i.e. produces the identical resulting configuration every
+		// time, regardless of which surviving node became leader.
+		if got := cl.Node(newLeader).Core().LastIndex(); got < entryIdx {
+			t.Fatalf("new leader's log lost a committed entry: LastIndex %d, want >= %d", got, entryIdx)
+		}
+		if !cl.Node(newLeader).Core().ActiveConfig().IsMember("d") {
+			t.Fatal("new leader did not deterministically reconstruct the committed AddLearner entry's configuration")
+		}
+
+		// Restart the crashed original leader too: its own durable state
+		// (the entry was persisted locally before it was ever
+		// acknowledged, ordinary write-ahead discipline) reconstructs
+		// the identical configuration on recovery.
+		cl.Restart(a)
+		if cfg := cl.Node(a).Core().ActiveConfig(); !cfg.IsMember("d") {
+			t.Fatal("restarted original leader did not durably retain the committed AddLearner entry")
+		}
+	})
+}
+
+// TestDM13_SnapshotBoundaryCapturesConfigAtNotActiveConfig regresses
+// DM-13 (§15, §23/C1's "T2 counterexample"): a snapshot boundary must
+// capture ConfigAt(N) — the configuration effective strictly at the
+// boundary — never activeConfig, which can reflect an uncommitted
+// EntryConfig entry above the boundary that may yet be truncated away.
+func TestDM13_SnapshotBoundaryCapturesConfigAtNotActiveConfig(t *testing.T) {
+	cl := NewCluster([]raft.NodeID{"a", "b", "c"}, ClusterOptions{ElectionTimeoutTicks: 10, ElectionTimeoutJitterTicks: 5, HeartbeatTimeoutTicks: 2, Seed: 13})
+	if !cl.SettleElection(50) {
+		t.Fatal("no leader emerged")
+	}
+	a := cl.Leaders()[0]
+	for i := 0; i < 4; i++ {
+		commitNoOpAndSettle(cl, a, []byte("x"))
+	}
+	n := cl.Node(a).Core().LastIndex() // N: appliedIndex == commitIndex == N here
+	configAtN := cl.Node(a).Core().ActiveConfig()
+	if configAtN.IsMember("d") {
+		t.Fatal("test setup: d must not be a member yet")
+	}
+
+	// Propose an EntryConfig at N+1; deliver it to nobody at all.
+	if err := cl.ProposeConfigChange(a, raft.AddLearnerChange, "add-d", "d", "d:0"); err != nil {
+		t.Fatalf("ProposeConfigChange: %v", err)
+	}
+	if got := cl.Node(a).Core().LastIndex(); got != n+1 {
+		t.Fatalf("test setup: entry not appended at N+1: got %d, want %d", got, n+1)
+	}
+	if !cl.Node(a).Core().ActiveConfig().IsMember("d") {
+		t.Fatal("test setup: append-time-effective activation did not fire")
+	}
+
+	// Trigger compaction at N (never at N+1: the pending entry is not
+	// yet applied, and Compact refuses uptoIndex > appliedIndex).
+	if !cl.Compact(a, n) {
+		t.Fatal("Compact(N) refused")
+	}
+
+	// ConfigAt(snapshotIndex) must equal ConfigAt(N) as captured before
+	// the pending entry — the boundary-agreement invariant (§6.3) — and
+	// must explicitly differ from activeConfig, which still reflects
+	// the pending, uncommitted d.
+	if got, _ := cl.Node(a).Core().ConfigAt(n); !got.Equal(configAtN) {
+		t.Fatalf("ConfigAt(snapshotIndex) after Compact = %+v, want %+v (the pre-pending-entry configuration)", got, configAtN)
+	}
+	if !cl.Node(a).Core().ActiveConfig().IsMember("d") {
+		t.Fatal("Compact must not have altered activeConfig, which must still reflect the pending entry")
+	}
+
+	// Truncate N+1 away: isolate a, let b/c elect a new leader among
+	// themselves (neither has the pending entry), and have that leader
+	// commit different content at N+1.
+	cl.IsolateNode(a)
+	others := otherThree(cl, a)
+	newLeader := settleAmong(cl, others, 200)
+	if newLeader == "" {
+		t.Fatal("remaining voters never elected a leader among themselves")
+	}
+	commitNoOpAndSettle(cl, newLeader, []byte("conflicting"))
+	if got := cl.Node(newLeader).Core().LastIndex(); got < n+1 {
+		t.Fatalf("test setup: new leader did not commit a conflicting entry at N+1: LastIndex %d", got)
+	}
+
+	// Heal: a must truncate its divergent tail and revert activeConfig
+	// to ConfigAt(N) via the ordinary divergent-suffix repair path —
+	// not a no-op, precisely because snapshotConfig was never
+	// (incorrectly) set to the pending activeConfig.
+	cl.HealAll()
+	for i := 0; i < 40; i++ {
+		cl.AdvanceTicks(1)
+		cl.DeliverEligible()
+	}
+	revertedCfg := cl.Node(a).Core().ActiveConfig()
+	if revertedCfg.IsMember("d") {
+		t.Fatal("a's activeConfig still includes the truncated-away pending AddLearner entry after divergent-suffix repair")
+	}
+	if !revertedCfg.Equal(configAtN) {
+		t.Fatalf("a's reverted activeConfig = %+v, want %+v", revertedCfg, configAtN)
+	}
+
+	// Restart from durable state alone: byte-identical to the reverted
+	// state.
+	cl.Crash(a)
+	cl.Restart(a)
+	if got := cl.Node(a).Core().ActiveConfig(); !got.Equal(revertedCfg) {
+		t.Fatalf("restarted node's activeConfig = %+v, want byte-identical %+v", got, revertedCfg)
+	}
+}
+
 func otherThree(cl *Cluster, exclude raft.NodeID) []raft.NodeID {
 	var out []raft.NodeID
 	for _, id := range cl.NodeIDs() {
