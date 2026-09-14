@@ -34,7 +34,7 @@ const fsmStateVersion uint8 = 1
 func (f *FSM) EncodeState() []byte {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	return encodeState(f.store, f.outcomes, f.clusterGeneration, f.controlOutcomes)
+	return encodeState(f.store, f.outcomes, f.clusterGeneration, f.controlOutcomes, f.membershipOutcomes)
 }
 
 // encodeState serializes store/outcomes/clusterGeneration/controlOutcomes.
@@ -69,7 +69,7 @@ func (f *FSM) EncodeState() []byte {
 // StatusCommitted outcome — and that case is exactly when
 // clusterGeneration is already nonzero (the commit that recorded the
 // outcome is the same Apply call that advanced clusterGeneration).
-func encodeState(store *mvcc.Store, outcomes map[RequestID]outcomeEntry, clusterGeneration uint32, controlOutcomes map[RequestID]Outcome) []byte {
+func encodeState(store *mvcc.Store, outcomes map[RequestID]outcomeEntry, clusterGeneration uint32, controlOutcomes map[RequestID]Outcome, membershipOutcomes map[RequestID]membershipOutcomeEntry) []byte {
 	chains := store.Export() // already sorted by key
 
 	ids := make([]RequestID, 0, len(outcomes))
@@ -85,6 +85,23 @@ func encodeState(store *mvcc.Store, outcomes map[RequestID]outcomeEntry, cluster
 			controlIDs = append(controlIDs, id)
 		}
 		sort.Slice(controlIDs, func(i, j int) bool { return controlIDs[i] < controlIDs[j] })
+	}
+
+	// The membership-outcomes block is gated on clusterGeneration >= 2,
+	// not > 0 (dynamic-membership plan §8.2/§8.1): generation 1 is the
+	// pre-v0.5.0-finalization state, whose FSM state must stay
+	// byte-identical to what v0.4.0 itself would produce at that same
+	// generation (ROLLBACK BOUNDARY HONESTY) — no EntryConfig entry can
+	// exist anywhere before generation 2, so no membership outcome can
+	// exist either, and the condition matches that fact structurally
+	// rather than by coincidence.
+	var membershipIDs []RequestID
+	if clusterGeneration >= 2 {
+		membershipIDs = make([]RequestID, 0, len(membershipOutcomes))
+		for id := range membershipOutcomes {
+			membershipIDs = append(membershipIDs, id)
+		}
+		sort.Slice(membershipIDs, func(i, j int) bool { return membershipIDs[i] < membershipIDs[j] })
 	}
 
 	size := 1 + 4 // version + numChains
@@ -112,6 +129,14 @@ func encodeState(store *mvcc.Store, outcomes map[RequestID]outcomeEntry, cluster
 			size += 4 + len(id) // requestIDLen + requestID
 			size += 1           // status
 			size += 8           // CommitSeq (always present, 0 when meaningless)
+		}
+		if clusterGeneration >= 2 {
+			size += 4 // numMembershipOutcomes
+			for _, id := range membershipIDs {
+				size += 4 + len(id) + len(fingerprint{})
+				size += 1 // status
+				size += 8 // CommitSeq
+			}
 		}
 	}
 
@@ -175,6 +200,21 @@ func encodeState(store *mvcc.Store, outcomes map[RequestID]outcomeEntry, cluster
 			off++
 			binary.BigEndian.PutUint64(buf[off:], outcome.CommitSeq)
 			off += 8
+		}
+		if clusterGeneration >= 2 {
+			binary.BigEndian.PutUint32(buf[off:], uint32(len(membershipIDs)))
+			off += 4
+			for _, id := range membershipIDs {
+				e := membershipOutcomes[id]
+				binary.BigEndian.PutUint32(buf[off:], uint32(len(id)))
+				off += 4
+				off += copy(buf[off:], id)
+				off += copy(buf[off:], e.fingerprint[:])
+				buf[off] = byte(e.outcome.Status)
+				off++
+				binary.BigEndian.PutUint64(buf[off:], e.outcome.CommitSeq)
+				off += 8
+			}
 		}
 	}
 	return buf[:off]
@@ -337,6 +377,7 @@ func DecodeState(data []byte) (*FSM, uint64, error) {
 	// trailing-block case here, deliberately, the same way this one was
 	// added; it would never silently fall through to "corrupt").
 	controlOutcomes := make(map[RequestID]Outcome)
+	membershipOutcomes := make(map[RequestID]membershipOutcomeEntry)
 	var clusterGeneration uint32
 	if len(data)-off > 0 {
 		if len(data)-off < 8 {
@@ -375,15 +416,56 @@ func DecodeState(data []byte) (*FSM, uint64, error) {
 			}
 			controlOutcomes[id] = outcome
 		}
+		if clusterGeneration >= 2 {
+			if len(data)-off < 4 {
+				return nil, 0, fmt.Errorf("%w: truncated membership-outcome count", ErrMalformedCommand)
+			}
+			numMembershipOutcomes := binary.BigEndian.Uint32(data[off:])
+			off += 4
+			const fingerprintSize = 32
+			const minMembershipOutcomeSize = 4 + fingerprintSize + 1 + 8
+			if remaining := len(data) - off; numMembershipOutcomes > uint32(remaining/minMembershipOutcomeSize) {
+				return nil, 0, fmt.Errorf("%w: declares %d membership outcomes but only %d bytes remain", ErrMalformedCommand, numMembershipOutcomes, remaining)
+			}
+			for i := uint32(0); i < numMembershipOutcomes; i++ {
+				if len(data)-off < 4 {
+					return nil, 0, fmt.Errorf("%w: truncated membership outcome %d (RequestID length)", ErrMalformedCommand, i)
+				}
+				idLen := binary.BigEndian.Uint32(data[off:])
+				off += 4
+				if int64(idLen) > int64(len(data)-off) {
+					return nil, 0, fmt.Errorf("%w: truncated membership outcome %d (RequestID: declared %d, %d remain)", ErrMalformedCommand, i, idLen, len(data)-off)
+				}
+				id := RequestID(data[off : off+int(idLen)])
+				off += int(idLen)
+				if len(data)-off < fingerprintSize+1+8 {
+					return nil, 0, fmt.Errorf("%w: truncated membership outcome %d body", ErrMalformedCommand, i)
+				}
+				var fp fingerprint
+				copy(fp[:], data[off:off+fingerprintSize])
+				off += fingerprintSize
+				status := Status(data[off])
+				off++
+				commitSeq := binary.BigEndian.Uint64(data[off:])
+				off += 8
+				outcome := Outcome{RequestID: id, Status: status}
+				if status == StatusCommitted {
+					outcome.CommitSeq = commitSeq
+					bumpMax(commitSeq)
+				}
+				membershipOutcomes[id] = membershipOutcomeEntry{outcome: outcome, fingerprint: fp}
+			}
+		}
 		if off != len(data) {
 			return nil, 0, fmt.Errorf("%w: %d trailing bytes after decoding cluster-generation block", ErrMalformedCommand, len(data)-off)
 		}
 	}
 
 	return &FSM{
-		store:             mvcc.RestoreStore(chains),
-		outcomes:          outcomes,
-		controlOutcomes:   controlOutcomes,
-		clusterGeneration: clusterGeneration,
+		store:              mvcc.RestoreStore(chains),
+		outcomes:           outcomes,
+		controlOutcomes:    controlOutcomes,
+		membershipOutcomes: membershipOutcomes,
+		clusterGeneration:  clusterGeneration,
 	}, maxSeq, nil
 }

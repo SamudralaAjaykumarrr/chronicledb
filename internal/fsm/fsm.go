@@ -60,6 +60,14 @@ type FSM struct {
 	// detection with a command kind it does not apply to.
 	clusterGeneration uint32
 	controlOutcomes   map[RequestID]Outcome
+
+	// membershipOutcomes is the dynamic-membership RequestID -> Outcome
+	// idempotency table (membership.go, dynamic-membership plan §2.6,
+	// §10) — kept as its own table for the identical reason
+	// controlOutcomes is: its fingerprint semantics ({kind, nodeId,
+	// address}, deliberately excluding confirmVoterCount) differ from
+	// CommitTxn's.
+	membershipOutcomes map[RequestID]membershipOutcomeEntry
 }
 
 // New returns an FSM that applies commands against store. store may
@@ -68,7 +76,12 @@ type FSM struct {
 // recovery — replaying a durable command history into a fresh FSM, in
 // order, is the caller's responsibility (see internal/txn.Manager.recover).
 func New(store *mvcc.Store) *FSM {
-	return &FSM{store: store, outcomes: make(map[RequestID]outcomeEntry), controlOutcomes: make(map[RequestID]Outcome)}
+	return &FSM{
+		store:              store,
+		outcomes:           make(map[RequestID]outcomeEntry),
+		controlOutcomes:    make(map[RequestID]Outcome),
+		membershipOutcomes: make(map[RequestID]membershipOutcomeEntry),
+	}
 }
 
 // Store returns the FSM's underlying MVCC store, for read-only access
