@@ -572,3 +572,94 @@ func TestHeardFromLeaderSuppressesHigherTermRequestVote(t *testing.T) {
 		t.Fatal("InputElectionTimeout must clear heardFromLeader")
 	}
 }
+
+// TestRemovedMemberReceivesNothingViaReplyDrivenContinuation regresses a
+// real defect found by DM-10's randomized combined schedule
+// (dynamic-membership plan §15): §4.1 states, and
+// TestDM4_RemovalOfIsolatedVoterCommitsWithoutItAndItRemainsHarmless
+// (internal/fault) already pins, that "replication to the removed
+// member stops at append, not at commit... every replication fan-out
+// site... iterates activeConfig.Voters/.Learners, which by that instant
+// already exclude the target." That claim is true of the three sites
+// §4.1 actually names (appendLeaderEntry, handleHeartbeatTimeout,
+// becomeLeader) but was false of three more: the reply-driven
+// continuation in handleAppendEntriesResponse's success branch and its
+// conflict-repair branch, and handleInstallSnapshotResponse's
+// equivalent — none of which checked activeConfig membership before
+// calling appendEntriesMessage(msg.From) again, because nextIndex/
+// matchIndex bookkeeping for a removed member is never cleaned up.
+// DM-4's own schedule never exercised the exact timing window that
+// trips this: a message to the target already in flight (or a stale
+// reply from one) at the instant its removal commits.
+func TestRemovedMemberReceivesNothingViaReplyDrivenContinuation(t *testing.T) {
+	assertNothingSentTo := func(t *testing.T, out Output, target NodeID, path string) {
+		t.Helper()
+		for _, msg := range out.Messages {
+			if msg.To == target {
+				t.Fatalf("%s: removed member %q was sent %+v — §4.1 requires replication to a removed member to stop at append, never resume via a reply-driven continuation", path, target, msg)
+			}
+		}
+	}
+
+	// setup builds a fresh leader, removes "b", commits the removal via
+	// the new majority of C_new={a,c}, and appends one further entry
+	// above the removal index — independently for each subtest below,
+	// so each demonstrates its own reply-driven continuation site in
+	// isolation rather than sharing nextIndex/matchIndex bookkeeping
+	// state across subtests.
+	setup := func(t *testing.T) (c *Core, removeIdx Index) {
+		t.Helper()
+		c = leaderReadyForConfigChange(t, []NodeID{"a", "b", "c"})
+		out, err := c.ProposeConfigChange(RemoveServerChange, "r1", "b", "")
+		if err != nil {
+			t.Fatalf("ProposeConfigChange: %v", err)
+		}
+		applyPersist(t, c, out)
+		removeIdx = c.activeConfigIndex
+
+		c.matchIndex["c"] = removeIdx
+		c.advanceLeaderCommit(&Output{})
+		if c.commitIndex < removeIdx {
+			t.Fatal("test setup: removal did not commit")
+		}
+		if c.activeConfig.IsMember("b") {
+			t.Fatal("test setup: b still a member after the removal committed")
+		}
+
+		applyPersist(t, c, c.handlePropose([]byte("after-removal")))
+		if c.lastIndex() <= removeIdx {
+			t.Fatal("test setup: expected at least one entry above the removal index")
+		}
+		return c, removeIdx
+	}
+
+	t.Run("success branch", func(t *testing.T) {
+		c, _ := setup(t)
+		out := c.Step(Input{Kind: InputMessage, Message: Message{
+			Type: MsgAppendEntriesResponse, From: "b", To: "a", Term: c.currentTerm,
+			Success: true, MatchIndex: c.matchIndex["b"],
+		}})
+		applyPersist(t, c, out)
+		assertNothingSentTo(t, out, "b", "handleAppendEntriesResponse success branch")
+	})
+
+	t.Run("conflict-repair branch", func(t *testing.T) {
+		c, _ := setup(t)
+		out := c.Step(Input{Kind: InputMessage, Message: Message{
+			Type: MsgAppendEntriesResponse, From: "b", To: "a", Term: c.currentTerm,
+			Success: false, ConflictIndex: 1, ConflictTerm: 0,
+		}})
+		applyPersist(t, c, out)
+		assertNothingSentTo(t, out, "b", "handleAppendEntriesResponse conflict-repair branch")
+	})
+
+	t.Run("install-snapshot response", func(t *testing.T) {
+		c, _ := setup(t)
+		out := c.Step(Input{Kind: InputMessage, Message: Message{
+			Type: MsgInstallSnapshotResponse, From: "b", To: "a", Term: c.currentTerm,
+			Success: true, MatchIndex: 1,
+		}})
+		applyPersist(t, c, out)
+		assertNothingSentTo(t, out, "b", "handleInstallSnapshotResponse")
+	})
+}

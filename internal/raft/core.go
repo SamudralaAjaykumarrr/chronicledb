@@ -999,8 +999,17 @@ func (c *Core) handleAppendEntriesResponse(msg Message) Output {
 		// advanceLeaderCommit may have just triggered a self-removal
 		// step-down (dynamic-membership plan §4.2), which nils out
 		// nextIndex/matchIndex — this node is no longer Leader and has
-		// nothing further to send.
-		if c.role == Leader && c.nextIndex[msg.From] <= c.lastIndex() {
+		// nothing further to send. c.activeConfig.IsMember(msg.From) is
+		// the same guard the proactive fan-out sites (appendLeaderEntry,
+		// handleHeartbeatTimeout) already apply: nextIndex/matchIndex
+		// bookkeeping for a removed member is never cleaned up, so
+		// without this check a removed member's own (possibly stale)
+		// reply would make this reply-driven continuation keep sending
+		// it entries — including the very entry that removed it —
+		// contradicting §4.1's "replication to the removed member stops
+		// at append, not at commit" (dynamic-membership plan §23, found
+		// by DM-10's randomized combined schedule).
+		if c.role == Leader && c.activeConfig.IsMember(msg.From) && c.nextIndex[msg.From] <= c.lastIndex() {
 			out.Messages = append(out.Messages, c.appendEntriesMessage(msg.From))
 		}
 		return out
@@ -1025,7 +1034,11 @@ func (c *Core) handleAppendEntriesResponse(msg Message) Output {
 	if next < c.nextIndex[msg.From] {
 		c.nextIndex[msg.From] = next
 	}
-	out.Messages = append(out.Messages, c.appendEntriesMessage(msg.From))
+	// Same membership guard as the success branch above: a removed
+	// member's stale rejection must not resume replication to it.
+	if c.activeConfig.IsMember(msg.From) {
+		out.Messages = append(out.Messages, c.appendEntriesMessage(msg.From))
+	}
 	return out
 }
 
@@ -1217,8 +1230,10 @@ func (c *Core) handleInstallSnapshotResponse(msg Message) Output {
 	c.advanceLeaderCommit(&out)
 	// See handleAppendEntriesResponse's identical guard: advanceLeaderCommit
 	// may have just triggered a self-removal step-down, nilling
-	// nextIndex/matchIndex.
-	if c.role == Leader && c.nextIndex[msg.From] <= c.lastIndex() {
+	// nextIndex/matchIndex, and c.activeConfig.IsMember(msg.From) stops
+	// this reply-driven continuation from resuming replication to an
+	// already-removed member (dynamic-membership plan §4.1, §23).
+	if c.role == Leader && c.activeConfig.IsMember(msg.From) && c.nextIndex[msg.From] <= c.lastIndex() {
 		out.Messages = append(out.Messages, c.appendEntriesMessage(msg.From))
 	}
 	return out
