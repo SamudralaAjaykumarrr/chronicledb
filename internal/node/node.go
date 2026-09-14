@@ -84,6 +84,19 @@ type Config struct {
 	PeerTLSCertFile string
 	PeerTLSKeyFile  string
 	PeerTLSCAFile   string
+
+	// PromotionMaxLagEntries is the leader-only, non-replicated
+	// eligibility gate PromoteToVoter applies (dynamic-membership plan
+	// §3.3): a learner's matchIndex must be within this many entries of
+	// the leader's own LastIndex() at the moment of the promote call.
+	// The default (0) is pinned by the plan and is not merely an
+	// implementation-time choice — promote only a learner whose
+	// matchIndex exactly equals LastIndex() — because it is the
+	// conservative, availability-protecting value; ErrLearnerNotCaughtUp
+	// is a pre-proposal, records-nothing, explicitly retryable refusal.
+	// This is an operational threshold, never a safety rule (§2.6
+	// enforces every safety property regardless of its value).
+	PromotionMaxLagEntries uint64
 }
 
 // PeerTLSEnabled reports whether Config requests peer mTLS.
@@ -124,14 +137,21 @@ func (c Config) validate() error {
 	if c.DataDir == "" {
 		return fmt.Errorf("node: Config.DataDir must not be empty")
 	}
-	found := false
-	for _, p := range c.Peers {
-		if p == c.ID {
-			found = true
+	// A non-empty Peers must include ID (a fresh-cluster bootstrap
+	// seed); an entirely empty Peers is valid and is the required state
+	// for a brand-new node that will join an existing cluster as a
+	// learner (dynamic-membership plan §3.1) — it acquires its
+	// Configuration only by replication, never from this flag.
+	if len(c.Peers) > 0 {
+		found := false
+		for _, p := range c.Peers {
+			if p == c.ID {
+				found = true
+			}
 		}
-	}
-	if !found {
-		return fmt.Errorf("node: Config.Peers must include Config.ID (%q)", c.ID)
+		if !found {
+			return fmt.Errorf("node: non-empty Config.Peers must include Config.ID (%q)", c.ID)
+		}
 	}
 	if c.PeerTLSEnabled() {
 		if c.PeerTLSCertFile == "" || c.PeerTLSKeyFile == "" || c.PeerTLSCAFile == "" {
@@ -162,6 +182,24 @@ type Status struct {
 	// (internal/version.MaxSupportedGeneration) — the generation
 	// UpgradePrecheck/FinalizeUpgrade would target next.
 	MaxSupportedGeneration uint32
+
+	// VoterCount/LearnerCount/ConfigIndex reflect Core.ActiveConfig()/
+	// ActiveConfigIndex() (dynamic-membership plan §9/§14).
+	VoterCount   int
+	LearnerCount int
+	ConfigIndex  raft.Index
+	// CommittedConfigIndex is the second return value of
+	// Core.ConfigAt(CommitIndex()) and nothing else (§6.3's call-site
+	// table, §9) — the configuration effective at the last committed
+	// index, distinct from ConfigIndex when a change is still in
+	// flight.
+	CommittedConfigIndex raft.Index
+	// ChangesReady/NotReadyReason mirror Core.ConfigChangeReady():
+	// whether §2.2a's P1/P2 gates currently hold on this leader, and if
+	// not, which one is outstanding. Always false ("not-leader") on a
+	// non-leader.
+	ChangesReady   bool
+	NotReadyReason string
 }
 
 type waiter struct {
@@ -228,6 +266,12 @@ type PeerGenerationInfo struct {
 	// configured peer (e.g. that peer's process was never started) must
 	// see "unknown," never a misleading assumed 0.
 	Known bool
+	// Role is "voter" or "learner" (dynamic-membership plan §8.2a) — a
+	// learner appears here for diagnostics but never affects Ready
+	// (LEARNER NON-INTERFERENCE: a learner cannot participate in
+	// committing a command it does not understand, so it cannot block
+	// finalization).
+	Role string
 }
 
 // PrecheckResult is UpgradePrecheck's answer (docs/enterprise-v1-plan.md
@@ -426,14 +470,16 @@ type Node struct {
 	// arbitrary caller goroutine (docs/enterprise-v1-plan.md §7).
 	peerGenerations map[raft.NodeID]uint32
 
-	proposeCh   chan proposeReq
-	controlCh   chan controlProposeReq
-	readIndexCh chan readIndexReq
-	backupCh    chan backupReq
-	precheckCh  chan precheckReq
-	stopCh      chan struct{}
-	doneCh      chan struct{}
-	stopOnce    sync.Once
+	proposeCh          chan proposeReq
+	controlCh          chan controlProposeReq
+	readIndexCh        chan readIndexReq
+	backupCh           chan backupReq
+	precheckCh         chan precheckReq
+	membershipCh       chan membershipReq
+	membershipStatusCh chan membershipStatusReq
+	stopCh             chan struct{}
+	doneCh             chan struct{}
+	stopOnce           sync.Once
 
 	statusMu sync.Mutex
 	status   Status
@@ -544,16 +590,38 @@ func Open(cfg Config) (*Node, error) {
 
 	rcfg := raft.Config{
 		ID:                         cfg.ID,
-		Peers:                      append([]raft.NodeID(nil), cfg.Peers...),
+		Bootstrap:                  bootstrapConfiguration(cfg),
 		ElectionTimeoutTicks:       cfg.ElectionTimeoutTicks,
 		ElectionTimeoutJitterTicks: cfg.ElectionTimeoutJitterTicks,
 		HeartbeatTimeoutTicks:      cfg.HeartbeatTimeoutTicks,
 		Rand:                       newSysRand(),
 	}
-	core, err := raft.NewCoreFromSnapshot(rcfg, hs, raft.Index(baseIndex), raft.Term(baseTerm), entries)
+	var (
+		snapConfig    raft.Configuration
+		snapHasConfig bool
+	)
+	if haveSnapshot {
+		snapConfig = fromSnapshotConfiguration(snap.Meta.Configuration)
+		snapHasConfig = snap.Meta.HasConfiguration
+	}
+	core, err := raft.NewCoreFromSnapshot(rcfg, hs, raft.Index(baseIndex), raft.Term(baseTerm), snapConfig, snapHasConfig, entries)
 	if err != nil {
 		w.Close()
 		return nil, fmt.Errorf("node: constructing raft core: %w", err)
+	}
+
+	// §1.8: a durably-derived Configuration overrides the operator's
+	// -peers/-cluster flags unconditionally on every restart past the
+	// very first. A drifted flag set is diagnostic-only and never
+	// refuses startup over it (a cosmetic mismatch is a worse trade-off
+	// than refusing availability), but is worth a loud, single-line
+	// diagnostic — peer list drift is almost always a stale deployment
+	// script.
+	if active := core.ActiveConfig(); !active.IsZero() && !active.Equal(rcfg.Bootstrap) {
+		logf := cfg.Logger
+		if logf != nil {
+			logf.Printf("node %s: durably-derived cluster configuration (%d voters, %d learners) differs from the -peers/-cluster flags supplied at startup; the durable configuration is authoritative and flags are advisory-only past initial bootstrap", cfg.ID, len(active.Voters), len(active.Learners))
+		}
 	}
 
 	var (
@@ -583,26 +651,28 @@ func Open(cfg Config) (*Node, error) {
 	}
 
 	n := &Node{
-		cfg:               cfg,
-		core:              core,
-		walog:             w,
-		storage:           st,
-		snapMgr:           snapMgr,
-		tr:                tr,
-		identityHolder:    identityHolder,
-		logger:            cfg.Logger,
-		appliedIndex:      baseIndex,
-		clusterGeneration: fsmachine.ClusterGeneration(),
-		waiters:           make(map[raft.Index]waiter),
-		ackSeq:            make(map[raft.NodeID]uint64, len(cfg.Peers)),
-		peerGenerations:   make(map[raft.NodeID]uint32, len(cfg.Peers)),
-		proposeCh:         make(chan proposeReq),
-		controlCh:         make(chan controlProposeReq),
-		readIndexCh:       make(chan readIndexReq),
-		backupCh:          make(chan backupReq),
-		precheckCh:        make(chan precheckReq),
-		stopCh:            make(chan struct{}),
-		doneCh:            make(chan struct{}),
+		cfg:                cfg,
+		core:               core,
+		walog:              w,
+		storage:            st,
+		snapMgr:            snapMgr,
+		tr:                 tr,
+		identityHolder:     identityHolder,
+		logger:             cfg.Logger,
+		appliedIndex:       baseIndex,
+		clusterGeneration:  fsmachine.ClusterGeneration(),
+		waiters:            make(map[raft.Index]waiter),
+		ackSeq:             make(map[raft.NodeID]uint64, len(cfg.Peers)),
+		peerGenerations:    make(map[raft.NodeID]uint32, len(cfg.Peers)),
+		proposeCh:          make(chan proposeReq),
+		controlCh:          make(chan controlProposeReq),
+		readIndexCh:        make(chan readIndexReq),
+		backupCh:           make(chan backupReq),
+		precheckCh:         make(chan precheckReq),
+		membershipCh:       make(chan membershipReq),
+		membershipStatusCh: make(chan membershipStatusReq),
+		stopCh:             make(chan struct{}),
+		doneCh:             make(chan struct{}),
 	}
 	n.fsmachine.Store(fsmachine)
 	n.electionArmed = true
@@ -687,6 +757,10 @@ func (n *Node) Status() Status {
 }
 
 func (n *Node) refreshStatusLocked() {
+	cfg := n.core.ActiveConfig()
+	_, committedConfigIndex := n.core.ConfigAt(n.core.CommitIndex())
+	changesReady, notReadyReason := n.core.ConfigChangeReady()
+
 	n.statusMu.Lock()
 	n.status = Status{
 		ID:                     n.cfg.ID,
@@ -699,6 +773,12 @@ func (n *Node) refreshStatusLocked() {
 		SnapshotIndex:          n.core.SnapshotIndex(),
 		ClusterGeneration:      n.clusterGeneration,
 		MaxSupportedGeneration: version.MaxSupportedGeneration,
+		VoterCount:             len(cfg.Voters),
+		LearnerCount:           len(cfg.Learners),
+		ConfigIndex:            n.core.ActiveConfigIndex(),
+		CommittedConfigIndex:   committedConfigIndex,
+		ChangesReady:           changesReady,
+		NotReadyReason:         notReadyReason,
 	}
 	n.statusMu.Unlock()
 }
@@ -711,8 +791,6 @@ func (n *Node) Stop() {
 	n.stopOnce.Do(func() { close(n.stopCh) })
 	<-n.doneCh
 }
-
-func (n *Node) majority() int { return len(n.cfg.Peers)/2 + 1 }
 
 // recordPeerGeneration updates this node's last-known view of peer's
 // compatibility generation (docs/enterprise-v1-plan.md §7). Call only
@@ -759,17 +837,27 @@ func (n *Node) computePrecheck() PrecheckResult {
 	// magnitudes).
 	target := local + 1
 
-	peers := make(map[string]PeerGenerationInfo, len(n.cfg.Peers))
+	// §8.2a: learners appear in Peers (with Role, for diagnostics) but
+	// never gate Ready — LEARNER NON-INTERFERENCE extends to
+	// finalization: a non-voting node cannot participate in committing
+	// a command it does not understand, so it must not have veto power
+	// over a cluster-wide operation either.
+	cfg := n.core.ActiveConfig()
+	peers := make(map[string]PeerGenerationInfo, len(cfg.Voters)+len(cfg.Learners))
 	ready := !alreadyFinalized
-	for _, p := range n.cfg.Peers {
-		if p == n.cfg.ID {
+	for _, m := range cfg.Voters {
+		if m.ID == n.cfg.ID {
 			continue
 		}
-		gen, known := n.peerGenerations[p]
-		peers[string(p)] = PeerGenerationInfo{Generation: gen, Known: known}
+		gen, known := n.peerGenerations[m.ID]
+		peers[string(m.ID)] = PeerGenerationInfo{Generation: gen, Known: known, Role: "voter"}
 		if !known || gen < target {
 			ready = false
 		}
+	}
+	for _, m := range cfg.Learners {
+		gen, known := n.peerGenerations[m.ID]
+		peers[string(m.ID)] = PeerGenerationInfo{Generation: gen, Known: known, Role: "learner"}
 	}
 	return PrecheckResult{
 		LocalClusterGeneration:      local,
@@ -1116,6 +1204,10 @@ func (n *Node) run() {
 			n.handleBackup(req)
 		case req := <-n.precheckCh:
 			req.resultCh <- n.computePrecheck()
+		case req := <-n.membershipCh:
+			n.handleMembership(req)
+		case req := <-n.membershipStatusCh:
+			req.resultCh <- n.computeMembershipStatus()
 		case <-n.stopCh:
 			return
 		}
@@ -1226,6 +1318,13 @@ func (n *Node) handleControlPropose(req controlProposeReq) {
 // specific to each caller, not baked into shared plumbing that has no
 // business knowing about them.
 func (n *Node) proposeAndAwait(payload []byte, requestID fsm.RequestID, resultCh chan proposeResult, onRejected, onAccepted func()) {
+	if n.selfRemoved() {
+		if onRejected != nil {
+			onRejected()
+		}
+		resultCh <- proposeResult{err: ErrNodeRemoved}
+		return
+	}
 	if n.core.Role() != raft.Leader {
 		if onRejected != nil {
 			onRejected()
@@ -1259,6 +1358,10 @@ func (n *Node) proposeAndAwait(payload []byte, requestID fsm.RequestID, resultCh
 }
 
 func (n *Node) handleReadIndex(req readIndexReq) {
+	if n.selfRemoved() {
+		req.resultCh <- readResult{err: ErrNodeRemoved}
+		return
+	}
 	if n.core.Role() != raft.Leader {
 		req.resultCh <- readResult{err: &NotLeaderError{Leader: n.core.LeaderID()}}
 		return
@@ -1291,22 +1394,32 @@ func (n *Node) checkPendingReads() {
 	if len(n.pendingReads) == 0 {
 		return
 	}
+	// Read once per pass, not once per pending read (dynamic-membership
+	// plan §4.2a): every read resolved in one pass is evaluated against
+	// one configuration, never against a set that could differ between
+	// loop iterations.
+	cfg := n.core.ActiveConfig()
 	remaining := n.pendingReads[:0]
 	for _, pr := range n.pendingReads {
 		if n.core.Role() != raft.Leader || n.core.CurrentTerm() != pr.term {
 			pr.resultCh <- readResult{err: ErrLeadershipLost}
 			continue
 		}
-		acked := 1 // self
-		for _, p := range n.cfg.Peers {
-			if p == n.cfg.ID {
-				continue
-			}
-			if n.ackSeq[p] > pr.requiredSeq {
+		// A node contributes to this quorum count — its own implicit
+		// self-ack — iff it is a Voter in its own current activeConfig
+		// (§4.2a): no self-exemption once this node is no longer a
+		// voter (e.g. mid self-removal), the exact rule §4.2 already
+		// applies to the commit path.
+		acked := 0
+		if cfg.IsVoter(n.cfg.ID) {
+			acked = 1
+		}
+		for _, v := range cfg.Voters {
+			if v.ID != n.cfg.ID && n.ackSeq[v.ID] > pr.requiredSeq {
 				acked++
 			}
 		}
-		if acked < n.majority() {
+		if acked < cfg.Majority() {
 			remaining = append(remaining, pr)
 			continue
 		}
@@ -1443,6 +1556,17 @@ func (n *Node) applyCommitted(entries []raft.Entry) {
 	for _, e := range entries {
 		if uint64(e.Index) <= n.appliedIndex {
 			continue // already applied (e.g. benign re-derivation after restart)
+		}
+		if e.Type == raft.EntryConfig {
+			// Checked FIRST, before ever consulting fsm.IsControlCommand
+			// (dynamic-membership plan §2.5): an EntryConfig entry's
+			// quorum effect already happened at append time, inside Core
+			// (§2.2) — the only work left here is the outcome record,
+			// dial-table update, and waiter resolution (§2.6).
+			if !n.applyConfigEntry(e) {
+				return // n.fail already recorded the error and stopped the node
+			}
+			continue
 		}
 		if fsm.IsControlCommand(e.Data) {
 			if !n.applyControlEntry(e) {
@@ -1597,8 +1721,20 @@ func (n *Node) maybeSnapshot() {
 		return
 	}
 
-	meta := snapshot.Meta{LastIncludedIndex: n.appliedIndex, LastIncludedTerm: uint64(n.termAtApplied())}
-	if _, err := n.snapMgr.Create(meta, n.fsmachine.Load()); err != nil {
+	// ConfigAt(appliedIndex) — never activeConfig, which may reflect an
+	// uncommitted entry above this boundary that can still be truncated
+	// (dynamic-membership plan §6.3/§7.1's §23/C1 correction). ConfigAt
+	// is total, so a locally created boundary always has a
+	// configuration, even the zero one for a node that has never
+	// joined anything.
+	cfgAtApplied, _ := n.core.ConfigAt(raft.Index(n.appliedIndex))
+	meta := snapshot.Meta{
+		LastIncludedIndex: n.appliedIndex,
+		LastIncludedTerm:  uint64(n.termAtApplied()),
+		HasConfiguration:  true,
+		Configuration:     toSnapshotConfiguration(cfgAtApplied),
+	}
+	if _, err := n.snapMgr.Create(meta, n.fsmachine.Load(), n.snapshotWriteVersion()); err != nil {
 		n.fail(fmt.Errorf("node: creating snapshot at index %d: %w", meta.LastIncludedIndex, err))
 		return
 	}
@@ -1645,11 +1781,18 @@ func (n *Node) handleBackup(req backupReq) {
 	if baseIndex == 0 {
 		baseTerm = 0
 	}
+	cfgAtBase, _ := n.core.ConfigAt(raft.Index(baseIndex))
 
 	src := backup.Source{
-		BaseMeta: snapshot.Meta{LastIncludedIndex: baseIndex, LastIncludedTerm: uint64(baseTerm)},
-		BaseFSM:  baseFSM,
-		WAL:      n.walog,
+		BaseMeta: snapshot.Meta{
+			LastIncludedIndex: baseIndex,
+			LastIncludedTerm:  uint64(baseTerm),
+			HasConfiguration:  true,
+			Configuration:     toSnapshotConfiguration(cfgAtBase),
+		},
+		BaseFSM:              baseFSM,
+		WAL:                  n.walog,
+		SnapshotWriteVersion: n.snapshotWriteVersion(),
 	}
 	until := baseIndex
 	if req.continuous {
@@ -1707,6 +1850,41 @@ func (n *Node) handleInstallSnapshot(msg raft.Message) {
 			Term: n.core.CurrentTerm(), Success: false,
 		})
 		return
+	}
+
+	// §7.2: the only two values ever adopted are the just-installed
+	// snapshot's own Meta.HasConfiguration/Meta.Configuration pair.
+	// msg.HasConfiguration/msg.Configuration exist only so Core can
+	// reason about the transfer without this driver handing it bytes it
+	// must not parse — checked here as a should-never-happen detector.
+	//
+	// The check is enforced only when the installed FILE itself asserts
+	// a configuration (snap.Meta.HasConfiguration == true, i.e. a real
+	// FormatVersion-2 write). Core's own ConfigAt/Compact are
+	// generation-unaware and unconditionally treat every locally
+	// compacted boundary as carrying a configuration (dynamic-
+	// membership plan §7.4) — true even at generation < 2, where the
+	// bootstrap configuration is a real fact, just one this node has
+	// never needed to persist as such. snapshot.Encode's write-version
+	// gate (§7.1, snapshotWriteVersion) is what keeps a pre-finalize
+	// FILE byte-identical to v0.4.0's — a v1 file always decodes with
+	// HasConfiguration=false regardless of what Core's live in-memory
+	// snapshotHasConfig said when the boundary was created. That
+	// divergence is benign by construction: pre-finalization no
+	// EntryConfig entry can exist at all (§8.2), so ConfigAt's step-2
+	// (a "true" snapshotConfig) and step-3 (the bootstrap fallback a
+	// "false" flag reaches) always agree on the SAME effective
+	// Configuration value — only the priority path differs. Enforcing
+	// exact equality unconditionally would make this should-never-happen
+	// detector fire on every ordinary pre-finalization snapshot install,
+	// which is exactly the routine case every v0.1.0-v0.4.0 behavior
+	// this phase must not regress already exercises.
+	if snap.Meta.HasConfiguration {
+		if !msg.HasConfiguration || !fromSnapshotConfiguration(snap.Meta.Configuration).Equal(msg.Configuration) {
+			n.fail(fmt.Errorf("node: installed snapshot's Configuration/HasConfiguration (has=%v cfg=%+v) disagrees with the InstallSnapshotRequest's own pair (has=%v cfg=%+v)",
+				snap.Meta.HasConfiguration, snap.Meta.Configuration, msg.HasConfiguration, msg.Configuration))
+			return
+		}
 	}
 
 	willAdvance := msg.Term >= n.core.CurrentTerm() && raft.Index(snap.Meta.LastIncludedIndex) > n.core.SnapshotIndex()

@@ -351,7 +351,7 @@ func recoverFSMForTest(t *testing.T, dataDir string) *fsm.FSM {
 		// docs/architecture.md §5), so a restored, real backup's WAL
 		// entries carry that same term prefix and must be unwrapped the
 		// same way before decoding as a CommitTxn command.
-		_, data, err := decodeEntryPayload(rec.Payload)
+		_, _, data, err := decodeEntryPayload(rec.Payload)
 		if err != nil {
 			t.Fatalf("decoding restored entry %d envelope: %v", rec.Index, err)
 		}

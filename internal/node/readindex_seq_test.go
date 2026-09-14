@@ -39,9 +39,13 @@ func (zeroRand) Intn(int) int { return 0 }
 func newSingleLeaderNodeForTest(t *testing.T) *Node {
 	t.Helper()
 	peers := []raft.NodeID{"A", "B", "C"}
+	voters := make([]raft.Member, len(peers))
+	for i, p := range peers {
+		voters[i] = raft.Member{ID: p, Address: string(p) + ":0"}
+	}
 	rcfg := raft.Config{
 		ID:                         "A",
-		Peers:                      peers,
+		Bootstrap:                  raft.Configuration{Voters: voters},
 		ElectionTimeoutTicks:       10,
 		ElectionTimeoutJitterTicks: 5,
 		HeartbeatTimeoutTicks:      2,

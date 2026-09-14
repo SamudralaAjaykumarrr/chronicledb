@@ -1,6 +1,7 @@
 package fault
 
 import (
+	"fmt"
 	"sort"
 
 	"github.com/SamudralaAjaykumarrr/chronicledb/internal/raft"
@@ -61,11 +62,15 @@ func NewCluster(peers []raft.NodeID, opts ClusterOptions) *Cluster {
 	cl.order = append([]raft.NodeID(nil), peers...)
 	sort.Slice(cl.order, func(i, j int) bool { return cl.order[i] < cl.order[j] })
 
-	allPeers := append([]raft.NodeID(nil), peers...)
+	voters := make([]raft.Member, len(peers))
+	for i, id := range peers {
+		voters[i] = raft.Member{ID: id, Address: string(id) + ":0"}
+	}
+	bootstrap := raft.Configuration{Voters: voters}
 	for _, id := range peers {
 		cfg := raft.Config{
 			ID:                         id,
-			Peers:                      append([]raft.NodeID(nil), allPeers...),
+			Bootstrap:                  bootstrap,
 			ElectionTimeoutTicks:       opts.ElectionTimeoutTicks,
 			ElectionTimeoutJitterTicks: opts.ElectionTimeoutJitterTicks,
 			HeartbeatTimeoutTicks:      opts.HeartbeatTimeoutTicks,
@@ -192,6 +197,25 @@ func (cl *Cluster) Propose(leader raft.NodeID, data []byte) {
 	}
 	n.Step(raft.Input{Kind: raft.InputPropose, ProposeData: data})
 	cl.flush(n)
+}
+
+// ProposeConfigChange submits a membership change directly to the
+// named node's Core (dynamic-membership plan §15/§21 slice 6),
+// mirroring Propose's existing wrapper pattern: if leader is not
+// currently Leader, or any of §2.6a's preconditions are unmet, the
+// error is returned unchanged and nothing enters the log.
+func (cl *Cluster) ProposeConfigChange(leader raft.NodeID, kind raft.MembershipChangeKind, requestID string, targetID raft.NodeID, targetAddr string) error {
+	n := cl.nodes[leader]
+	if n == nil || n.Crashed() {
+		return fmt.Errorf("fault: ProposeConfigChange: node %s is unknown or crashed", leader)
+	}
+	out, err := n.core.ProposeConfigChange(kind, requestID, targetID, targetAddr)
+	if err != nil {
+		return err
+	}
+	n.applyOutput(out)
+	cl.flush(n)
+	return nil
 }
 
 // Crash simulates an ungraceful crash of id: its volatile Core is

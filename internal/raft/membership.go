@@ -574,6 +574,28 @@ func (c *Core) ActiveConfig() Configuration { return c.activeConfig.clone() }
 // or Config.Bootstrap.
 func (c *Core) ActiveConfigIndex() Index { return c.activeConfigIndex }
 
+// ConfigChangeReady reports whether ProposeConfigChange's P1/P2 gates
+// (§2.2a) currently hold on this Core, and if not, which one is
+// outstanding — for /admin/membership/status's changesReady/
+// notReadyReason fields (§9, §11) and for the membership_changes_ready
+// metric (§14). Always false with reason "not-leader" on a non-leader.
+// Read-only: performs no I/O and mutates nothing.
+func (c *Core) ConfigChangeReady() (ready bool, reason string) {
+	if c.role != Leader {
+		return false, "not-leader"
+	}
+	if c.commitIndex < c.pendingConfIndex {
+		return false, "inherited-suffix-uncommitted"
+	}
+	if c.termAt(c.commitIndex) != c.currentTerm {
+		return false, "no-current-term-commit"
+	}
+	if c.activeConfigIndex > c.commitIndex {
+		return false, "change-in-progress"
+	}
+	return true, ""
+}
+
 // neverJoined reports whether this node has never observed any
 // configuration from any source (dynamic-membership plan §3.1).
 func (c *Core) neverJoined() bool { return c.activeConfig.IsZero() }
