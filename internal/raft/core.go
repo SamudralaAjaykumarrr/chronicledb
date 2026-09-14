@@ -1133,14 +1133,35 @@ func (c *Core) handleInstallSnapshotRequest(msg Message) Output {
 	out.ResetElectionTimer = true
 	out.ElectionTimeoutTicks = c.cfg.electionTimeout()
 
-	if msg.LastIncludedIndex <= c.snapshotIndex {
+	if msg.LastIncludedIndex <= c.snapshotIndex || msg.LastIncludedIndex <= c.commitIndex {
 		// Stale or duplicate: this node's own boundary is already at
-		// least as far. Still acknowledge (idempotent) so the leader can
-		// advance nextIndex/matchIndex past what it mistakenly thought
-		// was missing (docs/snapshots.md §7 step 6's "no partial state").
+		// least as far — either its own SnapshotIndex already covers it
+		// (the original check), or ordinary AppendEntries replication
+		// has already advanced CommitIndex past it. The second case
+		// matters because a duplicated or delayed InstallSnapshotRequest
+		// (docs/failure-model.md's modeled message-duplication/delay
+		// fault class — internal/fault's Transport.Duplicate/Delay
+		// exercise exactly this) can otherwise arrive after this node
+		// has already moved past msg.LastIncludedIndex through normal
+		// replication: without this check, the code below would
+		// unconditionally discard this node's entire log down to the
+		// stale (lower) boundary while leaving CommitIndex unchanged,
+		// corrupting it into CommitIndex() > LastIndex() (found by
+		// DM-10's randomized combined schedule, dynamic-membership plan
+		// §15). CommitIndex is reported, not SnapshotIndex, when it is
+		// the higher of the two: every entry up to CommitIndex is
+		// COMMITTED-PREFIX-SAFETY-guaranteed permanent regardless of
+		// which leader incarnation asks, exactly as SnapshotIndex
+		// already was in the original check — but nothing above
+		// CommitIndex is reported, since those entries may still be
+		// uncommitted and reversible.
+		matchIndex := c.snapshotIndex
+		if c.commitIndex > matchIndex {
+			matchIndex = c.commitIndex
+		}
 		out.Messages = append(out.Messages, Message{
 			Type: MsgInstallSnapshotResponse, From: c.cfg.ID, To: msg.From,
-			Term: c.currentTerm, Success: true, MatchIndex: c.snapshotIndex,
+			Term: c.currentTerm, Success: true, MatchIndex: matchIndex,
 		})
 		if stateChanged {
 			seq := c.nextPersistSeq()

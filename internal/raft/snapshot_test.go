@@ -212,6 +212,59 @@ func TestHandleInstallSnapshotRequestAlreadyCoveredAcksIdempotently(t *testing.T
 	}
 }
 
+// TestHandleInstallSnapshotRequestBelowCommitIndexTreatedAsStale
+// regresses a real defect found by DM-10's randomized combined schedule
+// (dynamic-membership plan §15): the "already covered" staleness check
+// above only compared msg.LastIncludedIndex against c.snapshotIndex,
+// never against c.commitIndex. A node that has already advanced
+// CommitIndex past msg.LastIncludedIndex via ordinary AppendEntries —
+// entirely possible for a duplicated or delayed InstallSnapshotRequest
+// constructed earlier in a run and delivered late, the same
+// message-reordering fault class internal/fault's Transport.Duplicate/
+// Delay already model elsewhere — would still take the "install" branch
+// (msg.LastIncludedIndex > c.snapshotIndex) and unconditionally discard
+// its entire log down to the new, LOWER boundary, while leaving
+// CommitIndex untouched: CommitIndex() > LastIndex() afterward, an
+// invalid state.
+func TestHandleInstallSnapshotRequestBelowCommitIndexTreatedAsStale(t *testing.T) {
+	f, err := NewCore(testConfig("A", threePeers()), HardState{CurrentTerm: 1}, []Entry{
+		{Index: 1, Term: 1, Data: []byte("a")},
+		{Index: 2, Term: 1, Data: []byte("b")},
+		{Index: 3, Term: 1, Data: []byte("c")},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Ordinary replication already advanced CommitIndex to 3, above the
+	// stale offer below but still above SnapshotIndex (0).
+	f.commitIndex = 3
+	f.appliedIndex = 3
+
+	out := f.Step(Input{Kind: InputMessage, Message: Message{
+		Type: MsgInstallSnapshotRequest, From: "L", To: "F", Term: 1,
+		LastIncludedIndex: 1, LastIncludedTerm: 1,
+	}})
+
+	if f.CommitIndex() > f.LastIndex() {
+		t.Fatalf("CommitIndex()=%d exceeds LastIndex()=%d after a stale InstallSnapshotRequest below the already-advanced CommitIndex", f.CommitIndex(), f.LastIndex())
+	}
+	if f.SnapshotIndex() != 0 {
+		t.Fatalf("SnapshotIndex must remain unchanged (0), got %d", f.SnapshotIndex())
+	}
+	if f.CommitIndex() != 3 || f.LastIndex() != 3 {
+		t.Fatalf("CommitIndex/LastIndex = %d/%d, want both unchanged at 3 (existing durable state must survive a stale offer intact)", f.CommitIndex(), f.LastIndex())
+	}
+	if e, ok := f.EntryAt(3); !ok || string(e.Data) != "c" {
+		t.Fatalf("entry 3 must survive intact, got %+v ok=%v", e, ok)
+	}
+	if out.PersistRequest != nil {
+		t.Fatalf("a stale offer below CommitIndex must not require a fresh persist, got %+v", out.PersistRequest)
+	}
+	if len(out.Messages) != 1 || !out.Messages[0].Success || out.Messages[0].MatchIndex != 3 {
+		t.Fatalf("response = %+v, want idempotent Success MatchIndex=3 (this node's own CommitIndex, since it exceeds SnapshotIndex)", out.Messages)
+	}
+}
+
 // --- handleInstallSnapshotResponse (leader side) ---
 
 func TestHandleInstallSnapshotResponseAdvancesReplicationAndCommit(t *testing.T) {
