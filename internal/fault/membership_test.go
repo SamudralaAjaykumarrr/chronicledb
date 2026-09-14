@@ -1281,3 +1281,232 @@ func TestDM9_StaleRemovedNodeCannotDisruptCluster(t *testing.T) {
 		t.Fatal("legitimate leader was disrupted by a removed node's stale elections")
 	}
 }
+
+// TestDM14_SelfRemovingLeaderReplicationContinuesUntilCommit regresses
+// DM-14 (§15, §2.7, §23/C3): a follower that has already adopted
+// C_new excluding the leader (at append time, ahead of commit — §2.2)
+// must keep accepting that leader's ordinary AppendEntriesRPC traffic
+// — both LeaderCommit advance and further ordinary replication — and
+// must never campaign while it is still legitimately hearing from that
+// leader. This is the exact defect revision 1's membership-scoped
+// message filter reproduced (§2.7 "why revision 1's rule was wrong"):
+// under that rule, b would have dropped every subsequent message from
+// a the instant it adopted C_new.
+func TestDM14_SelfRemovingLeaderReplicationContinuesUntilCommit(t *testing.T) {
+	// A wider ElectionTimeoutTicks than usual: c stays fully isolated
+	// for a stretch of this test purely to keep the self-removal
+	// uncommitted, and must not run away to a higher term in the
+	// meantime (that would be a spurious, unrelated election — see
+	// TestDM2's "Deliberately no AdvanceTicks here" comment for the
+	// same discipline applied to a shorter window).
+	cl := NewCluster([]raft.NodeID{"a", "b", "c"}, ClusterOptions{ElectionTimeoutTicks: 30, ElectionTimeoutJitterTicks: 10, HeartbeatTimeoutTicks: 2, Seed: 14})
+	if !cl.SettleElection(80) {
+		t.Fatal("no leader emerged")
+	}
+	a := cl.Leaders()[0]
+	commitNoOpAndSettle(cl, a, []byte("x")) // P1
+
+	var b, c raft.NodeID
+	for _, id := range cl.NodeIDs() {
+		if id == a {
+			continue
+		}
+		if b == "" {
+			b = id
+		} else {
+			c = id
+		}
+	}
+
+	// Isolate c so the removal cannot commit yet: only b will durably
+	// append it, ahead of any commit.
+	cl.IsolateNode(c)
+	if err := cl.ProposeConfigChange(a, raft.RemoveServerChange, "remove-a-dm14", a, ""); err != nil {
+		t.Fatalf("ProposeConfigChange: %v", err)
+	}
+	entryIdx := cl.Node(a).Core().LastIndex()
+	cl.DeliverEligible()
+	cl.DeliverEligible()
+
+	if got := cl.Node(b).Core().LastIndex(); got != entryIdx {
+		t.Fatalf("b never durably appended the self-removal entry: LastIndex %d, want %d", got, entryIdx)
+	}
+	if cl.Node(b).Core().ActiveConfig().IsMember(a) {
+		t.Fatal("b's activeConfig still includes a after appending a's own removal entry — append-time effect missing")
+	}
+
+	// b now excludes a from its own view of the cluster, yet a remains
+	// its actual leader. Ordinary replication traffic must not be
+	// membership-filtered: propose further ordinary entries and confirm
+	// b keeps accepting them.
+	for i := 0; i < 3; i++ {
+		cl.Propose(a, []byte(fmt.Sprintf("after-removal-%d", i)))
+		cl.AdvanceTicks(1)
+		cl.DeliverEligible()
+	}
+	if got, want := cl.Node(b).Core().LastIndex(), cl.Node(a).Core().LastIndex(); got != want {
+		t.Fatalf("b stopped accepting a's AppendEntriesRPC once it excluded a from its own config: b.LastIndex=%d, a.LastIndex=%d", got, want)
+	}
+
+	// Rule 2: while b keeps legitimately hearing from a, b must never
+	// campaign, even though a is absent from b's own activeConfig.
+	beforeTerm := cl.Node(b).Core().CurrentTerm()
+	for i := 0; i < 20; i++ {
+		cl.AdvanceTicks(1)
+		cl.DeliverEligible()
+	}
+	if got := cl.Node(b).Core().CurrentTerm(); got != beforeTerm {
+		t.Fatalf("b campaigned (term %d -> %d) while still hearing from its leader a, despite a being absent from b's own activeConfig", beforeTerm, got)
+	}
+	if cl.Node(b).Core().Role() != raft.Follower {
+		t.Fatalf("b left Follower role (role=%v) while still hearing from its leader a", cl.Node(b).Core().Role())
+	}
+
+	// Confirm the removal genuinely has not committed yet, and a is
+	// still leading — so what follows is a real commit, not a no-op.
+	if cl.Node(a).Core().CommitIndex() >= entryIdx {
+		t.Fatal("test setup: the removal must not have committed yet")
+	}
+	if cl.Node(a).Core().Role() != raft.Leader {
+		t.Fatal("a stepped down before its own removal actually committed")
+	}
+
+	// Heal c and let the genuine C_new={b,c} majority assemble: the
+	// removal commits, LeaderCommit propagates to b, and a steps down
+	// exactly at that commit — never before.
+	cl.HealAll()
+	for i := 0; i < 20; i++ {
+		cl.AdvanceTicks(1)
+		cl.DeliverEligible()
+	}
+
+	if got := cl.Node(a).Core().CommitIndex(); got < entryIdx {
+		t.Fatalf("self-removal never committed once the genuine C_new majority could assemble: commitIndex=%d, want >= %d", got, entryIdx)
+	}
+	if cl.Node(a).Core().Role() != raft.Follower {
+		t.Fatal("self-removing leader did not step down exactly at its own removal's commit")
+	}
+
+	// a steps down synchronously with its own commit computation
+	// (§4.2), so it may never get to announce this particular commit's
+	// LeaderCommit to b itself; that falls to whichever of b/c is
+	// elected next. Per ordinary Raft, a freshly elected leader can
+	// only directly advance commitIndex for an entry of its own
+	// current term, so the already-matched removal entry only surfaces
+	// as committed to every follower once the new leader commits one
+	// entry of its own (mirroring internal/node.proposeElectionNoOp) —
+	// give that election, and then that commit, room to finish.
+	var newLeader raft.NodeID
+	for i := 0; i < 80 && newLeader == ""; i++ {
+		cl.AdvanceTicks(1)
+		cl.DeliverEligible()
+		if leaders := cl.Leaders(); len(leaders) == 1 {
+			newLeader = leaders[0]
+		}
+	}
+	if newLeader == "" {
+		t.Fatal("remaining voters never elected a new leader after a's self-removal")
+	}
+	commitNoOpAndSettle(cl, newLeader, []byte("dm14-after"))
+
+	if got := cl.Node(b).Core().CommitIndex(); got < entryIdx {
+		t.Fatalf("b's CommitIndex never advanced past the removal entry once C_new={b,c} elected a working leader: %d, want >= %d", got, entryIdx)
+	}
+}
+
+// TestDM14_AbandonedSelfRemovalDoesNotStrandFollower is DM-14's
+// "abandoned-change variant" (§15): while a self-removal remains
+// uncommitted — and forever will in this run, because the second
+// remaining voter c never acknowledges it, so C_new={b,c}'s majority
+// can never assemble — follower b (which already excludes a from its
+// own activeConfig, ahead of any commit) must not be permanently cut
+// off from a merely because b no longer considers a a member. This is
+// the exact production defect revision 1's membership-scoped filter
+// had (§2.7 "why revision 1's rule was wrong": once b adopted C_new,
+// revision 1 dropped every subsequent message from a, including
+// ordinary AppendEntriesRPC repair/catch-up traffic, permanently
+// stranding b). Here b is additionally network-partitioned from a for
+// a stretch, modeling any real-world replication lapse; the assertion
+// is that healing the network — not any membership bookkeeping — is
+// what is required to bring b back: a's ordinary AppendEntriesRPC
+// repairs and catches b up exactly as it would for any other current
+// member, i.e. b is repaired by a rather than stranded.
+func TestDM14_AbandonedSelfRemovalDoesNotStrandFollower(t *testing.T) {
+	// See TestDM14_SelfRemovingLeaderReplicationContinuesUntilCommit's
+	// comment on the wider ElectionTimeoutTicks: c stays isolated for
+	// this entire test and must not run away to a higher term.
+	cl := NewCluster([]raft.NodeID{"a", "b", "c"}, ClusterOptions{ElectionTimeoutTicks: 30, ElectionTimeoutJitterTicks: 10, HeartbeatTimeoutTicks: 2, Seed: 140})
+	if !cl.SettleElection(80) {
+		t.Fatal("no leader emerged")
+	}
+	a := cl.Leaders()[0]
+	commitNoOpAndSettle(cl, a, []byte("x")) // P1
+
+	var b, c raft.NodeID
+	for _, id := range cl.NodeIDs() {
+		if id == a {
+			continue
+		}
+		if b == "" {
+			b = id
+		} else {
+			c = id
+		}
+	}
+
+	// c is isolated for the whole test: the removal can never commit
+	// (C_new={b,c} needs both), modeling a change that is effectively
+	// abandoned/timed out rather than ever resolving.
+	cl.IsolateNode(c)
+	if err := cl.ProposeConfigChange(a, raft.RemoveServerChange, "remove-a-dm14-abandoned", a, ""); err != nil {
+		t.Fatalf("ProposeConfigChange: %v", err)
+	}
+	entryIdx := cl.Node(a).Core().LastIndex()
+	cl.DeliverEligible()
+	cl.DeliverEligible()
+
+	if got := cl.Node(b).Core().LastIndex(); got != entryIdx {
+		t.Fatalf("b never durably appended the self-removal entry: LastIndex %d, want %d", got, entryIdx)
+	}
+	if cl.Node(b).Core().ActiveConfig().IsMember(a) {
+		t.Fatal("b's activeConfig still includes a after appending a's own removal entry")
+	}
+
+	// b itself now also drops off the network for a stretch. The old,
+	// rejected filtering rule would have made this permanent, because b
+	// already excludes a from its own membership view.
+	cl.IsolateNode(b)
+	for i := 0; i < 3; i++ {
+		cl.Propose(a, []byte(fmt.Sprintf("while-b-partitioned-%d", i)))
+		cl.AdvanceTicks(1)
+		cl.DeliverEligible()
+	}
+	if got := cl.Node(b).Core().LastIndex(); got != entryIdx {
+		t.Fatalf("test setup: b should not have received anything while partitioned, got LastIndex=%d want %d", got, entryIdx)
+	}
+
+	// Heal b and confirm a's ordinary AppendEntriesRPC repairs and
+	// catches it up — it is not permanently stranded by its own
+	// exclusion of a.
+	cl.HealNode(b)
+	for i := 0; i < 20; i++ {
+		cl.AdvanceTicks(1)
+		cl.DeliverEligible()
+	}
+	if got, want := cl.Node(b).Core().LastIndex(), cl.Node(a).Core().LastIndex(); got != want {
+		t.Fatalf("b was stranded: after healing, b.LastIndex=%d, want caught up to a.LastIndex=%d", got, want)
+	}
+	if cl.Node(b).Core().Role() != raft.Follower || cl.Node(b).Core().CurrentTerm() != cl.Node(a).Core().CurrentTerm() {
+		t.Fatalf("b did not remain (or resume) a normal follower of a: role=%v term=%d, a's term=%d", cl.Node(b).Core().Role(), cl.Node(b).Core().CurrentTerm(), cl.Node(a).Core().CurrentTerm())
+	}
+
+	// The self-removal itself is still uncommitted — c has never
+	// acknowledged it — confirming this really was the abandoned,
+	// never-resolves branch throughout, not a disguised commit.
+	if cl.Node(a).Core().CommitIndex() >= entryIdx {
+		t.Fatal("the self-removal committed despite c never acknowledging it — test no longer exercises the abandoned-change branch")
+	}
+	if cl.Node(a).Core().Role() != raft.Leader {
+		t.Fatal("a stepped down despite its own removal never committing")
+	}
+}
