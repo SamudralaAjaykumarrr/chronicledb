@@ -495,7 +495,7 @@ func (c *Core) ProposeConfigChange(kind MembershipChangeKind, requestID string, 
 		return Output{}, ErrConfigChangeInheritedSuffixUncommitted
 	}
 	// Check 3 (P1): leader-term commit gate.
-	if c.termAt(c.commitIndex) != c.currentTerm {
+	if !c.skipP1ForTest && c.termAt(c.commitIndex) != c.currentTerm {
 		return Output{}, ErrConfigChangeNoCurrentTermCommit
 	}
 	// Check 4 (P3): local serialization.

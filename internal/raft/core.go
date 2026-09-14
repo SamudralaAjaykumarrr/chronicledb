@@ -151,7 +151,21 @@ type Core struct {
 	// internal/node.PauseTicksForTest's doc comment for the other side
 	// of this coupling.
 	heardFromLeader bool
+
+	// skipP1ForTest disables ProposeConfigChange's P1 check (dynamic-
+	// membership plan §2.2a) — never set in production code. Exists
+	// solely so DM-12/DM-22's negative controls can demonstrate that
+	// the harness's committedOracle actually detects the safety
+	// violation P1 exists to prevent when the gate is removed (a
+	// regression test that cannot fail when its mechanism is deleted
+	// does not count, §19 gate 3).
+	skipP1ForTest bool
 }
+
+// SetSkipP1GateForTest disables (or re-enables) P1 for this Core only
+// — see skipP1ForTest's doc comment. Test-only; never called from
+// production code.
+func (c *Core) SetSkipP1GateForTest(skip bool) { c.skipP1ForTest = skip }
 
 // NewCore constructs a Core from cfg and previously persisted state
 // (hs, entries — both the zero value / nil for a brand-new node).
