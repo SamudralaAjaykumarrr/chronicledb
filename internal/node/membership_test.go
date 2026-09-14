@@ -250,3 +250,120 @@ func TestSelfRemovingLeaderStepsDownAndClusterElectsNewLeader(t *testing.T) {
 		return false
 	})
 }
+
+// TestMembershipRequestIDRetryAcrossLeaderFailover is the real-process
+// counterpart of DM-6 (§15, §10): a membership RequestID's outcome must
+// resolve identically regardless of which node answers a retry, across
+// a genuine leader failover, and a pre-proposal refusal must record
+// nothing so the same RequestID remains freshly usable against whoever
+// becomes leader next.
+func TestMembershipRequestIDRetryAcrossLeaderFailover(t *testing.T) {
+	t.Run("committed outcome survives failover and a retry does not re-propose", func(t *testing.T) {
+		tc := newTestCluster(t, 3)
+		leader1 := tc.leaderNode(5 * time.Second)
+		leader1ID := leader1.cfg.ID
+		mustFinalizeToMax(t, tc, leader1)
+
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		outcome1, err := leader1.AddLearner(ctx, "dm6-add", "x", "127.0.0.1:0")
+		if err != nil {
+			t.Fatalf("AddLearner: %v", err)
+		}
+		if outcome1.Status != fsm.StatusCommitted {
+			t.Fatalf("AddLearner outcome = %+v, want Committed", outcome1)
+		}
+
+		tc.crash(leader1ID)
+		newLeaderID := tc.awaitLeader(5 * time.Second)
+		leader2 := tc.node(newLeaderID)
+		awaitCondition(t, 5*time.Second, "new leader applies the already-committed AddLearner entry into its FSM outcome table", func() bool {
+			return leader2.Status().AppliedIndex >= outcome1.CommitSeq
+		})
+		lastIndexBeforeRetry := leader2.Status().LastIndex
+
+		outcome2, err := leader2.AddLearner(ctx, "dm6-add", "x", "127.0.0.1:0")
+		if err != nil {
+			t.Fatalf("retry against new leader after failover: %v", err)
+		}
+		if outcome2 != outcome1 {
+			t.Fatalf("retry outcome %+v != original outcome %+v — must resolve identically regardless of which node answers", outcome2, outcome1)
+		}
+		if got := leader2.Status().LastIndex; got != lastIndexBeforeRetry {
+			t.Fatalf("idempotent retry re-proposed a duplicate entry: LastIndex went from %d to %d", lastIndexBeforeRetry, got)
+		}
+
+		// A conflicting request reusing the same RequestID for a
+		// different target must be rejected distinctly, never silently
+		// returning the unrelated original outcome.
+		if _, err := leader2.AddLearner(ctx, "dm6-add", "y", "127.0.0.1:1"); !errors.Is(err, fsm.ErrRequestIDConflict) {
+			t.Fatalf("AddLearner with a conflicting fingerprint under a reused RequestID: err = %v, want ErrRequestIDConflict", err)
+		}
+	})
+
+	t.Run("a pre-proposal refusal records nothing and the same RequestID succeeds fresh after failover", func(t *testing.T) {
+		tc := newTestCluster(t, 3)
+		leader1 := tc.leaderNode(5 * time.Second)
+		leader1ID := leader1.cfg.ID
+		mustFinalizeToMax(t, tc, leader1)
+
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+
+		var target raft.NodeID
+		for _, id := range tc.ids {
+			if id != leader1ID {
+				target = id
+				break
+			}
+		}
+
+		// Refused before ever proposing (§12.2/§2.6a): no confirmVoterCount
+		// against a 3-voter cluster.
+		_, err := leader1.RemoveServer(ctx, "dm6-remove", target, 0)
+		var confirmErr *ErrConfirmationRequired
+		if !errors.As(err, &confirmErr) {
+			t.Fatalf("RemoveServer without confirmVoterCount: err = %v, want *ErrConfirmationRequired", err)
+		}
+		if leader1.Status().VoterCount != 3 {
+			t.Fatalf("VoterCount changed on a refused proposal: %d, want unchanged 3", leader1.Status().VoterCount)
+		}
+
+		tc.crash(leader1ID)
+		newLeaderID := tc.awaitLeader(5 * time.Second)
+		leader2 := tc.node(newLeaderID)
+
+		// Retarget the removal to the crashed original leader itself:
+		// removing anyone else would need a majority of a C_new that
+		// still includes the crashed, unreachable leader1 (§4.3's C_new
+		// majority rule), which could never commit — an unrelated
+		// liveness dead-end this test must not trip over.
+		target = leader1ID
+
+		// The same RequestID, now against the new leader, with the
+		// correct confirmation, must succeed as a genuinely fresh
+		// attempt — nothing was recorded by the earlier refusal.
+		// Bounded-poll, retrying on the transient post-election
+		// not-ready window (§11/§2.2a's P1 gate): a brand-new leader
+		// has not yet committed an entry of its own current term, and
+		// this is expected to fire transiently right after failover
+		// (docs/testing-strategy.md §4's bounded-polling discipline).
+		var outcome fsm.Outcome
+		awaitCondition(t, 5*time.Second, "RemoveServer retry eventually succeeds once the new leader clears the P1 gate", func() bool {
+			rctx, rcancel := context.WithTimeout(context.Background(), time.Second)
+			defer rcancel()
+			o, err := leader2.RemoveServer(rctx, "dm6-remove", target, 2)
+			if err != nil {
+				if errors.Is(err, raft.ErrConfigChangeNoCurrentTermCommit) || errors.Is(err, raft.ErrConfigChangeInheritedSuffixUncommitted) {
+					return false // retryable, keep polling
+				}
+				t.Fatalf("RemoveServer retry with the same RequestID after failover: unexpected error %v", err)
+			}
+			outcome = o
+			return true
+		})
+		if outcome.Status != fsm.StatusCommitted {
+			t.Fatalf("RemoveServer retry outcome = %+v, want Committed", outcome)
+		}
+	})
+}

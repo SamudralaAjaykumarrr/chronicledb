@@ -369,6 +369,95 @@ func TestDM4_RemovalOfIsolatedVoterCommitsWithoutItAndItRemainsHarmless(t *testi
 	}
 }
 
+// TestDM5_ElectionDuringInFlightConfigChange regresses DM-5 (§15, §5's
+// "candidate election during change"/"after proposal, before commit"
+// rows): an election occurring while a configuration change is
+// in-flight (uncommitted) must be decided purely by LEADER COMPLETENESS
+// exactly as for any other uncommitted entry — no membership-specific
+// special case — in both directions: the entry survives if it reached
+// a majority of C_new before the election, and is discarded (as if the
+// proposal never happened) if it did not.
+func TestDM5_ElectionDuringInFlightConfigChange(t *testing.T) {
+	t.Run("entry that reached a majority of C_new survives the election and commits normally", func(t *testing.T) {
+		cl := NewCluster([]raft.NodeID{"a", "b", "c"}, ClusterOptions{ElectionTimeoutTicks: 12, ElectionTimeoutJitterTicks: 5, HeartbeatTimeoutTicks: 2, Seed: 51})
+		if !cl.SettleElection(50) {
+			t.Fatal("no leader emerged")
+		}
+		a := cl.Leaders()[0]
+		commitNoOpAndSettle(cl, a, []byte("x")) // P1
+		others := otherThree(cl, a)
+
+		if err := cl.ProposeConfigChange(a, raft.AddLearnerChange, "add-d", "d", "d:0"); err != nil {
+			t.Fatalf("ProposeConfigChange: %v", err)
+		}
+		entryIdx := cl.Node(a).Core().LastIndex()
+
+		// Let it replicate to (and be acked by) a majority of C_new's
+		// voters (unchanged by an AddLearner: still {a,b,c}) before
+		// crashing the leader — so the entry has genuinely reached a
+		// majority and LEADER COMPLETENESS guarantees any future leader
+		// must have it.
+		cl.DeliverEligible()
+		cl.DeliverEligible()
+		for _, id := range others {
+			if got := cl.Node(id).Core().LastIndex(); got != entryIdx {
+				t.Fatalf("test setup: %s did not receive the entry before the crash: LastIndex %d, want %d", id, got, entryIdx)
+			}
+		}
+
+		cl.Crash(a)
+		newLeader := settleAmong(cl, others, 100)
+		if newLeader == "" {
+			t.Fatal("remaining voters never elected a leader among themselves")
+		}
+		if got := cl.Node(newLeader).Core().LastIndex(); got < entryIdx {
+			t.Fatalf("new leader's log does not contain an entry that reached a majority of C_new — LEADER COMPLETENESS violated: LastIndex %d, want >= %d", got, entryIdx)
+		}
+		commitNoOpAndSettle(cl, newLeader, []byte("noop"))
+		if got := cl.Node(newLeader).Core().CommitIndex(); got < entryIdx {
+			t.Fatalf("entry that reached a majority of C_new failed to eventually commit under the new leader: commitIndex %d, want >= %d", got, entryIdx)
+		}
+		if !cl.Node(newLeader).Core().ActiveConfig().IsMember("d") {
+			t.Fatal("new leader's activeConfig lost the survived AddLearner entry")
+		}
+	})
+
+	t.Run("entry that never reached a majority is discarded as if it never happened", func(t *testing.T) {
+		cl := NewCluster([]raft.NodeID{"a", "b", "c"}, ClusterOptions{ElectionTimeoutTicks: 12, ElectionTimeoutJitterTicks: 5, HeartbeatTimeoutTicks: 2, Seed: 52})
+		if !cl.SettleElection(50) {
+			t.Fatal("no leader emerged")
+		}
+		a := cl.Leaders()[0]
+		commitNoOpAndSettle(cl, a, []byte("x")) // P1
+		others := otherThree(cl, a)
+
+		// Isolate a before proposing: the entry sits only in a's own
+		// log, replicated to nobody.
+		cl.IsolateNode(a)
+		if err := cl.ProposeConfigChange(a, raft.RemoveServerChange, "remove-c", others[0], ""); err != nil {
+			t.Fatalf("ProposeConfigChange: %v", err)
+		}
+
+		newLeader := settleAmong(cl, others, 100)
+		if newLeader == "" {
+			t.Fatal("remaining voters never elected a leader among themselves")
+		}
+		if cfg := cl.Node(newLeader).Core().ActiveConfig(); !cfg.IsMember(others[0]) {
+			t.Fatal("new leader's activeConfig reflects an entry that never reached a majority — as-if-never-happened violated")
+		}
+
+		// The new leader can propose its own change normally — nothing
+		// about the abandoned proposal lingers as a serialization
+		// obstacle (SERIALIZED MEMBERSHIP CHANGE: at most one
+		// outstanding change ever, and the abandoned one was never
+		// really outstanding at all once superseded).
+		commitNoOpAndSettle(cl, newLeader, []byte("noop"))
+		if err := cl.ProposeConfigChange(newLeader, raft.RemoveServerChange, "remove-c-2", others[0], ""); err != nil {
+			t.Fatalf("ProposeConfigChange after the abandoned proposal was superseded: %v", err)
+		}
+	})
+}
+
 func otherThree(cl *Cluster, exclude raft.NodeID) []raft.NodeID {
 	var out []raft.NodeID
 	for _, id := range cl.NodeIDs() {
