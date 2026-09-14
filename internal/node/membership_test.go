@@ -207,6 +207,135 @@ func TestRemoveServerRequiresConfirmationBelowThreeVoters(t *testing.T) {
 	}
 }
 
+// TestDM19_SubThreeVoterConfirmationStaleAndZeroVoterCases extends
+// TestRemoveServerRequiresConfirmationBelowThreeVoters with DM-19's
+// (§15, §12.2) two remaining sub-cases: a stale confirmVoterCount
+// (correct for an earlier cluster size, wrong for the current one) is
+// refused just like a missing one, never silently honored; and
+// RemoveServer down to zero voters is refused by Core itself
+// (ErrLastVoterRemoval) regardless of what confirmVoterCount claims —
+// §12.2's two-layer split, with the operator-policy layer
+// (confirmVoterCount) and the absolute Core-level invariant each
+// exercised independently.
+func TestDM19_SubThreeVoterConfirmationStaleAndZeroVoterCases(t *testing.T) {
+	t.Run("stale confirmVoterCount refused", func(t *testing.T) {
+		// Start from 4 voters so the first removal (4 -> 3) needs no
+		// confirmation at all, changing the cluster's size "in between"
+		// from the operator's point of view.
+		tc := newTestCluster(t, 4)
+		leader := tc.leaderNode(5 * time.Second)
+		mustFinalizeToMax(t, tc, leader)
+
+		var toRemove []raft.NodeID
+		for _, id := range tc.ids {
+			if id != leader.cfg.ID {
+				toRemove = append(toRemove, id)
+			}
+		}
+
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+
+		// 4 -> 3: no confirmation required.
+		out1, err := leader.RemoveServer(ctx, "dm19-remove-1", toRemove[0], 0)
+		if err != nil {
+			t.Fatalf("RemoveServer 4->3: %v", err)
+		}
+		if out1.Status != fsm.StatusCommitted {
+			t.Fatalf("RemoveServer 4->3 outcome = %+v, want Committed", out1)
+		}
+		if got := leader.Status().VoterCount; got != 3 {
+			t.Fatalf("VoterCount after first removal = %d, want 3", got)
+		}
+
+		// The cluster has now shrunk to 3 voters. An operator who last
+		// observed it at 4 voters and (wrongly, but plausibly) still
+		// believes a further removal needs no confirmation submits
+		// confirmVoterCount=0 — actual resulting count is 2, so this
+		// must be refused exactly like a bare missing confirmation,
+		// naming the real current count.
+		_, err = leader.RemoveServer(ctx, "dm19-remove-2", toRemove[1], 0)
+		var confirmErr *ErrConfirmationRequired
+		if !errors.As(err, &confirmErr) {
+			t.Fatalf("RemoveServer with a stale confirmVoterCount=0: err = %v, want *ErrConfirmationRequired", err)
+		}
+		if confirmErr.ResultingVoterCount != 2 {
+			t.Fatalf("ErrConfirmationRequired.ResultingVoterCount = %d, want 2", confirmErr.ResultingVoterCount)
+		}
+		if got := leader.Status().VoterCount; got != 3 {
+			t.Fatalf("VoterCount changed on a refused proposal: %d, want unchanged 3", got)
+		}
+
+		// A different stale value (3 — correct for no-confirmation-
+		// needed, which is also wrong here) is refused identically.
+		_, err = leader.RemoveServer(ctx, "dm19-remove-3", toRemove[1], 3)
+		if !errors.As(err, &confirmErr) {
+			t.Fatalf("RemoveServer with a stale confirmVoterCount=3: err = %v, want *ErrConfirmationRequired", err)
+		}
+		if confirmErr.ResultingVoterCount != 2 {
+			t.Fatalf("ErrConfirmationRequired.ResultingVoterCount = %d, want 2", confirmErr.ResultingVoterCount)
+		}
+
+		// The correct, current confirmVoterCount succeeds.
+		out2, err := leader.RemoveServer(ctx, "dm19-remove-4", toRemove[1], 2)
+		if err != nil {
+			t.Fatalf("RemoveServer with the correct confirmVoterCount=2: %v", err)
+		}
+		if out2.Status != fsm.StatusCommitted {
+			t.Fatalf("RemoveServer outcome = %+v, want Committed", out2)
+		}
+	})
+
+	t.Run("removal to zero voters refused by Core itself regardless of confirmation", func(t *testing.T) {
+		tc := newTestCluster(t, 3)
+		leader := tc.leaderNode(5 * time.Second)
+		mustFinalizeToMax(t, tc, leader)
+
+		var toRemove []raft.NodeID
+		for _, id := range tc.ids {
+			if id != leader.cfg.ID {
+				toRemove = append(toRemove, id)
+			}
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+
+		// 3 -> 2 -> 1, both with correct confirmations, leaving the
+		// leader as the cluster's sole voter.
+		if _, err := leader.RemoveServer(ctx, "dm19-drain-1", toRemove[0], 2); err != nil {
+			t.Fatalf("RemoveServer 3->2: %v", err)
+		}
+		if _, err := leader.RemoveServer(ctx, "dm19-drain-2", toRemove[1], 1); err != nil {
+			t.Fatalf("RemoveServer 2->1: %v", err)
+		}
+		if got := leader.Status().VoterCount; got != 1 {
+			t.Fatalf("VoterCount = %d, want 1", got)
+		}
+
+		// A wrong confirmVoterCount is refused by the operator-policy
+		// layer, exactly as for any other sub-three-voter removal.
+		_, err := leader.RemoveServer(ctx, "dm19-drain-3", leader.cfg.ID, 99)
+		var confirmErr *ErrConfirmationRequired
+		if !errors.As(err, &confirmErr) {
+			t.Fatalf("RemoveServer(last voter) with a wrong confirmVoterCount: err = %v, want *ErrConfirmationRequired", err)
+		}
+		if confirmErr.ResultingVoterCount != 0 {
+			t.Fatalf("ErrConfirmationRequired.ResultingVoterCount = %d, want 0", confirmErr.ResultingVoterCount)
+		}
+
+		// confirmVoterCount=0 is the *correct* resulting count, so it
+		// clears the operator-policy layer — and must still be refused,
+		// this time by Core's own absolute, non-overridable invariant.
+		_, err = leader.RemoveServer(ctx, "dm19-drain-4", leader.cfg.ID, 0)
+		if !errors.Is(err, raft.ErrLastVoterRemoval) {
+			t.Fatalf("RemoveServer(last voter) with confirmVoterCount=0: err = %v, want raft.ErrLastVoterRemoval", err)
+		}
+		if got := leader.Status().VoterCount; got != 1 {
+			t.Fatalf("VoterCount changed on a refused last-voter removal: %d, want unchanged 1", got)
+		}
+	})
+}
+
 // TestSelfRemovingLeaderStepsDownAndClusterElectsNewLeader is the
 // real-process counterpart to the raft-level self-removal unit test
 // (dynamic-membership plan §4.2, §16).
