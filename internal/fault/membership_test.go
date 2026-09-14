@@ -84,6 +84,186 @@ func TestDM12_NewLeaderRefusesSecondTransitionOnInheritedUncommittedTail(t *test
 	}
 }
 
+// recordingFataler is an oracleFataler that records whether Fatalf was
+// ever called instead of aborting the goroutine, so a negative-control
+// test can assert an oracle *would* have failed without that failure
+// propagating to the enclosing *testing.T (whose own Fail() walks up
+// to every ancestor test).
+type recordingFataler struct {
+	called  bool
+	message string
+}
+
+func (r *recordingFataler) Helper() {}
+func (r *recordingFataler) Fatalf(format string, args ...interface{}) {
+	r.called = true
+	r.message = fmt.Sprintf(format, args...)
+}
+
+// TestDM12Step7_P1DisabledProducesADoubleCommitTheOracleDetects is
+// DM-12's step 7 (§15): a regression test for a safety-critical gate
+// is incomplete without a negative control proving it can actually
+// fail (docs/testing-strategy.md §11). This reproduces §2.3's exact
+// "branch confinement fails without P1" counterexample with P1
+// disabled via Core.SetSkipP1GateForTest, and asserts the harness's
+// own committedOracle detects the resulting two-committed-values-at-
+// one-index divergence — proving DM-12's mechanism (and this test's
+// own oracle) actually detects what it claims to prevent, not merely
+// that the happy path behaves.
+//
+// The trace, mapped onto this harness's primitives (§2.3's table):
+// voters {a,b,c,d} (majority 3) plus a committed learner e; a proposes
+// Promote(e) -> C1={a,b,c,d,e}, delivered only to e (2 of 5,
+// uncommitted); {a,e} partitioned from the other three, who elect a
+// new leader under C0 (majority 3) with no knowledge of the pending
+// entry; that new leader is further cut off from one of its own two
+// followers ("d") before proposing its own no-op *and*, with P1
+// disabled, RemoveServer(a) — both commit via the remaining two-of-
+// three; the network then reconnects {a,e} to the previously-cut-off
+// "d" (never to the other branch), and a regains leadership of a
+// three-node majority of C1 and commits a marker entry, transitively
+// committing its own old-term Promote(e) entry at the very same index
+// the other branch already committed different content at.
+func TestDM12Step7_P1DisabledProducesADoubleCommitTheOracleDetects(t *testing.T) {
+	cl := NewCluster([]raft.NodeID{"a", "b", "c", "d"}, ClusterOptions{ElectionTimeoutTicks: 10, ElectionTimeoutJitterTicks: 5, HeartbeatTimeoutTicks: 2, Seed: 1290})
+	if !cl.SettleElection(50) {
+		t.Fatal("no leader emerged")
+	}
+	a := cl.Leaders()[0]
+	commitNoOpAndSettle(cl, a, []byte("warmup"))
+
+	cl.AddNode("e")
+	if err := cl.ProposeConfigChange(a, raft.AddLearnerChange, "add-e", "e", "e:0"); err != nil {
+		t.Fatalf("AddLearner: %v", err)
+	}
+	for i := 0; i < 20; i++ {
+		cl.AdvanceTicks(1)
+		cl.DeliverEligible()
+	}
+	if !cl.Node(a).Core().ActiveConfig().IsMember("e") {
+		t.Fatal("test setup: AddLearner did not commit")
+	}
+	commitNoOpAndSettle(cl, a, []byte("more"))
+
+	// a proposes Promote(e) -> C1={a,b,c,d,e}; deliver to e only.
+	if err := cl.ProposeConfigChange(a, raft.PromoteToVoterChange, "promote-e", "e", ""); err != nil {
+		t.Fatalf("ProposeConfigChange Promote(e): %v", err)
+	}
+	pendingIdx := cl.Node(a).Core().LastIndex()
+	for _, pm := range cl.Transport().Pending() {
+		if pm.Message.To == "e" {
+			cl.Deliver(pm.ID)
+		}
+	}
+	if got := cl.Node("e").Core().LastIndex(); got != pendingIdx {
+		t.Fatalf("test setup: e did not receive the pending Promote(e) entry: got %d want %d", got, pendingIdx)
+	}
+	if cl.Node(a).Core().CommitIndex() >= pendingIdx {
+		t.Fatal("test setup: the pending entry must not have committed (only 2 of 5 acked)")
+	}
+
+	// {a,e} partitioned from the other three original voters (e is
+	// e-aware filtering, since e was added after cluster construction
+	// and otherThree doesn't know about it).
+	var others []raft.NodeID
+	for _, id := range cl.NodeIDs() {
+		if id != a && id != "e" {
+			others = append(others, id)
+		}
+	}
+	if len(others) != 3 {
+		t.Fatalf("test setup: expected exactly 3 other original voters, got %v", others)
+	}
+	cl.Partition([]raft.NodeID{a, "e"}, others)
+
+	newLeaderB := settleAmong(cl, others, 200)
+	if newLeaderB == "" {
+		t.Fatal("the other three voters never elected a leader among themselves")
+	}
+	if got := cl.Node(newLeaderB).Core().LastIndex(); got != pendingIdx-1 {
+		t.Fatalf("test setup: new leader %s must not have the pending entry: LastIndex %d, want %d", newLeaderB, got, pendingIdx-1)
+	}
+
+	// Split the two remaining followers into dNode (cut off from the
+	// new leader for the upcoming commit) and cNode (stays connected).
+	var dNode, cNode raft.NodeID
+	for _, id := range others {
+		if id == newLeaderB {
+			continue
+		}
+		if dNode == "" {
+			dNode = id
+		} else {
+			cNode = id
+		}
+	}
+	cl.Transport().IsolateLink(newLeaderB, dNode)
+	cl.Transport().IsolateLink(dNode, newLeaderB)
+	cl.Transport().IsolateLink(cNode, dNode)
+	cl.Transport().IsolateLink(dNode, cNode)
+
+	// The new leader's own no-op, then — with P1 disabled — a
+	// RemoveServer(a) immediately after, before that no-op commits.
+	// Both commit via the two-of-three still reachable to it.
+	cl.Propose(newLeaderB, []byte("noop-term2"))
+	cl.Node(newLeaderB).Core().SetSkipP1GateForTest(true)
+	if err := cl.ProposeConfigChange(newLeaderB, raft.RemoveServerChange, "remove-a-p1-disabled", a, ""); err != nil {
+		t.Fatalf("ProposeConfigChange with P1 disabled: %v", err)
+	}
+	removeIdx := cl.Node(newLeaderB).Core().LastIndex()
+	for i := 0; i < 30; i++ {
+		cl.AdvanceTicks(1)
+		cl.DeliverEligible()
+	}
+	if got := cl.Node(newLeaderB).Core().CommitIndex(); got < removeIdx {
+		t.Fatalf("test setup: the P1-disabled branch must commit via its own two-of-three: commitIndex %d, want >= %d", got, removeIdx)
+	}
+
+	// Record this branch's committed values in the oracle now, before
+	// the second (conflicting) branch commits anything — observe scans
+	// every currently-live node, so recording both branches' values in
+	// one call would never exercise the oracle's actual contradiction
+	// path, only its ordinary agreement path.
+	oracle := newCommittedOracle()
+	oracle.observe(t, 1290, cl)
+
+	// Reconnect {a,e} to dNode specifically — never to newLeaderB or
+	// cNode, so the two branches never directly observe each other.
+	cl.Transport().HealLink(a, dNode)
+	cl.Transport().HealLink(dNode, a)
+	cl.Transport().HealLink("e", dNode)
+	cl.Transport().HealLink(dNode, "e")
+
+	triple := []raft.NodeID{a, dNode, "e"}
+	tripleLeader := settleAmong(cl, triple, 400)
+	if tripleLeader == "" {
+		t.Fatal("a, dNode, and e never settled on a leader among themselves")
+	}
+	// A marker under the regained leader's own new current term: the
+	// transitive-commit rule is what pulls the old-term pending entry
+	// along with it (advanceLeaderCommit only ever counts a majority
+	// directly for an entry of the leader's own current term).
+	cl.Propose(tripleLeader, []byte("term-N-marker"))
+	for i := 0; i < 60; i++ {
+		cl.AdvanceTicks(1)
+		cl.DeliverEligible()
+	}
+	if got := cl.Node(tripleLeader).Core().CommitIndex(); got < pendingIdx {
+		t.Fatalf("test setup: the reconnected branch must also commit through the old pending index: commitIndex %d, want >= %d", got, pendingIdx)
+	}
+
+	// The reconnected branch has now committed *different* content at
+	// the very same index newLeaderB's branch already committed —
+	// exactly the divergence P1 exists to prevent. This second
+	// observation, against the same oracle, must detect it.
+	fake := &recordingFataler{}
+	oracle.observe(fake, 1290, cl) // now also sees tripleLeader's conflicting branch
+	if !fake.called {
+		t.Fatal("committedOracle did not detect the two-committed-values-at-one-index divergence produced by disabling P1 — this negative control is not exercising the gate")
+	}
+	t.Logf("oracle correctly detected: %s", fake.message)
+}
+
 // TestDM2_SelfRemovalCommitsOnlyOnGenuineCNewMajorityThenLeaderMayCrash
 // regresses DM-2 (§15, §4.2): a leader proposing its own removal must
 // collect acknowledgements from a genuine majority of C_new — never

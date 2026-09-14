@@ -50,6 +50,20 @@ func newCommittedOracle() *committedOracle {
 	return &committedOracle{byIndex: make(map[raft.Index]raft.Entry)}
 }
 
+// oracleFataler is the minimal subset of *testing.T that observe
+// needs. Extracted (rather than taking *testing.T directly) so a
+// negative-control test can substitute a failure-recording fake
+// instead of a real *testing.T — a real one's Fatal/Fatalf marks every
+// ancestor test failed too (testing.common.Fail walks up t.parent),
+// which would make "assert the oracle catches this violation" itself
+// report as a failed test (dynamic-membership plan §15 DM-12 step 7,
+// DM-10's oracle-independence requirement). *testing.T already
+// satisfies this interface, so every existing call site is unchanged.
+type oracleFataler interface {
+	Helper()
+	Fatalf(format string, args ...interface{})
+}
+
 // observe checks every entry any live, non-crashed node currently
 // reports as committed (via its cumulative CommittedEntries, which,
 // per Node's own doc comment, "may contain benign duplicates after a
@@ -57,7 +71,7 @@ func newCommittedOracle() *committedOracle {
 // against the oracle, recording first-sight values and failing loudly
 // on any contradiction — the direct falsification target for
 // COMMITTED-PREFIX-SAFETY / STATE-MACHINE-SAFETY under chaos.
-func (o *committedOracle) observe(t *testing.T, seed int64, cl *Cluster) {
+func (o *committedOracle) observe(t oracleFataler, seed int64, cl *Cluster) {
 	t.Helper()
 	for _, id := range cl.NodeIDs() {
 		n := cl.Node(id)
