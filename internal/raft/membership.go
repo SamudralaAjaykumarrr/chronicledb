@@ -435,7 +435,7 @@ func (c *Core) buildNewConfiguration(kind MembershipChangeKind, targetID NodeID,
 	cur := c.activeConfig
 	switch kind {
 	case AddLearnerChange:
-		if cur.isMember(targetID) {
+		if cur.IsMember(targetID) {
 			return Configuration{}, ErrMemberAlreadyExists
 		}
 		return Configuration{
@@ -452,10 +452,10 @@ func (c *Core) buildNewConfiguration(kind MembershipChangeKind, targetID NodeID,
 			Learners: removeMemberByID(cur.Learners, targetID),
 		}, nil
 	case RemoveServerChange:
-		if cur.isVoter(targetID) {
+		if cur.IsVoter(targetID) {
 			return Configuration{Voters: removeMemberByID(cur.Voters, targetID), Learners: cloneMembers(cur.Learners)}, nil
 		}
-		if cur.isLearner(targetID) {
+		if cur.IsLearner(targetID) {
 			return Configuration{Voters: cloneMembers(cur.Voters), Learners: removeMemberByID(cur.Learners, targetID)}, nil
 		}
 		return Configuration{}, ErrUnknownMember
@@ -576,14 +576,14 @@ func (c *Core) ActiveConfigIndex() Index { return c.activeConfigIndex }
 
 // neverJoined reports whether this node has never observed any
 // configuration from any source (dynamic-membership plan §3.1).
-func (c *Core) neverJoined() bool { return c.activeConfig.isZero() }
+func (c *Core) neverJoined() bool { return c.activeConfig.IsZero() }
 
 // selfRemoved reports whether this node has observed a real
 // configuration that excludes its own ID (dynamic-membership plan
 // §3.1) — distinct from neverJoined, which this package never conflates
 // with it.
 func (c *Core) selfRemoved() bool {
-	return !c.activeConfig.isZero() && !c.activeConfig.isMember(c.cfg.ID)
+	return !c.activeConfig.IsZero() && !c.activeConfig.IsMember(c.cfg.ID)
 }
 
 // initReplicationStateFor lazily initializes leader-only volatile
@@ -636,4 +636,48 @@ func (c *Core) activateFromAppendedEntries(entries []Entry) {
 		c.activeConfig = cfg
 		c.activeConfigIndex = e.Index
 	}
+}
+
+func membershipChangeKindFromWire(kind byte) (MembershipChangeKind, bool) {
+	switch kind {
+	case membershipKindAddLearner:
+		return AddLearnerChange, true
+	case membershipKindPromoteVoter:
+		return PromoteToVoterChange, true
+	case membershipKindRemoveServer:
+		return RemoveServerChange, true
+	default:
+		return 0, false
+	}
+}
+
+// DecodeConfigEntry decodes a committed EntryConfig entry's payload for
+// internal/node.applyCommitted (dynamic-membership plan §2.6/§7.6): the
+// membership operation kind, the request's opaque identifiers, the
+// resulting Configuration, and establishes (false only for a Voided
+// entry, which carries none of the above and requires no further
+// action beyond advancing appliedIndex). e.Type must be EntryConfig.
+//
+// This is the only way internal/node ever learns a committed
+// configuration's requestID/targetID/targetAddr — internal/fsm never
+// decodes EntryConfig payloads itself (§2.4).
+func DecodeConfigEntry(e Entry) (kind MembershipChangeKind, requestID, targetID, targetAddr string, cfg Configuration, establishes bool, err error) {
+	if e.Type != EntryConfig {
+		err = fmt.Errorf("raft: DecodeConfigEntry: entry %d has Type %d, not EntryConfig", e.Index, e.Type)
+		return
+	}
+	wireKind, requestID, targetID, targetAddr, cfg, establishes, err := decodeConfigChange(e.Data)
+	if err != nil {
+		return
+	}
+	if !establishes {
+		return 0, requestID, targetID, targetAddr, cfg, false, nil
+	}
+	k, ok := membershipChangeKindFromWire(wireKind)
+	if !ok {
+		err = fmt.Errorf("%w: %d", ErrUnknownConfigChangeKind, wireKind)
+		return
+	}
+	kind = k
+	return
 }

@@ -10,6 +10,7 @@ import (
 	"encoding/binary"
 	"fmt"
 
+	"github.com/SamudralaAjaykumarrr/chronicledb/internal/fsm"
 	"github.com/SamudralaAjaykumarrr/chronicledb/internal/raft"
 	"github.com/SamudralaAjaykumarrr/chronicledb/internal/wal"
 )
@@ -90,11 +91,11 @@ func OpenWALStorage(w *wal.WAL) (*WALStorage, error) {
 		if !ok {
 			break
 		}
-		term, data, err := decodeEntryPayload(rec.Payload)
+		term, typ, data, err := decodeEntryPayload(rec.Payload)
 		if err != nil {
 			return nil, fmt.Errorf("node: decoding log entry at index %d: %w", rec.Index, err)
 		}
-		s.entries = append(s.entries, raft.Entry{Index: raft.Index(rec.Index), Term: term, Data: data})
+		s.entries = append(s.entries, raft.Entry{Index: raft.Index(rec.Index), Term: term, Type: typ, Data: data})
 	}
 	return s, nil
 }
@@ -252,7 +253,7 @@ func (s *WALStorage) Append(entries []raft.Entry) error {
 		want++
 	}
 	for _, e := range entries {
-		idx, err := s.w.AppendLogEntry(encodeEntryPayload(e.Term, e.Data))
+		idx, err := s.w.AppendLogEntry(encodeEntryPayload(e.Term, e.Type, e.Data))
 		if err != nil {
 			return fmt.Errorf("node: appending log entry %d: %w", e.Index, err)
 		}
@@ -270,25 +271,96 @@ func (s *WALStorage) Append(entries []raft.Entry) error {
 // --- Opaque payload encodings (Raft-semantics-aware; deliberately kept
 // outside internal/wal, docs/architecture.md §5) ---
 
+// entryPayloadTypeSentinel is the self-describing typed-entry marker
+// byte (dynamic-membership plan §6.1a): written at payload offset 8
+// iff the entry's Type != raft.EntryNormal. It occupies a namespace
+// that does not exist today at that offset — byte 8 is always the
+// first byte of Entry.Data in every format that exists prior to this
+// phase, which is either fsm.ControlCommandMarker (0xF0) or a small
+// commitTxnCommandVersion integer (currently 2). An init() assertion
+// below guards this non-collision structurally, mirroring
+// fsm.ControlCommandMarker's own existing guard, one layer up at the
+// payload-framing level.
+const entryPayloadTypeSentinel byte = 0xFF
+
+// knownEntryTypesMax is the highest raft.EntryType value this build
+// recognizes; anything above it is ErrUnknownEntryType, fail-closed.
+const knownEntryTypesMax = raft.EntryConfig
+
+func init() {
+	if entryPayloadTypeSentinel == fsm.ControlCommandMarker {
+		panic(fmt.Sprintf("node: entryPayloadTypeSentinel (%d) collides with fsm.ControlCommandMarker (%d)", entryPayloadTypeSentinel, fsm.ControlCommandMarker))
+	}
+	// commitTxnCommandVersion is not exported, but it is documented (and
+	// tested, fsm.TestEntryPayloadSentinelNeverCollides) to be a small,
+	// sequentially-incrementing integer starting at 1 — realistically
+	// never reaching 0xFF within CommitTxn's own version lineage.
+}
+
+// ErrUnknownEntryType indicates a log entry payload's typed-entry
+// header names an EntryType this build does not recognize — a decode
+// error, never a guess (dynamic-membership plan §6.1a,
+// NO SILENT FORMAT MISINTERPRETATION).
+var ErrUnknownEntryType = fmt.Errorf("node: unknown log entry type")
+
+// ErrMalformedEntryPayload indicates a log entry payload's typed-entry
+// header is truncated or otherwise structurally invalid.
+var ErrMalformedEntryPayload = fmt.Errorf("node: malformed log entry payload")
+
 // encodeEntryPayload wraps a raft.Entry's Term ahead of its opaque Data
 // bytes, so a single internal/wal RecordTypeLogEntry payload carries
 // both — the WAL frame's own Index field already carries the entry's
 // log index (docs/wal.md §2's "(term, index, command bytes)": index
 // comes from the frame, term+command bytes are this payload).
-func encodeEntryPayload(term raft.Term, data []byte) []byte {
-	buf := make([]byte, 8+len(data))
+//
+// The typed-entry header (entryPayloadTypeSentinel + a one-byte
+// EntryType) is written iff typ != raft.EntryNormal — never gated on
+// this node's durable cluster generation, which is updated at a point
+// in processOutput's single event-loop pass that is systematically
+// stale relative to when this function runs for the very same pass
+// (dynamic-membership plan §6.1a/§23 F2): gating on the entry's own
+// type is what makes MEMBERSHIP RECOVERY DETERMINISM hold across the
+// generation-2 finalization boundary. An untyped payload
+// (typ == raft.EntryNormal) is byte-identical to every payload this
+// function has ever produced, in every release — the mechanism that
+// keeps ROLLBACK BOUNDARY HONESTY structural rather than a runtime
+// check: before generation 2, no EntryConfig entry can exist anywhere
+// (§8.2's gate), so a pre-finalization node has nothing typed to write.
+func encodeEntryPayload(term raft.Term, typ raft.EntryType, data []byte) []byte {
+	if typ == raft.EntryNormal {
+		buf := make([]byte, 8+len(data))
+		binary.BigEndian.PutUint64(buf[0:8], uint64(term))
+		copy(buf[8:], data)
+		return buf
+	}
+	buf := make([]byte, 8+1+1+len(data))
 	binary.BigEndian.PutUint64(buf[0:8], uint64(term))
-	copy(buf[8:], data)
+	buf[8] = entryPayloadTypeSentinel
+	buf[9] = byte(typ)
+	copy(buf[10:], data)
 	return buf
 }
 
-func decodeEntryPayload(b []byte) (raft.Term, []byte, error) {
+// decodeEntryPayload is unambiguous in both directions and needs no
+// external context (dynamic-membership plan §6.1a): a payload whose
+// 9th byte is entryPayloadTypeSentinel is the typed form; every other
+// payload — including every payload ever written by v0.1.0-v0.4.0 — is
+// EntryNormal, byte-identical to what those releases already produced.
+func decodeEntryPayload(b []byte) (raft.Term, raft.EntryType, []byte, error) {
 	if len(b) < 8 {
-		return 0, nil, fmt.Errorf("node: log entry payload too short (%d bytes)", len(b))
+		return 0, raft.EntryNormal, nil, fmt.Errorf("%w: too short (%d bytes)", ErrMalformedEntryPayload, len(b))
 	}
 	term := raft.Term(binary.BigEndian.Uint64(b[0:8]))
+	if len(b) >= 10 && b[8] == entryPayloadTypeSentinel {
+		typ := raft.EntryType(b[9])
+		if typ == raft.EntryNormal || typ > knownEntryTypesMax {
+			return 0, raft.EntryNormal, nil, fmt.Errorf("%w: %d", ErrUnknownEntryType, b[9])
+		}
+		data := append([]byte(nil), b[10:]...)
+		return term, typ, data, nil
+	}
 	data := append([]byte(nil), b[8:]...)
-	return term, data, nil
+	return term, raft.EntryNormal, data, nil
 }
 
 // encodeHardState/decodeHardState serialize raft.HardState (currentTerm,

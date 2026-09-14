@@ -165,6 +165,21 @@ func (t *Transport) Addr() string { return t.ln.Addr().String() }
 // channel is closed after Close.
 func (t *Transport) Recv() <-chan raft.Message { return t.recv }
 
+// SetPeerAddr adds or updates peer's dial address in this transport's
+// live dial table (dynamic-membership plan §1.8): the dial table is no
+// longer fixed at construction from peerAddrs alone — internal/node
+// calls this whenever the active Configuration gains a member (a new
+// learner) so the very next Send to it dials the right address. There
+// is deliberately no corresponding "remove peer" operation: an address
+// the current Configuration no longer names is simply never dialed
+// again by anything that consults Configuration first, which every
+// send path in internal/node does.
+func (t *Transport) SetPeerAddr(id raft.NodeID, addr string) {
+	t.mu.Lock()
+	t.addrs[id] = addr
+	t.mu.Unlock()
+}
+
 // Send transmits msg to msg.To asynchronously and never blocks the
 // caller on network I/O: it enqueues onto that peer's dedicated sender
 // goroutine (dialing lazily and reconnecting on failure) and simply

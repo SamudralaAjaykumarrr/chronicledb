@@ -48,7 +48,7 @@ func (c Config) validate() error {
 		return fmt.Errorf("raft: Config.ID must not be empty")
 	}
 	if len(c.Bootstrap.Voters) > 0 || len(c.Bootstrap.Learners) > 0 {
-		if !c.Bootstrap.isMember(c.ID) {
+		if !c.Bootstrap.IsMember(c.ID) {
 			return fmt.Errorf("raft: non-empty Config.Bootstrap must include Config.ID (%q)", c.ID)
 		}
 	}

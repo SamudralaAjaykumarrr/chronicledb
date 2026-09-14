@@ -92,9 +92,9 @@ type Configuration struct {
 
 // majority returns the smallest count that constitutes a majority of
 // c.Voters.
-func (c Configuration) majority() int { return len(c.Voters)/2 + 1 }
+func (c Configuration) Majority() int { return len(c.Voters)/2 + 1 }
 
-func (c Configuration) isVoter(id NodeID) bool {
+func (c Configuration) IsVoter(id NodeID) bool {
 	for _, m := range c.Voters {
 		if m.ID == id {
 			return true
@@ -103,7 +103,7 @@ func (c Configuration) isVoter(id NodeID) bool {
 	return false
 }
 
-func (c Configuration) isLearner(id NodeID) bool {
+func (c Configuration) IsLearner(id NodeID) bool {
 	for _, m := range c.Learners {
 		if m.ID == id {
 			return true
@@ -112,11 +112,11 @@ func (c Configuration) isLearner(id NodeID) bool {
 	return false
 }
 
-func (c Configuration) isMember(id NodeID) bool { return c.isVoter(id) || c.isLearner(id) }
+func (c Configuration) IsMember(id NodeID) bool { return c.IsVoter(id) || c.IsLearner(id) }
 
 // isZero reports whether c is the zero Configuration — no voters, no
 // learners (dynamic-membership plan §3.1's "never joined" state).
-func (c Configuration) isZero() bool { return len(c.Voters) == 0 && len(c.Learners) == 0 }
+func (c Configuration) IsZero() bool { return len(c.Voters) == 0 && len(c.Learners) == 0 }
 
 func cloneMembers(m []Member) []Member {
 	if len(m) == 0 {

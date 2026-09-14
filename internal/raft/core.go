@@ -427,7 +427,7 @@ func (c *Core) handleElectionTimeout() Output {
 	// §2.7 Rule 1's third clause: a node that is not a Voter in its own
 	// activeConfig (a Learner, or one that has observed its own
 	// removal) never starts an election.
-	if !c.activeConfig.isVoter(c.cfg.ID) {
+	if !c.activeConfig.IsVoter(c.cfg.ID) {
 		return Output{}
 	}
 
@@ -458,7 +458,7 @@ func (c *Core) handleElectionTimeout() Output {
 			LastLogTerm:  c.lastTerm(),
 		})
 	}
-	if len(c.votesReceived) >= c.activeConfig.majority() {
+	if len(c.votesReceived) >= c.activeConfig.Majority() {
 		// Single-node cluster: a candidacy of one is already a majority.
 		c.becomeLeader(&out)
 	}
@@ -658,7 +658,7 @@ func (c *Core) handleRequestVoteRequest(msg Message) Output {
 	// in this receiver's own activeConfig. A Learner is likewise never
 	// a legitimate candidate, so this one condition covers both "removed
 	// node" and "learner campaigning."
-	if !c.activeConfig.isVoter(msg.From) {
+	if !c.activeConfig.IsVoter(msg.From) {
 		return out
 	}
 	// §2.7 Rule 2 (Raft §4.2.3 leader-contact suppression): a node that
@@ -688,7 +688,7 @@ func (c *Core) handleRequestVoteRequest(msg Message) Output {
 	// §2.7 Rule 1, second clause: a node that is not itself a Voter in
 	// its own activeConfig (a Learner, or one that has observed its own
 	// removal) never grants a vote, regardless of log state.
-	canVote := (c.votedFor == noVote || c.votedFor == msg.From) && c.activeConfig.isVoter(c.cfg.ID)
+	canVote := (c.votedFor == noVote || c.votedFor == msg.From) && c.activeConfig.IsVoter(c.cfg.ID)
 	logOK := c.isLogUpToDate(msg.LastLogIndex, msg.LastLogTerm)
 
 	if canVote && logOK {
@@ -755,7 +755,7 @@ func (c *Core) handleRequestVoteResponse(msg Message) Output {
 		return out // stale, not a candidate anymore, or a rejection
 	}
 	c.votesReceived[msg.From] = true // map dedupes: a peer's vote is never counted twice
-	if len(c.votesReceived) >= c.activeConfig.majority() {
+	if len(c.votesReceived) >= c.activeConfig.Majority() {
 		c.becomeLeader(&out)
 	}
 	return out
@@ -1032,7 +1032,7 @@ func (c *Core) advanceLeaderCommit(out *Output) {
 				count++
 			}
 		}
-		if count >= c.activeConfig.majority() {
+		if count >= c.activeConfig.Majority() {
 			start := c.commitIndex + 1
 			if start <= c.snapshotIndex {
 				start = c.snapshotIndex + 1
@@ -1051,7 +1051,7 @@ func (c *Core) advanceLeaderCommit(out *Output) {
 // not merely append, specifically avoids needlessly giving up
 // leadership for a change that might never actually succeed).
 func (c *Core) maybeStepDownAfterSelfRemoval(out *Output) {
-	if c.role != Leader || c.activeConfig.isVoter(c.cfg.ID) {
+	if c.role != Leader || c.activeConfig.IsVoter(c.cfg.ID) {
 		return
 	}
 	c.role = Follower

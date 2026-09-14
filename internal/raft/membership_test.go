@@ -103,7 +103,7 @@ func TestConfigAtNeverJoinedIsZeroConfiguration(t *testing.T) {
 		t.Fatal("a Core with an empty Bootstrap and no log must report neverJoined()")
 	}
 	got, idx := c.ConfigAt(0)
-	if idx != 0 || !got.isZero() {
+	if idx != 0 || !got.IsZero() {
 		t.Fatalf("ConfigAt(0) = %+v, %d; want the zero Configuration", got, idx)
 	}
 }
@@ -258,7 +258,7 @@ func TestSelfRemovingLeaderExcludedFromOwnCommitQuorum(t *testing.T) {
 	}
 	applyPersist(t, c, out)
 	idx := c.activeConfigIndex
-	if c.activeConfig.isVoter("a") {
+	if c.activeConfig.IsVoter("a") {
 		t.Fatal("activeConfig must exclude the self-removing leader immediately on append")
 	}
 
