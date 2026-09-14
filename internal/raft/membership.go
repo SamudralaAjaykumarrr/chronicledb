@@ -276,6 +276,21 @@ func decodeConfigChange(b []byte) (kind byte, requestID, targetID, targetAddr st
 		if err != nil {
 			return
 		}
+		// MINIMUM VOTER INVARIANT (§12.2): every configuration a live
+		// AddLearner/PromoteToVoter/RemoveServer change can legitimately
+		// establish has at least one voter — Core.ProposeConfigChange's
+		// own check 6 refuses to ever construct one without this
+		// (ErrLastVoterRemoval). A decoded payload that nonetheless
+		// claims zero voters here is malformed, never a valid
+		// zero-voter establishment — found by FuzzDecodeEntryConfig,
+		// which otherwise returned establishes=true for it with no
+		// error, exactly the "silent misinterpretation" NO SILENT
+		// FORMAT MISINTERPRETATION forbids.
+		if len(cfg.Voters) == 0 {
+			cfg = Configuration{}
+			err = fmt.Errorf("%w: establishing configuration has zero voters", ErrMalformedConfigChange)
+			return
+		}
 		establishes = true
 	case membershipKindVoided:
 		if len(cfgB) != 0 || len(reqIDB) != 0 || len(targetIDB) != 0 || len(targetAddrB) != 0 {
