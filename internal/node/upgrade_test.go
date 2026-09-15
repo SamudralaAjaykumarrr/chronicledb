@@ -4,6 +4,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"sort"
+	"strings"
 	"testing"
 	"time"
 
@@ -28,12 +30,7 @@ func TestUpgradePrecheckAndFinalize_RealCluster(t *testing.T) {
 	// Every node runs this same binary, so once heartbeats have made a
 	// round trip, precheck should converge to Ready — polled, not
 	// slept-for, since heartbeat timing is not this test's concern.
-	awaitCondition(t, 5*time.Second, "precheck reports Ready", func() bool {
-		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
-		defer cancel()
-		res, err := leader.UpgradePrecheck(ctx)
-		return err == nil && res.Ready && !res.AlreadyFinalized
-	})
+	awaitPrecheckReady(t, leader, "every node runs this same binary and all are reachable")
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
@@ -109,12 +106,7 @@ func TestFinalizeUpgrade_RestartPersistsGeneration(t *testing.T) {
 	leaderID := tc.awaitLeader(5 * time.Second)
 	leader := tc.node(leaderID)
 
-	awaitCondition(t, 5*time.Second, "precheck reports Ready", func() bool {
-		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
-		defer cancel()
-		res, err := leader.UpgradePrecheck(ctx)
-		return err == nil && res.Ready
-	})
+	awaitPrecheckReady(t, leader, "every node runs this same binary and all are reachable")
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
@@ -144,6 +136,99 @@ func TestFinalizeUpgrade_RestartPersistsGeneration(t *testing.T) {
 	awaitCondition(t, 5*time.Second, "restarted node recovers ClusterGeneration=max from local durable state", func() bool {
 		return restarted.Status().ClusterGeneration == version.MaxSupportedGeneration
 	})
+}
+
+// describePrecheckPeers renders a PrecheckResult's per-peer
+// Known/Generation view for a failure message, so a genuine
+// failure-to-become-ready names the peer responsible instead of only
+// reporting that a deadline passed.
+func describePrecheckPeers(res PrecheckResult) string {
+	ids := make([]string, 0, len(res.Peers))
+	for id := range res.Peers {
+		ids = append(ids, id)
+	}
+	sort.Strings(ids)
+	var b strings.Builder
+	fmt.Fprintf(&b, "target=%d local=%d peers=[", res.TargetGeneration, res.LocalClusterGeneration)
+	for i, id := range ids {
+		if i > 0 {
+			b.WriteString(" ")
+		}
+		info := res.Peers[id]
+		if info.Known {
+			fmt.Fprintf(&b, "%s{gen=%d role=%s}", id, info.Generation, info.Role)
+		} else {
+			fmt.Fprintf(&b, "%s{UNKNOWN role=%s}", id, info.Role)
+		}
+	}
+	b.WriteString("]")
+	return b.String()
+}
+
+// precheckNow runs one UpgradePrecheck against leader. UpgradePrecheck
+// dispatches through Node.run's event loop, so its answer is serialized
+// against every other event-loop operation rather than read from cached
+// state.
+func precheckNow(t *testing.T, leader *Node) PrecheckResult {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	res, err := leader.UpgradePrecheck(ctx)
+	if err != nil {
+		t.Fatalf("UpgradePrecheck: %v", err)
+	}
+	return res
+}
+
+// awaitPrecheckReady polls until leader's precheck reports Ready, and
+// names the peer that never became ready if it does not.
+//
+// What is actually being waited for is narrow and worth stating,
+// because getting it wrong produced a real -race flake in this package:
+// Ready requires the leader to have recorded a compatibility generation
+// for every voter peer, and Node.recordPeerGeneration only ever learns
+// one from a raft.Message this leader RECEIVES. A peer the leader has
+// never heard from is Known=false, and UpgradePrecheck deliberately has
+// no recency requirement in the other direction either — once recorded,
+// a generation is never un-recorded.
+//
+// Both halves matter for any test that isolates a node:
+//   - isolate a peer BEFORE the leader has received anything from it and
+//     Ready is false PERMANENTLY, not slowly. No test deadline fixes
+//     that, and raising one only converts a deterministic ordering bug
+//     into a slower flake. Call this helper before isolating.
+//   - isolate a peer AFTER Ready holds and Ready keeps holding
+//     immediately, with no polling, because nothing un-records it. Use
+//     requirePrecheckReadyNow for that assertion.
+//
+// The bound stays hard: this never retries forever and never sleeps in
+// place of a condition.
+func awaitPrecheckReady(t *testing.T, leader *Node, why string) {
+	t.Helper()
+	var last PrecheckResult
+	deadline := time.Now().Add(10 * time.Second)
+	for time.Now().Before(deadline) {
+		last = precheckNow(t, leader)
+		if last.Ready && !last.AlreadyFinalized {
+			return
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	t.Fatalf("precheck never reported Ready within 10s (%s): %s", why, describePrecheckPeers(last))
+}
+
+// requirePrecheckReadyNow asserts Ready on a single, immediate precheck
+// — no polling. Used after isolating a peer whose generation the leader
+// has already recorded: "Ready survives isolation" is a statement about
+// PeerGenerationInfo having no recency requirement, so it must hold at
+// once. Polling here would let a genuine regression pass by waiting for
+// some unrelated later event.
+func requirePrecheckReadyNow(t *testing.T, leader *Node, why string) {
+	t.Helper()
+	res := precheckNow(t, leader)
+	if !res.Ready {
+		t.Fatalf("precheck must be Ready immediately (%s): %s", why, describePrecheckPeers(res))
+	}
 }
 
 // finalizeToMax repeatedly calls FinalizeUpgrade against leader until it
@@ -191,13 +276,19 @@ func TestFinalizeUpgrade_FollowerAdoptsGenerationViaSnapshotInstall(t *testing.T
 	leaderID := tc.awaitLeader(5 * time.Second)
 	leader := tc.node(leaderID)
 
+	// Wait for Ready BEFORE isolating anything. Ready means the leader
+	// has recorded a generation for every voter peer, and a generation
+	// is only ever learned from a message this leader RECEIVES — so
+	// isolating a peer first can permanently strand it at Known=false
+	// and make this wait unsatisfiable rather than merely slow (see
+	// awaitPrecheckReady's doc comment; that ordering was a real -race
+	// flake here).
+	awaitPrecheckReady(t, leader, "before isolating any follower")
+
 	// Isolate the follower BEFORE finalize is ever proposed, so it has
 	// no way to ever learn the finalized generation via live replication
 	// (applyControlEntry) at all — the installed snapshot below must be
-	// the only path. (Precheck can still see this follower as
-	// Known/ready: it exchanged RequestVote traffic with the leader
-	// during the bootstrap election above, and PeerGenerationInfo has no
-	// recency requirement — see UpgradePrecheck's own doc comment.)
+	// the only path.
 	var follower raft.NodeID
 	for _, id := range tc.ids {
 		if id != leaderID {
@@ -207,12 +298,13 @@ func TestFinalizeUpgrade_FollowerAdoptsGenerationViaSnapshotInstall(t *testing.T
 	}
 	tc.isolate(follower)
 
-	awaitCondition(t, 5*time.Second, "precheck reports Ready despite the isolated follower", func() bool {
-		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
-		defer cancel()
-		res, err := leader.UpgradePrecheck(ctx)
-		return err == nil && res.Ready
-	})
+	// Precheck still sees the now-unreachable follower as Known/ready,
+	// and sees it IMMEDIATELY: PeerGenerationInfo has no recency
+	// requirement, so nothing un-records a generation already recorded
+	// (see UpgradePrecheck's own doc comment). Asserted without polling
+	// precisely so a regression in that property fails here rather than
+	// being waited out.
+	requirePrecheckReadyNow(t, leader, "an isolated peer's already-recorded generation must not be un-recorded")
 	{
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
@@ -263,4 +355,91 @@ func TestFinalizeUpgrade_FollowerAdoptsGenerationViaSnapshotInstall(t *testing.T
 	if got := fnode.walog.Metadata().ClusterGeneration; got != version.MaxSupportedGeneration {
 		t.Fatalf("follower's WAL metadata ClusterGeneration after snapshot catch-up = %d, want %d — handleInstallSnapshot must durably adopt the installed snapshot's own cluster generation", got, version.MaxSupportedGeneration)
 	}
+}
+
+// TestUpgradePrecheckPeerGenerationIsLearnedOnlyFromReceivedMessages
+// pins the two facts awaitPrecheckReady/requirePrecheckReadyNow depend
+// on, so that a change to either (say, adding a recency expiry to
+// PeerGenerationInfo, or inferring a generation from something other
+// than a received message) fails here loudly instead of resurfacing as
+// an intermittent -race flake in whichever test happens to isolate a
+// node at the wrong moment.
+//
+// Both halves are asserted deterministically, with no reliance on how
+// long anything takes.
+func TestUpgradePrecheckPeerGenerationIsLearnedOnlyFromReceivedMessages(t *testing.T) {
+	t.Run("a peer the leader has never received a message from stays Unknown", func(t *testing.T) {
+		tc := newTestCluster(t, 3)
+		// Isolated before any election completes. A three-node cluster
+		// elects on two votes, so n1/n2 still form a leader and keep
+		// replicating to each other without ever hearing from n3.
+		tc.isolate("n3")
+
+		var leader *Node
+		awaitCondition(t, 10*time.Second, "a leader emerges among the two reachable nodes", func() bool {
+			for _, id := range []raft.NodeID{"n1", "n2"} {
+				if tc.node(id).Status().Role == raft.Leader {
+					leader = tc.node(id)
+					return true
+				}
+			}
+			return false
+		})
+
+		// A committed proposal proves full replication rounds have
+		// completed between the reachable nodes: if a peer's generation
+		// were learnable from anything other than a message received
+		// from that peer, n3's would be known by now.
+		outcome, err := propose(t, leader, cmd("gen-probe", 1, 0, "k", "v"), 5*time.Second)
+		if err != nil || outcome.Status != fsm.StatusCommitted {
+			t.Fatalf("Propose: outcome=%+v err=%v", outcome, err)
+		}
+
+		res := precheckNow(t, leader)
+		if info, ok := res.Peers["n3"]; !ok || info.Known {
+			t.Fatalf("n3 must be present and Known=false: %s", describePrecheckPeers(res))
+		}
+		if res.Ready {
+			t.Fatalf("precheck must not be Ready while a voter peer's capability is unknown and unreachable: %s", describePrecheckPeers(res))
+		}
+		// This state is permanent, not slow — which is why every test
+		// that isolates a node must reach Ready BEFORE doing so. The
+		// reachable peer is Known, isolating the assertion to n3.
+		if info, ok := res.Peers[string(leaderPeerOf(t, tc, leader))]; !ok || !info.Known {
+			t.Fatalf("the reachable peer must be Known: %s", describePrecheckPeers(res))
+		}
+	})
+
+	t.Run("an already-recorded generation survives that peer's isolation", func(t *testing.T) {
+		tc := newTestCluster(t, 3)
+		leaderID := tc.awaitLeader(5 * time.Second)
+		leader := tc.node(leaderID)
+		awaitPrecheckReady(t, leader, "all nodes reachable")
+
+		var follower raft.NodeID
+		for _, id := range tc.ids {
+			if id != leaderID {
+				follower = id
+				break
+			}
+		}
+		tc.isolate(follower)
+
+		// Immediately, with no polling: PeerGenerationInfo has no
+		// recency requirement, so isolation cannot un-record it.
+		requirePrecheckReadyNow(t, leader, "isolation must not un-record a generation")
+	})
+}
+
+// leaderPeerOf returns the one node that is neither leader nor the
+// deliberately-isolated "n3", for the reachable-peer assertion above.
+func leaderPeerOf(t *testing.T, tc *testCluster, leader *Node) raft.NodeID {
+	t.Helper()
+	for _, id := range tc.ids {
+		if id != leader.cfg.ID && id != "n3" {
+			return id
+		}
+	}
+	t.Fatal("no reachable peer found")
+	return ""
 }

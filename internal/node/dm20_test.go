@@ -48,16 +48,21 @@ func runDM20FinalizationBoundarySchedule(t *testing.T, learnerID raft.NodeID) (t
 		}
 	}
 
+	// Ready BEFORE isolating F, not after: Ready requires the leader to
+	// have recorded a generation for every voter peer, and a generation
+	// is only ever learned from a message this leader RECEIVES, so
+	// isolating F first can strand it at Known=false permanently rather
+	// than briefly (see awaitPrecheckReady's doc comment; that ordering
+	// was a real -race flake here). Isolating afterwards does not
+	// un-record it — PeerGenerationInfo has no recency requirement —
+	// which is exactly what lets this schedule finalize while F is away.
+	awaitPrecheckReady(t, leader, "before isolating F")
+
 	tc.isolate(fID)
+	requirePrecheckReadyNow(t, leader, "F's already-recorded generation must survive its isolation")
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	awaitCondition(t, 5*time.Second, "precheck reports Ready", func() bool {
-		c, cancel := context.WithTimeout(context.Background(), time.Second)
-		defer cancel()
-		res, err := leader.UpgradePrecheck(c)
-		return err == nil && res.Ready
-	})
 	finalizeToMax(t, leader, ctx)
 	awaitCondition(t, 5*time.Second, "the non-isolated follower converges on max generation", func() bool {
 		return tc.node(other).Status().ClusterGeneration == leader.Status().MaxSupportedGeneration

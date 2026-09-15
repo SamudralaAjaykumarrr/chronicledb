@@ -20,12 +20,7 @@ func mustFinalizeToMax(t *testing.T, tc *testCluster, leader *Node) {
 	t.Helper()
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	awaitCondition(t, 5*time.Second, "precheck reports Ready", func() bool {
-		c, cancel := context.WithTimeout(context.Background(), time.Second)
-		defer cancel()
-		res, err := leader.UpgradePrecheck(c)
-		return err == nil && res.Ready
-	})
+	awaitPrecheckReady(t, leader, "every node runs this same binary and all are reachable")
 	finalizeToMax(t, leader, ctx)
 	for _, id := range tc.ids {
 		id := id
