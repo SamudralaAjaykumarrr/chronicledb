@@ -60,6 +60,16 @@ work as of this entry.
   branch and discard log down to a lower boundary, leaving
   `CommitIndex() > LastIndex()`. Found by DM-10's randomized combined
   fault schedule.
+- `internal/node.handleInstallSnapshot`'s driver-side `willAdvance`
+  predicate was not updated alongside that `CommitIndex` staleness
+  check, leaving the two halves of one contract disagreeing: for a
+  boundary strictly between `SnapshotIndex` and `CommitIndex` the
+  driver durably installed a snapshot `Core` then rejected, discarding
+  the committed WAL entries above that boundary, rolling the state
+  machine and `appliedIndex` back below `Core`'s own `CommitIndex` (so
+  they were never re-applied), and fail-stopping the node on the next
+  replicated entry. The driver now mirrors both halves of `Core`'s
+  check. Found by the `v0.5.0` final correctness review.
 - Three reply-driven continuation sites
   (`handleAppendEntriesResponse`'s success and conflict-repair
   branches, `handleInstallSnapshotResponse`) kept sending further

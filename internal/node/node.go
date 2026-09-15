@@ -1852,12 +1852,28 @@ func (n *Node) termAtApplied() raft.Term {
 //
 // Whether this snapshot actually advances anything is decided by
 // mirroring the exact condition under which Core.Step itself will
-// advance c.snapshotIndex (msg.Term >= c.currentTerm and
-// msg.LastIncludedIndex > c.snapshotIndex) — computed here from
-// Core's own read-only accessors, without calling Step — so the driver
-// never durably installs snapshot state that Core.Step would then go on
-// to reject as stale, which would otherwise desynchronize this
-// WALStorage's mirror from Core's own view of the log.
+// advance c.snapshotIndex (msg.Term >= c.currentTerm, and
+// msg.LastIncludedIndex above BOTH c.snapshotIndex and c.commitIndex —
+// see raft.Core.handleInstallSnapshotRequest's own staleness check) —
+// computed here from Core's own read-only accessors, without calling
+// Step — so the driver never durably installs snapshot state that
+// Core.Step would then go on to reject as stale, which would otherwise
+// desynchronize this WALStorage's mirror from Core's own view of the
+// log.
+//
+// The CommitIndex half of that condition is not optional and not
+// defensive: Core rejects a snapshot at or below CommitIndex precisely
+// because ordinary replication can already have carried this node past
+// that boundary (a duplicated or delayed InstallSnapshotRequest —
+// docs/failure-model.md's modeled message-duplication/delay class).
+// Mirroring only the SnapshotIndex half lets this driver durably
+// install such a snapshot anyway, which discards committed WAL entries
+// in (LastIncludedIndex, CommitIndex] via WALStorage.InstallSnapshot,
+// rolls n.fsmachine/n.appliedIndex back below Core's own CommitIndex —
+// so those entries are never re-applied, Core only ever surfaces
+// NEWLY committed entries — and then fail-stops this node on the next
+// replicated entry with a non-contiguous append. Any future change to
+// Core's staleness check must be mirrored here in the same change.
 func (n *Node) handleInstallSnapshot(msg raft.Message) {
 	snap, err := n.snapMgr.Install(msg.SnapshotData)
 	if err != nil {
@@ -1903,7 +1919,10 @@ func (n *Node) handleInstallSnapshot(msg raft.Message) {
 		}
 	}
 
-	willAdvance := msg.Term >= n.core.CurrentTerm() && raft.Index(snap.Meta.LastIncludedIndex) > n.core.SnapshotIndex()
+	lastIncluded := raft.Index(snap.Meta.LastIncludedIndex)
+	willAdvance := msg.Term >= n.core.CurrentTerm() &&
+		lastIncluded > n.core.SnapshotIndex() &&
+		lastIncluded > n.core.CommitIndex()
 	if willAdvance {
 		if err := n.storage.InstallSnapshot(raft.Index(snap.Meta.LastIncludedIndex)); err != nil {
 			n.fail(fmt.Errorf("node: installing snapshot at index %d: %w", snap.Meta.LastIncludedIndex, err))
