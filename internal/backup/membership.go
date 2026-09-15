@@ -50,6 +50,21 @@ var voidedConfigChangePayload = []byte{
 // is load-bearing, not decorative).
 var voidRestoredMembershipEntries = true
 
+// SetVoidRestoredMembershipEntriesForTest disables (or re-enables) part
+// 2 of §7.6's restore transform process-wide — mirroring
+// raft.Core.SetSkipP1GateForTest's pattern for the same purpose: letting
+// a test outside this package (dynamic-membership plan §15 DM-21's
+// negative control, exercised end to end against a real restored
+// cluster in internal/node) prove the transform is load-bearing rather
+// than decorative. Test-only; never called from production code, and
+// every caller must restore the default via the returned func before
+// returning.
+func SetVoidRestoredMembershipEntriesForTest(void bool) (restore func()) {
+	prev := voidRestoredMembershipEntries
+	voidRestoredMembershipEntries = void
+	return func() { voidRestoredMembershipEntries = prev }
+}
+
 // stripSnapshotConfiguration implements §7.6 part 1: a staged snapshot
 // carries no configuration at all, regardless of what the source
 // carried. A v1 source snapshot already decodes with
