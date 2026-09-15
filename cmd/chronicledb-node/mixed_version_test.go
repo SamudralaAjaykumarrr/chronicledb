@@ -59,7 +59,24 @@ func buildBinaryAtRef(t *testing.T, ref string) string {
 	})
 
 	bin := worktreeDir + "/chronicledb-node-old"
-	build := exec.Command("go", "build", "-o", bin, ".")
+	// -buildvcs=false: go build's automatic VCS stamping determines its
+	// repository root by walking up from the package directory looking
+	// for *any* ".git" entry, not by trusting worktreeDir — so it can
+	// walk straight past this linked worktree's own ".git" file and
+	// stop at an unrelated, possibly invalid ".git" directory further
+	// up the same filesystem (e.g. a stray leftover directly under the
+	// OS temp root t.TempDir() resolves under), then run `git status`
+	// with that wrong directory as its cwd and fail with "error
+	// obtaining VCS status: exit status 128" — reproduced independently
+	// by pointing GOROOT's own git wrapper at exactly that directory.
+	// VCS stamping was never load-bearing here: this binary's only job
+	// is to behave like the real ref's source at runtime, which
+	// building from a real detached worktree checkout already
+	// guarantees regardless of what (if anything) gets embedded in its
+	// own debug.ReadBuildInfo — no test here or in this package inspects
+	// that metadata. Disabling it removes a real, environment-dependent
+	// failure mode instead of only working around today's symptom.
+	build := exec.Command("go", "build", "-buildvcs=false", "-o", bin, ".")
 	build.Dir = worktreeDir + "/cmd/chronicledb-node"
 	var buildErr bytes.Buffer
 	build.Stderr = &buildErr
