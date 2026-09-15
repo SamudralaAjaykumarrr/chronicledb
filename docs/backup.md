@@ -322,6 +322,85 @@ alternatives-considered analysis):
 3. **`-restore-until` accepts a log index only, never a timestamp**
    (§8).
 
+## 10a. Membership bootstrap on restore (`v0.5.0`, resolved)
+
+`docs/dynamic-membership-plan.md` §7.6 has the full design and proof.
+Summary: **restoring a backup and bootstrapping cluster membership are
+separate concerns**, and `-restore-from` never resurrects the source
+cluster's runtime membership — it re-bootstraps `Configuration`
+entirely from the operator's `-cluster`/`-peers` flags supplied at
+restore time, exactly the same flags that seed a brand-new cluster.
+This is not new policy: §3's `clusterId` row above already established
+that cluster *identity* is diagnostic-only and never validated against
+a restore target; this extends the identical reasoning to cluster
+*membership*, which is the same kind of fact (a property of the
+deployment, not of the data).
+
+Why this needs its own mechanism at all: once a snapshot can carry a
+`Configuration` (`docs/snapshots.md` §11), and durable configuration
+already overrides operator flags on every restart past the first
+(`docs/dynamic-membership-plan.md` §1.8), the two rules compose into a
+silent failure unless restore explicitly breaks the chain — every
+restored node would otherwise find its own ID absent from the source
+cluster's (non-empty) configuration, conclude it has been removed, and
+never elect a leader, in precisely the disaster-recovery scenario this
+feature exists for.
+
+**The rule acts on two separate durable carriers**, because a restored
+data directory has two: the staged **snapshot** (`buildStaging`
+re-encodes it with `Meta.HasConfiguration` cleared and
+`Meta.Configuration` zeroed — a v1 source snapshot already satisfies
+this and needs no transform) and the staged **WAL suffix** (any
+`EntryConfig` entry copied from the source is rewritten, in place, into
+the "voided" kind — the same index and term, so every log-matching
+relationship and the snapshot-boundary relationship are unchanged, only
+the embedded `Configuration` is discarded). Acting on the snapshot
+alone is not sufficient: a source cluster that reconfigured after its
+last snapshot has that change sitting in the WAL suffix the backup also
+copies, and `ConfigAt`'s log scan finds it before it ever consults the
+snapshot boundary.
+
+The voiding transform is applied **only** on the restore path
+(`buildStaging`/`Restore`), never by `Export` — a backup must retain
+the source's own recoverable membership history unchanged, so a later
+restore of a source-identity backup (same node IDs, no replacement
+hardware) still has real membership to reconstruct from.
+
+**The one scoped exception to "restored application state is exact."**
+Voiding an `EntryConfig` entry discards the source's membership
+`RequestID -> Outcome` record for any membership change not yet
+captured in the source's last snapshot — those `RequestID`s name
+operations against a cluster that no longer exists, targeting nodes
+that are not members of the restored one, and voiding them is exactly
+what must happen. Membership outcome rows already captured *inside*
+the restored snapshot's FSM state are untouched and restore byte-for-
+byte like any other FSM state. Every non-membership `RequestID`
+outcome, every MVCC version, and the cluster generation remain exact
+and byte-identical — `BACKUP INTEGRITY`/`BACKUP CONSISTENCY` are
+unchanged in both statement and mechanism.
+
+**Decommission runbook note.** See
+[`docs/membership.md`](membership.md) for the operator-facing
+decommissioning procedure (including certificate revocation) — a
+removed node's stale traffic is bounded by liveness rules at the Raft
+layer regardless (`docs/invariants.md`'s `MEMBERSHIP-SCOPED VOTE
+ACCEPTANCE`), so revocation is recommended defense in depth, not a
+safety requirement.
+
+**Proven against a genuine old-binary artifact, not a re-implemented
+encoder.** `cmd/chronicledb-node/membership_snapshot_backup_test.go`'s
+`TestRealMembership_BackupRestoreRealV040Binary` takes a real backup
+with the actual, previously-released `v0.4.0` binary (built from a
+`git worktree` checkout, the same technique used elsewhere in this
+suite) and restores it successfully under the current binary, with the
+resulting configuration coming entirely from the restore's own
+operator-supplied flags. The same file's
+`TestRealMembership_BackupRestoreNewIdentityWithoutSnapshotFirst`
+covers the WAL-suffix-only case (§10a above): a backup taken before any
+snapshot, so its membership entries live only in the WAL suffix, still
+restores cleanly onto a cluster with entirely different `NodeID`s/
+addresses.
+
 ## 11. Related documents
 
 - [`docs/enterprise-v1-plan.md`](enterprise-v1-plan.md) §6 — the

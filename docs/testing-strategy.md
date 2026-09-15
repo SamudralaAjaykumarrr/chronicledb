@@ -771,3 +771,69 @@ decoder Phase 10's own brief specifically names.
 No new test category was needed beyond §1's existing table — Phase
 10's contribution is depth and independence of oracle, not a new kind
 of test.
+
+## 11. `v0.5.0`: the negative-control discipline
+
+Dynamic Membership (`docs/dynamic-membership-plan.md`) introduced a
+reusable discipline worth naming explicitly, since it is not specific
+to that phase: **a regression test for a safety-critical gate is
+incomplete without a negative control proving the test can actually
+fail** — i.e., re-running the identical scenario with the mechanism
+under test disabled via a test-only hook, and asserting the harness's
+own oracle *detects* the resulting violation. A test that would pass
+identically whether or not the mechanism it claims to protect exists is
+not exercising that mechanism at all; it is only exercising the happy
+path.
+
+Concretely: `raft.Core.SetSkipP1GateForTest` disables the P1 leader-
+term-commit gate (`docs/dynamic-membership-plan.md` §2.2a) for exactly
+this purpose — proving that, with it disabled, the deterministic
+harness's `committedOracle` (§6.5's reference model) detects the two-
+committed-configurations-at-one-index divergence P1 exists to prevent,
+rather than merely asserting "the mechanism, left enabled, behaves."
+The hook is implemented and its call site is wired; the negative-
+control scenario itself — `internal/fault`'s
+`TestDM12Step7_P1DisabledProducesADoubleCommitTheOracleDetects`,
+reproducing `docs/dynamic-membership-plan.md` §2.3's exact "branch
+confinement fails without P1" counterexample end to end and asserting
+`committedOracle` detects the resulting divergence — is implemented
+and passing.
+
+Apply the same discipline to any future safety gate: build the
+disable-hook and the oracle-detects-the-violation assertion in the same
+change that adds the gate's own positive test, not as a follow-up.
+
+## 12. `v0.5.0`: substituting for a proof surface that does not exist
+
+`docs/dynamic-membership-plan.md` §16 specifies a background goroutine
+issuing real SQL `SELECT`s against `cmd/chronicledb-node`'s real OS
+processes throughout the real-process membership suite. `cmd/
+chronicledb-node` has no SQL wire protocol at all — `docs/sql.md` §8 and
+`examples/sql-basics/main.go` are explicit that SQL is a Go-library-
+only surface by design, not an oversight this phase happens to expose.
+Building a wire protocol solely to satisfy one test's literal wording
+would be exactly the kind of unscoped production change this project's
+phase discipline (`docs/enterprise-v1-plan.md`) exists to prevent.
+
+`internal/sql/dynamic_membership_test.go`
+(`TestDynamicMembershipWithConcurrentSQLReads`) substitutes the
+equivalent proof at the tier this package's own "Distributed Evidence"
+tests already use: real TCP (`internal/transport`), real disk
+(`internal/wal`), unmodified `internal/node.Node`/`internal/raft.Core`,
+one OS process. A background reader issues real SQL `SELECT`s — each a
+real `BeginReadIndex` call — against whichever node currently holds
+leadership while a full add/promote/remove/self-removal sequence and a
+real crash-driven failover run concurrently, asserting every read
+either succeeds or fails with one of the documented clean error classes
+(`NotLeaderError`, `ErrLeadershipLost`, `ErrNodeStopped` from this
+tier's own crash mechanism, `ErrNodeRemoved` from the append-time-
+effective self-removal gate) — never a bare context deadline expiry.
+This is the accurate description of what §16's own acceptance criteria
+require and what this codebase can actually exercise; it is a
+substitution of proof tier, not a reduction of what is proven. §16's
+own real-process suite in `cmd/chronicledb-node`
+(`docs/dynamic-membership-plan.md` §16, §19 gate 4) covers everything
+else that section specifies — background `/propose` writes, the
+post-election window, snapshot-in-flight, both restore steps, the
+mixed-binary variant — against genuine OS processes; only the SQL
+reader moves to this package's tier, for the structural reason above.

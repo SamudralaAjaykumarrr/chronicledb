@@ -4,6 +4,112 @@ All notable changes to ChronicleDB are documented here. Format loosely
 follows [Keep a Changelog](https://keepachangelog.com/); versioning
 follows [`docs/versioning.md`](docs/versioning.md) (SemVer, pre-1.0).
 
+## [Unreleased] — `v0.5.0` Dynamic Membership (in progress)
+
+Dynamic Membership — the fourth phase of the
+`docs/enterprise-v1-plan.md` Enterprise V1 roadmap (§8, target release
+`v0.5.0`). **Not yet tagged or released.** See
+`docs/dynamic-membership-plan.md` and
+`docs/adr/0018-dynamic-membership-architecture.md` for the complete
+design, `docs/membership.md` for the operator runbook, and that ADR's
+"Testing and Proof Obligations" section for exactly which parts of the
+plan's full test matrix are implemented versus documented remaining
+work as of this entry.
+
+### Added
+
+- Runtime cluster membership changes with no downtime: add a learner,
+  promote a caught-up learner to voter, remove a voter or learner
+  (including the leader removing itself) — `internal/raft.Configuration`/
+  `ProposeConfigChange`, four admin-gated, audited HTTP endpoints
+  (`/admin/membership/add`/`promote`/`remove`/`status`).
+- Single-server, serialized configuration changes, append-time-
+  effective, gated by three proposal-time premises (current-term
+  commit, inherited-suffix floor, local serialization) with a formal
+  quorum-intersection/branch-confinement safety proof.
+- `internal/snapshot.FormatVersion` 1 -> 2 (a bounded
+  `[MinReadVersion, FormatVersion]` read range replaces strict
+  equality); `internal/version.MaxSupportedGeneration` 1 -> 2.
+- `internal/backup` restore-side membership-isolation transform: a
+  restored cluster's `Configuration` always comes from the operator's
+  `-cluster`/`-peers` flags, never from the source cluster, on both the
+  staged snapshot and the staged WAL suffix.
+- Two narrow Raft-level liveness rules bounding a removed node's
+  disruption (membership-scoped vote acceptance; leader-contact
+  suppression), replacing no existing mechanism.
+- New `docs/membership.md` operator runbook, `ADR-0018`, and twelve new
+  `docs/invariants.md` entries.
+
+### Fixed
+
+- `internal/wal.SetClusterGeneration` rejected any request at or below
+  the current durable generation as an error; correct only for a fresh
+  commit, this broke restart replay of more than one historical
+  generation transition, unreachable before this phase's own
+  `MaxSupportedGeneration` bump past 1. Now a silent no-op.
+- `internal/raft.Core`'s follower-side four-shape defense-in-depth
+  re-check produced a false-positive fail-closed panic on a brand-new
+  node's first catch-up batch when that batch contains, among older
+  entries, the very `EntryConfig` entry that adds the node itself.
+- A nil-map panic when the acknowledgement completing a self-removing
+  leader's new quorum arrives mid-call.
+- `handleInstallSnapshotRequest`'s staleness check compared only
+  against `SnapshotIndex`, never `CommitIndex`; a stale or duplicated
+  `InstallSnapshotRequest` delivered after ordinary replication had
+  already advanced `CommitIndex` past it could still take the install
+  branch and discard log down to a lower boundary, leaving
+  `CommitIndex() > LastIndex()`. Found by DM-10's randomized combined
+  fault schedule.
+- Three reply-driven continuation sites
+  (`handleAppendEntriesResponse`'s success and conflict-repair
+  branches, `handleInstallSnapshotResponse`) kept sending further
+  entries to a removed member based on stale `nextIndex`/`matchIndex`
+  bookkeeping alone, without checking current membership — even though
+  the two proactive fan-out sites already excluded it correctly. Found
+  by DM-10.
+- `decodeConfigChange` returned `establishes=true` with no error for a
+  crafted `EntryConfig` payload carrying an empty voter set, a gap
+  `Core.ProposeConfigChange`'s own construction-time check never
+  covered on the decode path. Found by `FuzzDecodeEntryConfig`.
+- `/admin/upgrade/finalize`'s HTTP response unconditionally reported
+  the newly reached generation as `MaxSupportedGeneration`, rather than
+  the generation it actually targeted (`current+1`); exposed once this
+  phase's own generation bump made a single finalize call no longer
+  sufficient to reach the binary's max.
+- `-cluster` was mandatory, leaving no way to start a fresh node with a
+  genuinely empty `Configuration` to join an existing cluster by
+  replication rather than by CLI-declared bootstrap.
+- A membership call (`add`/`promote`/`remove`) that lost leadership
+  before its entry committed fell through to a generic `500` instead of
+  the same retryable `409` already used for `NotLeaderError`.
+- CI's real-binary tests build an old release's binary from a `git
+  worktree`; `go build`'s automatic VCS stamping can walk past the
+  worktree's own `.git` file to an unrelated `.git` directory further
+  up the filesystem and fail. Fixed by disabling VCS stamping
+  (`-buildvcs=false`) for that build, which was never load-bearing for
+  the resulting binary's behavior. Test-only; no production code
+  changed.
+
+### Known limitations at this point
+
+- Exactly one membership change may be outstanding at a time — no
+  joint consensus, no concurrent multi-node reconfiguration. By design
+  (`ADR-0018`), not a target for a future release at this project's
+  scale.
+- No automatic or failure-triggered membership changes — every add,
+  promote, and remove is operator/admin-triggered.
+- Beyond the existing `v0.2.0` mTLS certificate-to-`NodeID` binding, no
+  additional transport-layer check that a connection's certificate
+  identity matches the address's *currently configured* membership
+  role is implemented in this release (`docs/dynamic-membership-plan.md`
+  §13.2 describes such a check; it was not built). The two Raft-level
+  liveness rules and certificate revocation remain the operative
+  defenses (`docs/membership.md` §7).
+- A removed node does not self-terminate, self-wipe, or self-report as
+  retired; decommissioning it (stopping the process, wiping or
+  archiving its data directory, revoking its certificate) is an
+  operator procedure — `docs/membership.md` §7.
+
 ## [0.4.0] - 2026-09-10
 
 Compatibility / Rolling Upgrades — the third phase of the

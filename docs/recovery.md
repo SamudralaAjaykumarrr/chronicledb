@@ -67,6 +67,18 @@ invented committed state.
     unconditional; recovery does not attempt to route around it.
  9. Restore Raft persistent metadata (currentTerm, votedFor) from the
     most recent HardState record (docs/raft.md §5).
+ 9a. (`v0.5.0`+) Reconstruct the active cluster `Configuration` — the
+    single, sole mechanism for this, on every restart with no
+    exception: `ConfigAt(lastIndex())`, evaluated in one fixed priority
+    order over exactly what steps 4-9 above already established (the
+    newest configuration-establishing log entry retained, else the
+    snapshot's own configuration when step 4 recorded one, else the
+    operator's `-cluster`/`-peers` bootstrap flags, else the zero
+    configuration for a node that has never joined anything — see
+    `docs/dynamic-membership-plan.md` §6.2/§6.3 for the full algorithm
+    and its four invariants). There is no recovery-specific
+    configuration algorithm distinct from the one every other call site
+    (append-time activation, snapshot creation, compaction) uses.
 10. Determine the committed boundary correctly (§2 below) — never by
     assuming every entry present in the log is committed.
 11. Apply only legitimate committed history: replay LogEntry records

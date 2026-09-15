@@ -14,10 +14,18 @@ and the other document has a bug.
 - **One logical shard.** The entire keyspace is owned by a single Raft
   group. There is no partitioning, routing, or cross-shard
   coordination in V1.
-- **A static three-node Raft cluster.** Membership is fixed at cluster
-  creation. Dynamic reconfiguration (adding/removing voters) is
-  deferred — see [`docs/non-goals.md`](non-goals.md) and
-  [ADR-0001](adr/0001-v1-single-shard-static-cluster-scope.md).
+- **A Raft cluster whose voter/learner membership can change at
+  runtime** (`v0.5.0`, Dynamic Membership — see
+  [`docs/dynamic-membership-plan.md`](dynamic-membership-plan.md) and
+  [`ADR-0018`](adr/0018-dynamic-membership-architecture.md)), targeting
+  three-to-seven voters plus any number of learners, one change at a
+  time. Membership itself is Raft-consensus-level state (`internal/raft.
+  Configuration`), never application/FSM state — see that plan's §2.4.
+  What remains fixed, and out of scope, is the number of *shards*
+  (still exactly one, always) and joint-consensus-style *concurrent*
+  multi-node reconfiguration — see [`docs/non-goals.md`](non-goals.md)
+  and [ADR-0001](adr/0001-v1-single-shard-static-cluster-scope.md) for
+  the shard-count scope this phase does not touch.
 - **A single leader per term** accepts all writes and, in V1, all
   strong reads. Followers replicate the log and stand ready to become
   leader.
@@ -211,6 +219,18 @@ internal/metrics            Phase 9: two dependency-free diagnostic
 internal/benchutil           Phase 9: a latency-percentile recorder
                           used only by benchmarks/tests (docs/
                           benchmarks.md), never by production code.
+
+internal/backup              `v0.3.0`; modified by `v0.5.0` (Dynamic
+                          Membership, docs/dynamic-membership-plan.md
+                          §7.6): self-contained backup export/restore
+                          built on internal/snapshot and internal/wal's
+                          own encode/decode paths. Deliberately does not
+                          import internal/node or internal/raft — the
+                          `v0.5.0` restore-side membership-isolation
+                          transform matches on internal/raft's
+                          documented EntryConfig payload framing by
+                          value, pinned against drift by a cross-package
+                          test, rather than by importing that package.
 ```
 
 Dependency rules (enforced by review, and mechanically once packages

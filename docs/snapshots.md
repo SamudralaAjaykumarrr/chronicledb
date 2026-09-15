@@ -146,7 +146,9 @@ If the process crashes while writing the temporary snapshot file:
 
 Before a snapshot is used for recovery or installed on a follower:
 
-1. Its format version must be recognized.
+1. Its format version must be recognized — as of `v0.5.0`, "recognized"
+   is a bounded range (`[MinReadVersion, FormatVersion]`), not strict
+   equality; see §11.
 2. Its checksum must be verified over its full contents.
 3. Its `lastIncludedIndex`/`lastIncludedTerm` must be internally
    consistent with the rest of its own contents (e.g. the `RequestID`
@@ -270,3 +272,98 @@ coordinated snapshot, not competing sources of truth") paying off: because
 this package never independently encodes or interprets FSM content, a
 change entirely internal to `internal/fsm`'s own state format required
 zero changes here to remain correct.
+
+## 11. Phase `v0.5.0` (Dynamic Membership) implementation decision (resolved)
+
+Unlike `v0.4.0` above, this phase **does** change this package: the
+outer frame itself gains new content (the cluster's membership
+configuration effective at this snapshot's boundary), which is a
+Raft-level concept `internal/fsm` correctly has no business owning
+(`docs/dynamic-membership-plan.md` §2.4/§7.1). `FormatVersion` bumps
+`1` -> `2`; a new `MinReadVersion = 1` constant marks the oldest
+version this build still reads.
+
+**The outer frame, v2:**
+
+```
+magic(4B) version(1B)=2 lastIncludedIndex(8B) lastIncludedTerm(8B)
+  fsmStateLen(8B) fsmState(...)
+  hasConfig(1B) configLen(8B) config(configLen bytes)
+  crc32(4B)
+```
+
+`hasConfig`/`configLen` are always both present in a v2 frame (never
+omitted when the flag is clear) and are cross-checked on decode:
+`hasConfig == 0x01` requires `configLen > 0`; `hasConfig == 0x00`
+requires `configLen == 0`; any other `hasConfig` byte, or a
+`hasConfig`/`configLen` disagreement, is `ErrCorrupt` — this package's
+existing error for exactly this class of declared-length/bytes-present
+mismatch, not a new one. `Meta.HasConfiguration` is an explicit,
+durably-encoded bit — **never** inferred from `Meta.Configuration`
+being empty, which is a legitimate value (a snapshot boundary before
+this node ever joined anything) and a different statement entirely.
+
+**Version is now a bounded range, not strict equality (§5 point 1).** A
+version above `FormatVersion` or below `MinReadVersion` is
+`ErrUnsupportedVersion`, fail-closed, before any further byte is
+interpreted — the same invariant (`NO SILENT FORMAT MISINTERPRETATION`)
+as the strict-equality check it replaces, expressed as a range because
+a `v0.5.0` binary must still read its own pre-existing v1 snapshots
+(and any v1 backup) without a special case. `ADR-0017`'s own reasoning
+for *not* bumping the version for `v0.4.0` is superseded here, not
+contradicted — see that ADR's note.
+
+**Generation gating (`ROLLBACK BOUNDARY HONESTY`).** `Encode` takes the
+write-version as an explicit parameter — supplied by `internal/node`
+from its own durable cluster generation (`2` once finalized, `1`
+before) — rather than reading the package's own `FormatVersion`
+constant directly, so a pre-finalization snapshot is byte-identical to
+what `v0.4.0` itself would have produced, structurally, not merely by
+convention.
+
+**One consequence worth stating precisely, because it looks like an
+inconsistency and is not.** `raft.Core.ConfigAt`/`Compact` are
+deliberately generation-unaware: a locally-created snapshot boundary
+always carries a real configuration in `Core`'s own bookkeeping
+(`snapshotHasConfig = true`, unconditionally), even before generation 2.
+When `internal/node` writes that boundary at write-version 1
+(pre-finalization), the resulting *file* still decodes with
+`HasConfiguration == false` — the v1 format has no field for the flag
+at all. This divergence between "what Core believes in memory" and
+"what the durable file can represent" is benign by construction: before
+generation 2 no `EntryConfig` entry can exist anywhere
+(`docs/dynamic-membership-plan.md` §8.2), so `ConfigAt`'s
+`HasConfiguration`-gated step and its bootstrap-fallback step always
+agree on the identical effective `Configuration` value regardless of
+which path is taken — only the priority path differs, never the
+answer. `internal/node.handleInstallSnapshot`'s cross-check between an
+`InstallSnapshotRequest`'s carried `Configuration`/`HasConfiguration`
+pair and the installed file's own `Meta` is therefore enforced only
+when the installed file itself asserts a configuration
+(`Meta.HasConfiguration == true`) — exactly the case where the check is
+meaningful — never unconditionally.
+
+`internal/snapshot/membership_test.go` pins the v2 round-trip (including
+the `HasConfiguration`-false-vs-present-but-empty distinction), the
+`hasConfig`/`configLen` cross-check, the unsupported-version range, and
+that pre-finalization `v0.5.0` output is byte-identical to `v0.4.0`'s
+for the same `Meta`/FSM state.
+
+The compatibility boundary against a genuine old-binary artifact —
+rather than a re-implementation of the old encoder — is proven, but not
+via a static fixture checked into `internal/snapshot/testdata/`. Instead
+`cmd/chronicledb-node/mixed_version_membership_test.go`'s
+`TestMixedVersionMembership_RollThenAddPromoteRemoveRestart` starts a
+real 3-node cluster entirely on the actual, previously-released
+`v0.4.0` binary (built from a `git worktree` checkout, the same
+technique `mixed_version_test.go` already used for `v0.4.0`'s own
+release), drives enough writes to force every node to take a real,
+genuine `FormatVersion 1` snapshot, then rolls each node to the current
+binary one at a time and asserts each one starts successfully against
+its own pre-existing `v0.4.0` snapshot before the next is rolled. This
+is a stronger proof than a static fixture would have been — the
+snapshot is read by the real startup path of a live node, not only by
+`internal/snapshot.Decode` in isolation — at the cost of living in
+`cmd/chronicledb-node`'s test suite rather than this package's own.
+`docs/backup.md` §10a covers the equivalent real-`v0.4.0`-binary proof
+for backup/restore.

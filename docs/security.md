@@ -129,6 +129,10 @@ Three fixed roles; no dynamic grants database. `admin` implies every
 | `/admin/backup` | ✅ | ✅ | ❌ |
 | `/admin/upgrade/precheck` | ✅ | ❌ | ❌ |
 | `/admin/upgrade/finalize` | ✅ | ❌ | ❌ |
+| `/admin/membership/add` | ✅ | ❌ | ❌ |
+| `/admin/membership/promote` | ✅ | ❌ | ❌ |
+| `/admin/membership/remove` | ✅ | ❌ | ❌ |
+| `/admin/membership/status` | ✅ | ✅ | ✅ |
 
 `/fault` additionally requires the `-enable-fault-endpoint` flag; its
 route is never registered on the HTTP mux without it, regardless of
@@ -145,7 +149,12 @@ table mirrors). `/admin/upgrade/precheck` and `/admin/upgrade/finalize`
 and audited like every other mutating administrative action; restoring
 from a backup is a startup-time CLI flag (`-restore-from`), not an HTTP
 endpoint, so it has no row here — it is gated by filesystem/process
-access to the node, not by RBAC.
+access to the node, not by RBAC. `/admin/membership/add`/`promote`/
+`remove` (`docs/membership.md`, `docs/dynamic-membership-plan.md` §13)
+are `admin`-only for the identical reason as the upgrade endpoints —
+they change the cluster's consensus membership, not merely its data —
+while `/admin/membership/status` is pure observability and open to
+every role, mirroring `/status`.
 
 Every response to a failed authentication or authorization check is a
 fixed, generic body (`401 unauthorized` / `403 forbidden`) — never one

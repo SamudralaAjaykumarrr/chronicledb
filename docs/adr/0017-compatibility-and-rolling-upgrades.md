@@ -224,3 +224,25 @@ run that never opens `-datadir`/calls `node.Open`.
   `cmd/chronicledb-node/auth_test.go`'s HTTP-layer RBAC test both extend
   to the two new endpoints, admin-only, matching every other mutating
   administrative surface.
+
+## Superseded in part by `v0.5.0` (Dynamic Membership)
+
+`internal/snapshot.FormatVersion` was deliberately **not** bumped by
+this phase (see the Decision section above and `docs/snapshots.md`
+§10's "no code change to this package at all" resolution) — reasoned
+correctly at the time, because `v0.4.0` added no new *outer-frame*
+content, only an additive, conditionally-encoded field one layer down
+inside `internal/fsm`'s own opaque state blob. `v0.5.0` (Dynamic
+Membership) **does** add new outer-frame content — a cluster
+`Configuration` effective at the snapshot boundary, which is
+`internal/raft`/`Core`-level state `internal/fsm` correctly has no
+business owning (`docs/dynamic-membership-plan.md` §2.4/§7.1) — so
+`FormatVersion` bumps `1` -> `2` there, with a real version-aware
+decoder (`[MinReadVersion, FormatVersion]`, replacing strict equality)
+rather than the constant-bump-with-no-decoder-change this ADR's own
+Decision section warns is unsafe if ever attempted without one. This
+ADR's reasoning for *not* bumping in `v0.4.0` remains correct for
+`v0.4.0`; it does not generalize to "this format never needs a version
+bump," and `v0.5.0` is the phase that needed one. See
+[`ADR-0018`](0018-dynamic-membership-architecture.md) and
+`docs/snapshots.md` §11 for the full decision.

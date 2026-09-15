@@ -228,6 +228,42 @@ instead of this convenience flag).
   upgrades), a single maximum plus an always-0 minimum is the complete,
   exact representation of what any V1 binary ever needs to express.
 
+## 8a. Generation 2 (`v0.5.0`, Dynamic Membership)
+
+`MaxSupportedGeneration` bumps `1` -> `2` as part of implementing
+Dynamic Membership (`docs/dynamic-membership-plan.md` §8.1). Generation
+2 means: this binary understands `Entry.Type` and its typed entry-
+payload framing, `EntryConfig` entries including the `Voided` kind,
+`Message.Configuration`/`Message.HasConfiguration` on
+`MsgInstallSnapshotRequest`, and `snapshot.FormatVersion 2` including
+its `HasConfiguration` bit. No membership change (`AddLearner`/
+`PromoteToVoter`/`RemoveServer`) may be proposed, or applied, below
+this generation — enforced on **both** the leader (propose) and every
+replica (apply) side, so no replica's correctness depends on a remote
+node's code being right. The exact legality condition: a membership
+change may be proposed by leader `L` at time `t` iff the generation-2
+`SetClusterVersionCommand` is committed **and applied** in `L`'s own
+FSM at `t` — the committed generation, not the HTTP response from
+`/admin/upgrade/finalize`, is authoritative.
+
+**Learners never block finalization** (§8.2a): `PrecheckResult.Peers`
+reports every voter and learner (each tagged with a `Role`), but
+`Ready` — the value `FinalizeUpgrade` actually gates on — is computed
+over voters only. Letting a non-voting node veto a cluster-wide
+operation would be strictly worse than the "a learner's absence never
+blocks progress" property this project otherwise guarantees everywhere
+(`LEARNER NON-INTERFERENCE`). The residual risk — a learner left behind
+on an old binary, later promoted to voter — is closed at the
+*promotion* boundary instead: `/admin/membership/promote` refuses
+(`412`, reason `peer-generation-too-old`) if the target's last-known
+generation is below the cluster's committed generation, or unknown.
+
+Since `N/N+1`-only stepping is unchanged, a fresh cluster now needs
+**two** `/admin/upgrade/finalize` calls to reach generation 2 (0 -> 1,
+then 1 -> 2) — an operator or test driving finalize to "this binary's
+max" should call it repeatedly until it reports `ErrAlreadyFinalized`,
+not assume one call suffices.
+
 ## 9. Related documents
 
 [`docs/enterprise-v1-plan.md`](enterprise-v1-plan.md) §7 (the original

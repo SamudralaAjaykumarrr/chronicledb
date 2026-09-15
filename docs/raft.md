@@ -567,3 +567,106 @@ required no change: an asymmetric partition is entirely a transport-
 layer/message-delivery concern, exactly the kind of fault
 `docs/failure-model.md` §2.6 already documents Raft as designed to
 tolerate for liveness without affecting safety.
+
+## 12. Dynamic membership (`v0.5.0`)
+
+Full design and safety proof: `docs/dynamic-membership-plan.md`.
+Summary of the resolved decisions actually implemented, for readers of
+this document specifically:
+
+**Membership is Core-native state, never FSM state.** `Configuration`
+(`Voters []Member`, `Learners []Member`) replaces `Config.Peers`
+entirely; `Config.Bootstrap Configuration` is consulted only when a
+`Core` is constructed with no prior log entries and no snapshot
+configuration at all. Placing membership in `Core` rather than
+`internal/fsm` (unlike, say, `SetClusterVersionCommand`, which
+correctly *is* FSM-native) is load-bearing, not a style choice: the new
+configuration must govern quorum computation **before** the entry that
+introduces it commits, which only `Core` — not a post-commit `Apply`
+call — can provide.
+
+**Append-time-effective, single-server changes, serialized.** A
+membership change is one new log entry kind, `EntryConfig`
+(`Entry.Type`, a new field alongside the existing `Entry.Data`). The
+moment such an entry is appended — by a leader proposing it or a
+follower accepting it — that node's `activeConfig` switches to the
+entry's embedded `Configuration` immediately, before the entry commits;
+every subsequent quorum decision on that node (election, commit,
+replication fan-out) uses it. `Core.ProposeConfigChange` enforces three
+gates before ever creating an entry: **P1** (this leader has already
+committed an entry of its own current term — converged by the existing
+`proposeElectionNoOp`, now a documented safety dependency, not merely a
+ReadIndex liveness fix), **P2** (this leader's own inherited log tail,
+as of its election, has itself already committed), and **P3** (this
+leader has not itself already appended an uncommitted change). Exactly
+one of four shapes (AddLearner, PromoteToVoter, RemoveServer-voter,
+RemoveServer-learner) is accepted, checked on the leader before
+proposing and, as defense in depth, on every replica at accept time —
+except when a replica's own prior configuration is still the zero value
+(a never-joined node's first catch-up batch legitimately contains, among
+older entries, the very `EntryConfig` entry that adds it, and that node
+has no independent basis to validate the transition against).
+
+**`ConfigAt` is the sole configuration-reconstruction algorithm.**
+`Core.ConfigAt(i)` — pure, deterministic, reading only durable log/
+snapshot/bootstrap state — is used at every site that ever needs a
+configuration: append-time activation, accept-time activation and
+revert-on-truncate, construction/restart, leader initialization,
+snapshot creation, compaction, and status reporting. Two nodes with
+byte-identical durable state always agree, for every index, by
+construction — there is no second algorithm anywhere.
+
+**§2.7's two liveness rules — narrow, not a blanket filter.** A stray
+or removed node's disruption is bounded by exactly two rules, and only
+for `RequestVoteRequest`: **Rule 1** — a request from a sender that is
+not a Voter in the receiver's own `activeConfig` is dropped outright,
+and a node that is not itself a Voter in its own `activeConfig` never
+grants a vote or starts an election. **Rule 2** — a node that has heard
+from its current leader within the minimum election timeout ignores any
+`RequestVoteRequest`, including a higher-term one (the standard Raft
+§4.2.3 treatment of disruptive servers), implemented as one boolean,
+`Core.heardFromLeader`, set on an accepted leader `AppendEntries`/
+`InstallSnapshot` and cleared on `InputElectionTimeout` or step-down.
+`AppendEntriesRequest`/`MsgInstallSnapshotRequest`/every `*Response` are
+**never** filtered on a membership basis — a receiver's membership view
+is expected to be temporarily ahead of or behind the sender's during any
+valid transition, and filtering replication traffic would strand a
+legitimate member awaiting exactly the repair that traffic delivers.
+Note `Core` owns no clock and no tick counter for this: `internal/node`
+owns the election timer unchanged, and `heardFromLeader` composes with
+the existing `PauseTicksForTest` test-only election-clock freeze (while
+frozen, `heardFromLeader` never goes stale, so a node ignores every
+`RequestVoteRequest` for as long as the freeze lasts — intended, and
+something a test that freezes one node's clock while expecting another
+node's election to succeed must account for).
+
+**Self-removal excludes the leader from its own quorum, on every
+decision it makes — no exception.** The instant a self-removing
+`EntryConfig` entry is appended, `activeConfig` excludes the leader,
+and `advanceLeaderCommit`'s majority loop — which iterates
+`activeConfig.Voters` only — simply never counts that leader's own
+`matchIndex` again, including for the commit decision of the removal
+entry itself. The identical rule applies to `internal/node`'s ReadIndex
+quorum (`checkPendingReads`): a node's own implicit self-ack counts iff
+it is currently a Voter in its own `activeConfig`, read once per pass.
+The leader steps down to Follower the instant the removal entry
+*commits* (not merely appends), by the same `advanceLeaderCommit` call
+that observed the commit — `Core.maybeStepDownAfterSelfRemoval`. Two
+real bugs surfaced by real-process testing during implementation are
+worth recording here because they are easy to reintroduce: (1) a nil-map
+panic when the very acknowledgement that completes a self-removing
+leader's new majority arrives, because `advanceLeaderCommit`'s
+step-down nils `nextIndex`/`matchIndex` mid-call and the caller must
+check `role == Leader` before touching them again; (2) the "add a
+learner, then let it catch up in one batch that includes its own add
+entry" false-positive described above.
+
+See `docs/invariants.md`'s "Dynamic Membership invariants" section for
+the complete, individually-cited catalog (`LEADER-TERM CONFIGURATION
+GATE`, `CONFIGURATION BRANCH CONFINEMENT`, `SERIALIZED MEMBERSHIP
+CHANGE`, `QUORUM CONTINUITY`, `MEMBERSHIP RECOVERY DETERMINISM`,
+`RESTORE MEMBERSHIP ISOLATION`, `LEARNER NON-INTERFERENCE`,
+`MEMBERSHIP-SCOPED VOTE ACCEPTANCE`, `MINIMUM VOTER INVARIANT`,
+`SINGLE-SERVER TRANSITION SHAPE`, `MEMBERSHIP CHANGE GENERATION GATE`,
+`MEMBERSHIP REQUEST OUTCOME STABILITY`), and `docs/membership.md` for
+the operator-facing runbook.

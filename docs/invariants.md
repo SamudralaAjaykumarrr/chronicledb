@@ -876,3 +876,444 @@ leader failover while versions are mixed, continued traffic and a
 RequestID retry across that failover, final-node upgrade, finalize, a
 full-cluster restart, and every acknowledged RequestID's outcome
 verified on every node throughout.
+
+## Dynamic Membership invariants (`v0.5.0`, `docs/dynamic-membership-plan.md`)
+
+See [`docs/dynamic-membership-plan.md`](dynamic-membership-plan.md) for
+the full design and proofs, and
+[`ADR-0018`](adr/0018-dynamic-membership-architecture.md) for the
+architecture decision. These invariants govern
+`internal/raft.Configuration`/`Core.ConfigAt`/`ProposeConfigChange`,
+`internal/fsm`'s membership outcome table, `internal/snapshot`'s
+`FormatVersion 2`, `internal/backup`'s restore membership-isolation
+transform, and `internal/node`'s membership admin surface. Twelve are
+new entries in this catalog; `NO SILENT FORMAT MISINTERPRETATION`
+(above) is amended in place, not re-added.
+
+### LEADER-TERM CONFIGURATION GATE
+
+**Statement**: A leader never appends an `EntryConfig` entry unless it
+has already committed an entry of its own current term
+(`termAt(commitIndex) == currentTerm`, P1) and its inherited log tail as
+of its own election has itself already committed
+(`commitIndex >= pendingConfIndex`, P2).
+
+**Scope**: `raft.Core.ProposeConfigChange` (checks 2-3),
+`internal/node.proposeElectionNoOp` (the existing, `v0.1.0`+ mechanism
+that makes P1 converge after every election).
+
+**Why it matters**: This is the premise that keeps every committed
+configuration on a single chain (`CONFIGURATION BRANCH CONFINEMENT`'s
+W1) rather than letting two leaders each append a sibling child of one
+common ancestor with disjoint majorities — the single most serious
+defect an early revision of the design plan contained (traced as DM-12
+in the plan's own review history).
+
+**Mechanism**: `Core.ProposeConfigChange`'s ordered precondition list;
+`proposeElectionNoOp`'s synthetic current-term entry, proposed on every
+`BecameLeader` output, which this phase promotes from "a ReadIndex
+liveness fix" to "a documented safety dependency that must never be
+removed."
+
+**Threatened by**: Removing or short-circuiting `proposeElectionNoOp`;
+any path that appends an `EntryConfig` entry outside
+`ProposeConfigChange`; any future change letting `commitIndex` advance
+to an entry not in `currentTerm`.
+
+**Proof/test obligations**: `TestProposeConfigChangeP1NoCurrentTermCommit`,
+`TestProposeConfigChangeP2InheritedSuffix`
+(`internal/raft/membership_test.go`);
+`TestDM12_NewLeaderRefusesSecondTransitionOnInheritedUncommittedTail`
+(`internal/fault/membership_test.go`, real multi-node election/
+partition dynamics); `TestDM12Step7_P1DisabledProducesADoubleCommitTheOracleDetects`
+(`internal/fault`), the P1-disabled negative control proving
+`committedOracle` actually detects the resulting two-committed-siblings
+divergence rather than merely passing with the gate left enabled — see
+`docs/testing-strategy.md` §11.
+
+### CONFIGURATION BRANCH CONFINEMENT
+
+**Statement**, in two mechanically checkable parts: **(W1)** the set of
+*committed* configurations is totally ordered by the index of the
+`EntryConfig` entry that established each, forms exactly one chain (no
+two committed configurations are siblings), and every adjacent pair
+differs by at most one voter; **(W2)** every live-but-uncommitted
+configuration is a single-shape child of the newest committed
+configuration present in the log of the node holding it.
+
+**Why it matters**: adjacency is exactly the hypothesis quorum-
+intersection needs; two configurations more than one voter apart can
+have fully disjoint majorities. This is *not* a claim that at most two
+configurations are ever live at once, or that all live configurations
+are pairwise adjacent — three can be simultaneously live in a safe,
+reachable state (a partitioned node holding a stale branch, a healthy
+majority holding two further committed transitions), made safe by the
+superseded-branch exclusion lemma rather than by any window bound.
+
+**Scope**: `raft.Core.activeConfig`/`ConfigAt`/`ProposeConfigChange`'s
+four-shape check (§2.6 of the plan).
+
+**Threatened by**: Any relaxation of the P1/P2/P3 proposal gates; any
+transition shape changing more than one voter at a time; concurrent
+(unserialized) changes; reintroducing a live-set-size or adjacency-of-
+all-live-configurations test into any test oracle.
+
+**Proof/test obligations**: `TestClassifyTransitionFourShapes` (all four
+shapes plus deliberate violations), `TestConfigAtBoundaryAgreementAfterCompact`,
+`TestConfigAtNeverSnapshottedFallsBackToBootstrap` (`internal/raft`);
+`TestDM12_...` (`internal/fault`); `TestDM10_CombinedRandomizedMembershipSchedule`
+(`internal/fault/membership_dm10_test.go`), whose
+`configLineageOracle` (`internal/fault/lineage_oracle_test.go`)
+independently reconstructs each node's configuration from raw durable
+log/snapshot bytes with its own from-scratch decoder — never asking
+`Core`, `ConfigAt`, or any of its unexported helpers for the answer it
+is checking; `TestDM22_ThreeLiveConfigurationsIsSafeAndOracleStaysQuiet`,
+`TestDM22_SyntheticW1ViolationDetectedByLineageOracle`, and
+`TestDM22_CorruptedOracleExpectationDetectedAgainstCorrectSystem`
+(`internal/fault/membership_dm22_test.go`) calibrate that oracle in
+both directions: quiet on §2.3's genuine three-live-configuration safe
+state, and firing on both a real W1 violation and a corrupted
+expectation.
+
+### SERIALIZED MEMBERSHIP CHANGE
+
+**Statement**: At most one membership-change command may be outstanding
+at a time; a second is synchronously refused — never queued, never
+entering the log — until the first resolves.
+
+**Scope**: `raft.Core.ProposeConfigChange` checks 2-4 (P1, P2, P3 —
+three independent checks, not one: P3 alone covers only a second
+proposal within one stable leadership term).
+
+**Threatened by**: Any code path that appends a second `EntryConfig`
+entry before the first commits, on any node, in any term.
+
+**Proof/test obligations**: `TestProposeConfigChangeP3SerializationInProgress`
+(`internal/raft`); `TestRemoveServerRequiresConfirmationBelowThreeVoters`
+and the full add/promote/remove lifecycle test (`internal/node`),
+which exercise the idempotency pre-check that makes a retried request
+never re-enter this path at all.
+
+### QUORUM CONTINUITY
+
+**Statement**: Every *live* quorum decision — election, commit, and
+ReadIndex leadership confirmation — uses the deciding node's current
+`activeConfig`, and counts a node toward that quorum (its `matchIndex`,
+or its own implicit self-ack) **iff that node is currently a Voter in
+that `activeConfig`**, with no self-exemption on either path. Every
+*boundary* capture (a snapshot's `Meta.Configuration`, or
+`snapshotConfig` at compaction) uses `ConfigAt` evaluated at that
+boundary's own index — never the live `activeConfig`, which may reflect
+an uncommitted entry above the boundary that can still be truncated
+away.
+
+**Scope**: `raft.Core.advanceLeaderCommit` (majority computed over
+`activeConfig.Voters` only — a self-removing leader is simply absent
+from that range from the instant of append, with no special case);
+`internal/node.checkPendingReads` (reads `Core.ActiveConfig()` once per
+pass, and counts its own self-ack only `iff cfg.IsVoter(n.cfg.ID)`);
+`internal/node.maybeSnapshot`/`raft.Core.Compact` (both use
+`ConfigAt(appliedIndex)`/`ConfigAt(uptoIndex)`, never `activeConfig`).
+
+**Why it matters**: A self-removing leader that kept counting its own
+`matchIndex`/self-ack toward a quorum it is no longer a member of would
+let an entry "commit," or a read resolve, against a basis that is not a
+genuine majority of the configuration actually in force — the specific
+defect that made an early revision of this design unsafe for 3->2
+self-removal.
+
+**Threatened by**: Any new quorum-counting call site that iterates
+something other than `activeConfig.Voters`; any boundary capture that
+reads `activeConfig` instead of calling `ConfigAt`; a self-ack/self-
+matchIndex counted unconditionally (`acked := 1`) rather than gated on
+current voter status.
+
+**Proof/test obligations**: `TestSelfRemovingLeaderExcludedFromOwnCommitQuorum`,
+`TestSelfRemovalDoesNotPanicOnLateArrivingResponse` (`internal/raft`);
+`TestSelfRemovingLeaderStepsDownAndClusterElectsNewLeader`
+(`internal/node`, real processes, asserting the remaining voters elect
+a successor and the removed node answers `ErrNodeRemoved`). The full
+DM-17 three-sub-case ReadIndex-across-a-configuration-change scenario —
+promote (`TestDM17Promote_NewVoterWithZeroAckSeqDoesNotCount`), remove
+(`TestDM17Remove_RemovedVoterStopsCounting`), and self-removal's two-
+phase-blocked-then-clean-failure-plus-positive schedule
+(`TestDM17SelfRemoval_TwoPhasesAgainstOneReadPlusPositive`) — is
+implemented in `internal/node/dm17_test.go`, each repeated with a real
+interleaved leader failover in `internal/node/dm17_failover_test.go`.
+
+### MEMBERSHIP RECOVERY DETERMINISM
+
+**Statement**: `ConfigAt` is the **sole** mechanism by which any
+configuration is ever derived, at every call site, with one fixed
+priority order (latest retained configuration-establishing `EntryConfig`
+-> `snapshotConfig` when `snapshotHasConfig` -> `Config.Bootstrap` ->
+the zero value), and it is a pure, deterministic function of durable
+state. After any restart, snapshot install, or divergent-suffix repair,
+two nodes with byte-identical durable state always compute identical
+configurations.
+
+**Scope**: `raft.Core.ConfigAt` and its complete call-site table
+(append-time activation, accept-time activation/revert-on-truncate,
+`NewCoreFromSnapshot`, `becomeLeader`, `maybeSnapshot`, `Compact`,
+`refreshStatusLocked`); `internal/node`'s `encodeEntryPayload`/
+`decodeEntryPayload` typed-entry framing, which `Entry.Type` must
+survive intact for `ConfigAt`'s step-1 scan to ever find it.
+
+**Why it matters**: The typed-entry header is gated on the entry's own
+`Type`, never on this node's durable cluster generation — the latter is
+updated at a point in the event loop's single pass that is
+systematically stale relative to when a follower persists the very
+entry that gate would apply to, which would otherwise silently write
+the first post-finalization `EntryConfig` entry untyped and make it
+vanish from the scan on the next restart.
+
+**Threatened by**: Any code path trusting a cached `activeConfig` across
+a restart; any second, independent reconstruction implementation; any
+call site added without updating `ConfigAt`'s call-site table; gating
+the typed-entry header on a value updated on a different schedule from
+the write it gates.
+
+**Proof/test obligations**: `TestConfigAtNeverSnapshottedFallsBackToBootstrap`,
+`TestConfigAtNeverJoinedIsZeroConfiguration`,
+`TestConfigAtBoundaryAgreementAfterCompact`,
+`TestNewLearnerFirstCatchUpBatchIncludingItsOwnAddEntry`,
+`TestConfigAtInvariantsProperty` (`internal/raft` — DM-16, 40 randomized
+seeds, with/without a snapshot boundary and a bootstrap seed, covering
+determinism, monotone provenance, prefix stability, and boundary
+agreement); `TestFinalizeUpgrade_FollowerAdoptsGenerationViaSnapshotInstall`-
+style restart/catch-up coverage, `TestDM20_EntryTypeSurvivesWALRoundTripAcrossFinalizationBoundary`
+and its negative control `TestDM20_NegativeControlGenerationGatedEncodingFailsTheProof`
+(`internal/node/dm20_test.go` — the byte-level, negative-controlled
+`Entry.Type` WAL round trip across the finalization boundary).
+
+### RESTORE MEMBERSHIP ISOLATION
+
+**Statement**: A data directory produced by `-restore-from` derives its
+`Configuration` **only** from the operator's `-cluster`/`-peers` flags.
+No source-cluster `Member.ID` or address is ever adopted, replicated,
+or reported by the restored cluster, from either durable carrier — the
+staged snapshot (`Meta.HasConfiguration = false`) or the staged WAL
+suffix (every `EntryConfig` payload rewritten to the `Voided` kind, at
+its original index and term).
+
+**Scope**: `internal/backup.stripSnapshotConfiguration` (part 1),
+`internal/backup.voidConfigEntryPayload`/`copyWALSuffix`'s transform
+parameter (part 2, applied by `buildStaging`/`Restore` only — never by
+`Export`, which must retain a backup's own recoverable membership
+history unchanged).
+
+**Why it matters**: `docs/backup.md` already documents restoring onto a
+different peer set as supported, and durable configuration overrides
+the bootstrap flags everywhere else in this system; without this
+invariant those two rules compose into a silent, total failure — every
+restored node finds its own ID absent from a non-empty configuration,
+becomes permanently self-removed, and the restored cluster never elects
+a leader, in precisely the disaster-recovery scenario the feature
+exists for.
+
+**Threatened by**: A restore path that copies WAL payloads through
+without inspecting their type; clearing the snapshot's configuration
+without also voiding the WAL suffix's `EntryConfig` entries (a defect
+an early revision of this design actually had); voiding unconditionally
+inside the `Export`-shared `copyWALSuffix` helper; failing closed on a
+`Voided` entry received on the ordinary replication path (which halts
+every node that joins a restored cluster before its own first
+snapshot).
+
+**Proof/test obligations**: `TestVoidConfigEntryPayloadMatchesRaftFraming`,
+`TestStripSnapshotConfigurationClearsV2Configuration`,
+`TestRestoreVoidsConfigEntryInStagedWAL`,
+`TestRestoreNegativeControlWithoutVoiding` (`internal/backup`) — the
+last of these is DM-21's negative control at the package level. The
+full DM-21 real-cluster scenario — a restored cluster with different
+NodeIDs actually electing a leader and serving traffic, plus a learner
+added before the restored cluster's own first snapshot receiving voided
+entries from a live leader
+(`TestDM21_RestoreCarriesNoSourceMembershipFromEitherCarrier`), and its
+real-cluster negative control asserting the restored node never elects
+without part 2 of the transform
+(`TestDM21_NegativeControlWithoutVoidingSelfRemovedNeverElects`) — is
+implemented in `internal/node/dm21_test.go`.
+
+### LEARNER NON-INTERFERENCE
+
+**Statement**: A learner never counts toward quorum, never votes, and
+its absence/crash/slowness never blocks or delays commit progress for
+the voting set — including never blocking cluster-generation
+finalization.
+
+**Scope**: `activeConfig.Majority()` computed over `Voters` only,
+everywhere; `internal/node.computePrecheck`'s `Ready` field computed
+over voters only (a learner appears in `Peers` with a `Role` field for
+diagnostics, but can never gate finalization).
+
+**Threatened by**: Any commit-rule, election, or precheck path that
+iterates `Learners` when computing a threshold.
+
+**Proof/test obligations**: `TestAddLearnerPromoteRemoveFullLifecycle`
+(`internal/node`, asserting ordinary write traffic and catch-up proceed
+throughout); a direct unit test asserting `Ready` is true with an
+unreachable learner present is a documented remaining item.
+
+### MEMBERSHIP-SCOPED VOTE ACCEPTANCE (liveness, not safety)
+
+**Statement**: A `RequestVoteRequest` from a sender that is not a Voter
+in the receiver's own `activeConfig` is dropped before any term/log
+state is touched (Rule 1); a node that has heard from its current
+leader within the minimum election timeout ignores any
+`RequestVoteRequest`, including a higher-term one (Rule 2, Raft
+§4.2.3). `AppendEntriesRequest`, `MsgInstallSnapshotRequest`, and every
+`*Response` are never filtered on a membership basis.
+
+**Why it matters, and what it does not provide**: This bounds the
+disruption a removed-but-running node can cause. It is **not** a safety
+mechanism — safety against a removed node comes entirely from
+`CONFIGURATION BRANCH CONFINEMENT` plus quorum intersection, and holds
+with no filtering at all. Filtering replication traffic on a membership
+basis would strand a legitimate member awaiting log repair (the exact
+defect an early revision of this design had).
+
+**Scope**: `raft.Core.handleRequestVoteRequest` (Rule 1);
+`raft.Core.heardFromLeader`, set on an accepted leader
+`AppendEntries`/`InstallSnapshot` and cleared on `InputElectionTimeout`
+or step-down (Rule 2) — `Core` owns no clock and no tick counter;
+`internal/node` owns the election timer unchanged.
+
+**Threatened by**: Extending the filter to replication traffic; moving
+Rule 2's logic into `internal/node`, where `internal/fault`'s `Core`-
+level harness could not exercise it.
+
+**Proof/test obligations**: `TestRequestVoteDroppedFromNonMember`,
+`TestLearnerNeverGrantsVoteAndNeverCampaigns`,
+`TestHeardFromLeaderSuppressesHigherTermRequestVote` (`internal/raft`);
+`TestDM9_StaleRemovedNodeCannotDisruptCluster` (`internal/fault`, both
+rules exercised together against a real election timer).
+
+### MINIMUM VOTER INVARIANT
+
+**Statement**: A `RemoveServer` that would reduce the voter count to
+`0` is deterministically refused by `Core`, on the leader at propose
+time and on every replica at accept time; a zero-voter `Configuration`
+is never reached or persisted, transiently or otherwise. This is pure
+quorum mathematics and is **never** operator-overridable — distinct
+from the separate, policy-layer requirement that any result below
+*three* voters carry an explicit `confirmVoterCount` (`internal/node`,
+not re-validated by any replica, appearing in no safety proof).
+
+**Scope**: `raft.Core.ProposeConfigChange` check 6;
+`raft.classifyTransition`'s `RemoveServer(voter)` shape, which requires
+`len(C_new.Voters) >= 1`.
+
+**Proof/test obligations**: `TestMinimumVoterInvariantRefusesLastVoterRemoval`
+(`internal/raft`); `TestRemoveServerRequiresConfirmationBelowThreeVoters`
+(`internal/node`, the policy layer); `TestDM19_SubThreeVoterConfirmationStaleAndZeroVoterCases`
+(`internal/node/membership_test.go`), which additionally proves a
+*stale* `confirmVoterCount` — correct for an earlier cluster size — is
+refused exactly like a missing one, and that `Core`'s own absolute
+`ErrLastVoterRemoval` refuses a zero-voter removal even when the
+policy-layer confirmation is satisfied, pinning the two-layer split
+directly.
+
+### SINGLE-SERVER TRANSITION SHAPE
+
+**Statement**: Every `EntryConfig` entry that **establishes** a
+configuration represents exactly one of four transitions (AddLearner,
+PromoteToVoter, RemoveServer-voter, RemoveServer-learner) relative to
+the immediately preceding active configuration; no other transition is
+ever accepted by any replica. A `Voided` entry establishes none and is
+outside this invariant's scope entirely — it is appended on the
+ordinary replication path like any `EntryNormal` entry, and reading it
+*into* scope (failing closed on it) would halt every node that joins a
+restored cluster before that cluster's first snapshot.
+
+**Scope**: `raft.classifyTransition` (leader-side, via
+`ProposeConfigChange`, and replica-side, via
+`activateFromAppendedEntries`) — with one deliberate, documented
+exception: a replica's own re-check is skipped when its own prior
+configuration is still the zero value (a never-joined node's very first
+catch-up batch can legitimately contain, among older ordinary entries,
+the very `EntryConfig` entry that adds it, and that node has no
+independent basis to validate the transition's "before" state against
+— see `activateFromAppendedEntries`'s doc comment for the real bug this
+closes).
+
+**Threatened by**: A leader-side-only check with no follower-side
+re-verification; extending the re-verification to `Voided` entries;
+applying the re-verification against a receiver's own zero prior
+configuration.
+
+**Proof/test obligations**: `TestClassifyTransitionFourShapes`,
+`TestNewLearnerFirstCatchUpBatchIncludingItsOwnAddEntry`
+(`internal/raft`); `FuzzDecodeEntryConfig`.
+
+### MEMBERSHIP CHANGE GENERATION GATE
+
+**Statement**: No `EntryConfig` entry is ever proposed by a node whose
+committed cluster generation is `< 2`, and none is ever **applied** by
+a node whose durable cluster generation is `< 2` — the latter fails
+closed (this node stops) rather than being silently accepted.
+
+**Scope**: `internal/node.handleMembership` (propose-side gate, before
+`Core.ProposeConfigChange` is ever called);
+`internal/node.applyConfigEntry` (apply-side gate, checked after
+decoding but before recording any outcome).
+
+**Why it matters**: A leader-side-only check would make every replica's
+correctness depend on a remote node's code being right — the apply-side
+gate is defense in depth mirroring `ADR-0017`'s identical posture for
+`SetClusterVersionCommand`.
+
+**Proof/test obligations**: `TestAddLearnerRefusedBeforeGeneration2`
+(`internal/node`, and its HTTP-layer counterpart in
+`cmd/chronicledb-node`, both the leader-propose-side gate);
+`TestDM18_MembershipChangeGenerationGateBothSides`
+(`internal/node/membership_test.go`), which additionally pins the
+apply-side `Node.fail` path — a synthetic committed `EntryConfig` fed
+directly to `applyConfigEntry` against a hand-built, never-started
+`Node` pinned at generation 1, since genuine replication can never
+reach this path (every node necessarily applies the generation-2
+finalize before any later `EntryConfig` can exist).
+
+### MEMBERSHIP REQUEST OUTCOME STABILITY
+
+**Statement**: A completed membership-change `RequestID` resolves to
+the same recorded outcome after retry, restart, or leader failover,
+indefinitely; a request refused **before proposal** records nothing at
+all, leaving its `RequestID` freshly usable.
+
+**Scope**: `internal/fsm.RecordMembershipOutcome`/`GetMembershipOutcome`
+(fingerprinted over `{kind, nodeId, address}` only — `confirmVoterCount`
+is deliberately excluded, since it is an authorization gesture about
+one submission, not part of the operation's identity); the membership
+outcomes' `EncodeState`/`DecodeState` trailing block, gated on
+`clusterGeneration >= 2` (not `> 0`) so a pre-`v0.5.0`-finalization
+snapshot stays byte-identical to `v0.4.0`'s own output.
+
+**Threatened by**: Recording an outcome from any pre-proposal refusal
+path; including `confirmVoterCount` in the idempotency fingerprint.
+
+**Proof/test obligations**: `TestRecordMembershipOutcomeIdempotentAndConflictDetected`,
+`TestGetMembershipOutcomePrecheck`,
+`TestMembershipOutcomesSurviveEncodeDecodeRoundTrip`,
+`TestMembershipOutcomeGatedOnGeneration2NotJustNonZero` (`internal/fsm`);
+the idempotent-retry assertion inside
+`TestAddLearnerPromoteRemoveFullLifecycle` (`internal/node`).
+
+### NO SILENT FORMAT MISINTERPRETATION (extended by `v0.5.0`)
+
+Extended to four new surfaces, each with its own independent
+fail-closed path and its own test: the `EntryConfig` control-kind range
+on the **wire** (`internal/raft`'s local mirror of
+`fsm.ControlCommandMarker`, disjoint from `internal/fsm`'s own range —
+`TestControlKindRangesNeverCollide`), the `Entry.Type` payload sentinel
+on **disk** (`internal/node`'s `entryPayloadTypeSentinel`, disjoint from
+both `fsm.ControlCommandMarker` and `commitTxnCommandVersion` — guarded
+by an `init()` panic), the snapshot `FormatVersion` **range** check
+(`internal/snapshot.Decode`, `[MinReadVersion, FormatVersion]` replacing
+strict equality — `TestUnsupportedVersionRange`), and the snapshot
+frame's `hasConfig`/`configLen` **cross-check** (an invalid flag byte,
+or a flag and length that disagree, is `ErrCorrupt` rather than a
+shifted read — `TestV2RejectsInvalidHasConfigByte`,
+`TestV2RejectsHasConfigFalseWithNonZeroLen`). The `FormatVersion`
+surface's mechanism changes from equality to a bounded range; the
+invariant's statement is unchanged.
