@@ -51,17 +51,37 @@ const membershipRetryAfterSeconds = 1
 
 // membershipErrorResponse maps every §2.6a/§8.2/§8.2a/§12.2 refusal to
 // its fixed HTTP status and machine-readable reason (§9's pinned
-// table): 400 malformed/illegal-transition, 409 not-leader/in-progress/
-// confirmation-required, 412 capability-not-permitted, 425 learner-not
-// -caught-up, 503 transiently-not-ready. reason is always populated so
-// a client never has to distinguish conditions by status code alone —
-// the same string is also what recordMembershipAudit logs (§13.4).
+// table): 400 malformed/illegal-transition, 409 not-leader/leadership-
+// lost/in-progress/confirmation-required, 412 capability-not-permitted,
+// 425 learner-not-caught-up, 503 transiently-not-ready. reason is
+// always populated so a client never has to distinguish conditions by
+// status code alone — the same string is also what recordMembershipAudit
+// logs (§13.4).
 func membershipErrorResponse(err error) (status int, resp membershipMutateResponse) {
 	resp = membershipMutateResponse{Status: "error", Error: err.Error()}
 	var nle *node.NotLeaderError
 	if errors.As(err, &nle) {
 		resp.Reason = "not-leader"
 		resp.LeaderHint = string(nle.Leader)
+		return http.StatusConflict, resp
+	}
+	// ErrLeadershipLost (dynamic-membership plan §16's real-process
+	// suite found this: a membership call proposed against a leader
+	// that then loses leadership before the entry commits — a real,
+	// if narrow, race an election can create around any proposal, not
+	// specific to membership calls) is exactly as retryable as
+	// NotLeaderError, by the same RequestID, against whoever is leader
+	// next: its own message says as much ("retry by RequestID against
+	// the current leader"), and §10's idempotency table is what makes
+	// that safe regardless of whether the original attempt actually
+	// committed. Falling through to the generic 500 below would
+	// misreport an ordinary, well-understood consensus outcome as a
+	// server bug, and would violate §16's own "never a 500" acceptance
+	// criterion for a membership call immediately following a real
+	// failover.
+	if errors.Is(err, node.ErrLeadershipLost) {
+		resp.Reason = "leadership-lost"
+		resp.RetryAfterSeconds = membershipRetryAfterSeconds
 		return http.StatusConflict, resp
 	}
 	switch {
