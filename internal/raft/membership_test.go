@@ -663,3 +663,102 @@ func TestRemovedMemberReceivesNothingViaReplyDrivenContinuation(t *testing.T) {
 		assertNothingSentTo(t, out, "b", "handleInstallSnapshotResponse")
 	})
 }
+
+// TestClassifyTransitionIgnoresAddressSpelling pins the unit-level half
+// of the rule the v0.5.0 final correctness review found violated: §2.6's
+// four shapes constrain MEMBERSHIP — which IDs are voters, which are
+// learners, and that at most one moves per transition — and must never
+// be decided by Member.Address, which is process-local at bootstrap
+// (dynamic-membership plan §1.8) and therefore legitimately spelled
+// differently on different replicas until the first EntryConfig
+// replicates. The end-to-end proof, against real nodes whose -listen
+// and -peers name the same endpoint differently, is
+// internal/node's TestFirstConfigChangeToleratesBootstrapAddressSpellingDrift.
+func TestClassifyTransitionIgnoresAddressSpelling(t *testing.T) {
+	// "old" is one replica's own bootstrap view; "same endpoint, other
+	// spelling" is what a peer's bootstrap (and so the leader's proposed
+	// Configuration) carries for the identical node.
+	old := Configuration{
+		Voters:   []Member{{ID: "a", Address: "0.0.0.0:9000"}, m("b"), m("c")},
+		Learners: []Member{m("d")},
+	}
+	otherSpelling := Member{ID: "a", Address: "10.0.0.1:9000"}
+
+	cases := []struct {
+		name   string
+		newCfg Configuration
+	}{
+		{
+			name:   "AddLearner",
+			newCfg: Configuration{Voters: []Member{otherSpelling, m("b"), m("c")}, Learners: []Member{m("d"), m("e")}},
+		},
+		{
+			name:   "PromoteToVoter",
+			newCfg: Configuration{Voters: []Member{otherSpelling, m("b"), m("c"), m("d")}, Learners: nil},
+		},
+		{
+			name:   "RemoveServer(voter)",
+			newCfg: Configuration{Voters: []Member{otherSpelling, m("b")}, Learners: []Member{m("d")}},
+		},
+		{
+			name:   "RemoveServer(learner)",
+			newCfg: Configuration{Voters: []Member{otherSpelling, m("b"), m("c")}, Learners: nil},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if err := classifyTransition(old, tc.newCfg); err != nil {
+				t.Fatalf("classifyTransition() = %v, want nil: a differently-spelled address for an otherwise untouched member must never make a legal single-server transition look structurally invalid", err)
+			}
+		})
+	}
+
+	// The shape rules themselves are unaffected: a differently-spelled
+	// address does not license a second simultaneous membership change.
+	twoAtOnce := Configuration{
+		Voters:   []Member{otherSpelling, m("b"), m("c"), m("x")},
+		Learners: []Member{m("d"), m("e")},
+	}
+	if err := classifyTransition(old, twoAtOnce); !errors.Is(err, ErrInvalidTransition) {
+		t.Fatalf("classifyTransition(two changes at once) = %v, want ErrInvalidTransition", err)
+	}
+}
+
+// TestActivateFromAppendedEntriesAcceptsAddressSpellingDrift is the
+// Core-level regression for the same defect: the accept-time
+// defense-in-depth re-check runs inside activateFromAppendedEntries,
+// which turns a classification failure into a panic — in Core.Step,
+// before the entry is ever persisted, so a restart re-derives the same
+// bootstrap and panics on the same entry again.
+func TestActivateFromAppendedEntriesAcceptsAddressSpellingDrift(t *testing.T) {
+	// This replica's bootstrap spells its own address the way its own
+	// -listen does; the leader's Configuration spells it the way this
+	// node's peers dial it.
+	boot := Configuration{Voters: []Member{{ID: "a", Address: "0.0.0.0:9000"}, m("b"), m("c")}}
+	c := newBootstrapCore(t, "a", boot)
+
+	leaderView := Configuration{
+		Voters:   []Member{{ID: "a", Address: "10.0.0.1:9000"}, m("b"), m("c")},
+		Learners: []Member{m("d")},
+	}
+	entry := Entry{
+		Index: 1, Term: 1, Type: EntryConfig,
+		Data: encodeConfigChange(membershipKindAddLearner, "req1", "d", "d:0", leaderView),
+	}
+
+	defer func() {
+		if r := recover(); r != nil {
+			t.Fatalf("appending the cluster's first EntryConfig panicked because this replica's bootstrap spells its own address differently: %v", r)
+		}
+	}()
+	out := c.Step(Input{Kind: InputMessage, Message: Message{
+		Type: MsgAppendEntriesRequest, From: "b", To: "a", Term: 1,
+		PrevLogIndex: 0, PrevLogTerm: 0, Entries: []Entry{entry},
+	}})
+	if out.PersistRequest == nil || len(out.PersistRequest.Entries) != 1 {
+		t.Fatalf("expected the EntryConfig entry to be accepted and persisted, got %+v", out)
+	}
+	if !c.activeConfig.Equal(leaderView) {
+		t.Fatalf("activeConfig = %+v, want the leader's replicated view %+v (convergence is on what replicated, not on this node's own bootstrap spelling)", c.activeConfig, leaderView)
+	}
+}

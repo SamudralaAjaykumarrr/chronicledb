@@ -53,6 +53,19 @@ work as of this entry.
   entries, the very `EntryConfig` entry that adds the node itself.
 - A nil-map panic when the acknowledgement completing a self-removing
   leader's new quorum arrives mid-call.
+- That same follower-side four-shape re-check compared whole `Member`
+  values, including `Address`. Because every node seeds its bootstrap
+  `Configuration` from its own `-listen` for itself and `-peers` for
+  everyone else, two nodes legitimately hold different spellings of one
+  endpoint (`0.0.0.0:9000` against a routable address, `localhost`
+  against `127.0.0.1`), which made the first `EntryConfig` a correct
+  leader proposed panic those nodes' event loops — before the entry was
+  persisted, so a restart re-derived the same bootstrap and panicked
+  again, permanently. The four shapes are now classified by `NodeID`
+  alone, which is the membership property they actually constrain
+  (§1.8: `-listen` is "process-local configuration, never part of
+  replicated `Configuration`"). Found by the `v0.5.0` final correctness
+  review.
 - `handleInstallSnapshotRequest`'s staleness check compared only
   against `SnapshotIndex`, never `CommitIndex`; a stale or duplicated
   `InstallSnapshotRequest` delivered after ordinary replication had

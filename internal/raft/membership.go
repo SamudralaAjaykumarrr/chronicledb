@@ -315,12 +315,35 @@ func toMemberSet(members []Member) map[NodeID]Member {
 	return s
 }
 
-func setsEqualMembers(a, b map[NodeID]Member) bool {
+// sameMemberIDs reports whether a and b name exactly the same set of
+// NodeIDs. It deliberately compares IDs only, never Member.Address:
+// the property §2.6's four shapes constrain is MEMBERSHIP — which IDs
+// are voters, which are learners, and that at most one of them moves
+// per transition — and Member.Address is not a fact every replica can
+// independently agree on at the moment this check runs.
+//
+// Concretely, before any EntryConfig entry has ever been observed, a
+// replica's "before" configuration is its own Config.Bootstrap, which
+// internal/node seeds from that node's OWN -listen value for itself and
+// from -peers for everyone else (internal/node.bootstrapConfiguration).
+// Two nodes therefore hold legitimately different spellings of the same
+// endpoint — -listen=0.0.0.0:9000 versus a routable -peers address,
+// localhost versus 127.0.0.1, hostname versus IP — which the
+// dynamic-membership plan §1.8 already states outright ("-listen and
+// -http ... are process-local configuration, never part of replicated
+// Configuration"). Comparing whole Member values here made the first
+// EntryConfig a correct leader proposes fail this check on exactly
+// those nodes, and activateFromAppendedEntries turns a failure into a
+// panic — before the entry is persisted, so a restart re-derived the
+// same bootstrap and panicked again, permanently. Address is carried
+// and converged by adopting the leader's Configuration, not validated
+// here.
+func sameMemberIDs(a, b map[NodeID]Member) bool {
 	if len(a) != len(b) {
 		return false
 	}
-	for id, m := range a {
-		if bm, ok := b[id]; !ok || bm != m {
+	for id := range a {
+		if _, ok := b[id]; !ok {
 			return false
 		}
 	}
@@ -351,6 +374,14 @@ func oneRemoved(oldSet, newSet map[NodeID]Member) (Member, bool) {
 // legal single-server transitions relative to old. Returns nil iff
 // valid. Used both by ProposeConfigChange (leader side) and by the
 // accept-time defense-in-depth re-check every replica performs.
+//
+// Every comparison below is by NodeID, never by Member.Address — see
+// sameMemberIDs for why address is not a fact a replica can validate
+// at this point. In-place address mutation for an existing member
+// remains out of scope for v0.5.0 (§1.6); it is simply not a property
+// this structural check is the right place to enforce, and the leader
+// side never produces one anyway (buildNewConfiguration clones every
+// untouched member verbatim).
 func classifyTransition(old, new Configuration) error {
 	oldV, newV := toMemberSet(old.Voters), toMemberSet(new.Voters)
 	oldL, newL := toMemberSet(old.Learners), toMemberSet(new.Learners)
@@ -363,7 +394,7 @@ func classifyTransition(old, new Configuration) error {
 	switch {
 	case len(newV) == len(oldV) && len(newL) == len(oldL)+1:
 		// AddLearner
-		if !setsEqualMembers(oldV, newV) {
+		if !sameMemberIDs(oldV, newV) {
 			return ErrInvalidTransition
 		}
 		added, ok := oneAdded(oldL, newL)
@@ -384,11 +415,11 @@ func classifyTransition(old, new Configuration) error {
 		if !ok {
 			return ErrInvalidTransition
 		}
-		if addedV != removedL {
+		if addedV.ID != removedL.ID {
 			return ErrInvalidTransition
 		}
-		for id, m := range oldV {
-			if nm, ok := newV[id]; !ok || nm != m {
+		for id := range oldV {
+			if _, ok := newV[id]; !ok {
 				return ErrInvalidTransition
 			}
 		}
@@ -398,7 +429,7 @@ func classifyTransition(old, new Configuration) error {
 		if len(newV) < 1 {
 			return ErrInvalidTransition
 		}
-		if !setsEqualMembers(oldL, newL) {
+		if !sameMemberIDs(oldL, newL) {
 			return ErrInvalidTransition
 		}
 		if _, ok := oneRemoved(oldV, newV); !ok {
@@ -407,7 +438,7 @@ func classifyTransition(old, new Configuration) error {
 		return nil
 	case len(newV) == len(oldV) && len(newL)+1 == len(oldL):
 		// RemoveServer (learner)
-		if !setsEqualMembers(oldV, newV) {
+		if !sameMemberIDs(oldV, newV) {
 			return ErrInvalidTransition
 		}
 		if _, ok := oneRemoved(oldL, newL); !ok {
