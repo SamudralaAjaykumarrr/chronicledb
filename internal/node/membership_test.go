@@ -13,6 +13,45 @@ import (
 	"github.com/SamudralaAjaykumarrr/chronicledb/internal/raft"
 )
 
+// membershipCounts reads n's voter/learner counts through
+// Node.MembershipStatus, the event-loop-serialized read path (§9, §14),
+// never through the cached Status() snapshot.
+//
+// The distinction is load-bearing, and reading the cache instead was a
+// real -race flake in TestDM19_...: Node.run refreshes the cached
+// Status only at the END of each event-loop iteration
+// (refreshStatusLocked, after the select arm returns), whereas a
+// membership call's caller is released earlier, from resolveWaiter
+// inside applyCommitted. So between "RemoveServer returned committed"
+// and "the cached Status reflects it" there is a genuine window with no
+// happens-before edge, and an assertion reading Status() in that window
+// legitimately observes the PREVIOUS configuration.
+//
+// MembershipStatus has no such window: it dispatches a request onto the
+// same single-threaded event loop, so it cannot be serviced until the
+// iteration that resolved the caller has finished, and it then computes
+// its answer from Core.ActiveConfig() live rather than from any cached
+// value. Sending on its channel is the ordering edge the assertion
+// needs — which is why this is the right oracle rather than a sleep, a
+// retry, or a weakened expectation.
+func membershipCounts(t *testing.T, n *Node) (voters, learners int) {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	res, err := n.MembershipStatus(ctx)
+	if err != nil {
+		t.Fatalf("MembershipStatus: %v", err)
+	}
+	return len(res.Voters), len(res.Learners)
+}
+
+// membershipVoterCount is membershipCounts' voter half.
+func membershipVoterCount(t *testing.T, n *Node) int {
+	t.Helper()
+	voters, _ := membershipCounts(t, n)
+	return voters
+}
+
 // mustFinalizeToMax brings tc's cluster all the way to this binary's own
 // MaxSupportedGeneration via the leader, so membership operations (which
 // require generation >= 2) are legal (dynamic-membership plan §8.2).
@@ -136,7 +175,8 @@ func TestAddLearnerPromoteRemoveFullLifecycle(t *testing.T) {
 		t.Fatalf("PromoteToVoter outcome = %+v, want Committed", promoted)
 	}
 	awaitCondition(t, 5*time.Second, "cluster converges on 4 voters", func() bool {
-		return leader.Status().VoterCount == 4 && leader.Status().LearnerCount == 0
+		voters, learners := membershipCounts(t, leader)
+		return voters == 4 && learners == 0
 	})
 
 	// Remove one of the ORIGINAL three voters (not the new one), leaving
@@ -158,7 +198,7 @@ func TestAddLearnerPromoteRemoveFullLifecycle(t *testing.T) {
 		t.Fatalf("RemoveServer outcome = %+v, want Committed", removeOutcome)
 	}
 	awaitCondition(t, 5*time.Second, "cluster converges on 3 voters after removal", func() bool {
-		return leader.Status().VoterCount == 3
+		return membershipVoterCount(t, leader) == 3
 	})
 }
 
@@ -186,8 +226,8 @@ func TestRemoveServerRequiresConfirmationBelowThreeVoters(t *testing.T) {
 	if confirmErr.ResultingVoterCount != 2 {
 		t.Fatalf("ErrConfirmationRequired.ResultingVoterCount = %d, want 2", confirmErr.ResultingVoterCount)
 	}
-	if leader.Status().VoterCount != 3 {
-		t.Fatalf("VoterCount changed on a refused proposal: %d, want unchanged 3", leader.Status().VoterCount)
+	if got := membershipVoterCount(t, leader); got != 3 {
+		t.Fatalf("VoterCount changed on a refused proposal: %d, want unchanged 3", got)
 	}
 
 	// Same RequestID, now with the correct confirmation — must succeed
@@ -239,7 +279,7 @@ func TestDM19_SubThreeVoterConfirmationStaleAndZeroVoterCases(t *testing.T) {
 		if out1.Status != fsm.StatusCommitted {
 			t.Fatalf("RemoveServer 4->3 outcome = %+v, want Committed", out1)
 		}
-		if got := leader.Status().VoterCount; got != 3 {
+		if got := membershipVoterCount(t, leader); got != 3 {
 			t.Fatalf("VoterCount after first removal = %d, want 3", got)
 		}
 
@@ -257,7 +297,7 @@ func TestDM19_SubThreeVoterConfirmationStaleAndZeroVoterCases(t *testing.T) {
 		if confirmErr.ResultingVoterCount != 2 {
 			t.Fatalf("ErrConfirmationRequired.ResultingVoterCount = %d, want 2", confirmErr.ResultingVoterCount)
 		}
-		if got := leader.Status().VoterCount; got != 3 {
+		if got := membershipVoterCount(t, leader); got != 3 {
 			t.Fatalf("VoterCount changed on a refused proposal: %d, want unchanged 3", got)
 		}
 
@@ -303,7 +343,7 @@ func TestDM19_SubThreeVoterConfirmationStaleAndZeroVoterCases(t *testing.T) {
 		if _, err := leader.RemoveServer(ctx, "dm19-drain-2", toRemove[1], 1); err != nil {
 			t.Fatalf("RemoveServer 2->1: %v", err)
 		}
-		if got := leader.Status().VoterCount; got != 1 {
+		if got := membershipVoterCount(t, leader); got != 1 {
 			t.Fatalf("VoterCount = %d, want 1", got)
 		}
 
@@ -325,7 +365,7 @@ func TestDM19_SubThreeVoterConfirmationStaleAndZeroVoterCases(t *testing.T) {
 		if !errors.Is(err, raft.ErrLastVoterRemoval) {
 			t.Fatalf("RemoveServer(last voter) with confirmVoterCount=0: err = %v, want raft.ErrLastVoterRemoval", err)
 		}
-		if got := leader.Status().VoterCount; got != 1 {
+		if got := membershipVoterCount(t, leader); got != 1 {
 			t.Fatalf("VoterCount changed on a refused last-voter removal: %d, want unchanged 1", got)
 		}
 	})
@@ -451,8 +491,8 @@ func TestMembershipRequestIDRetryAcrossLeaderFailover(t *testing.T) {
 		if !errors.As(err, &confirmErr) {
 			t.Fatalf("RemoveServer without confirmVoterCount: err = %v, want *ErrConfirmationRequired", err)
 		}
-		if leader1.Status().VoterCount != 3 {
-			t.Fatalf("VoterCount changed on a refused proposal: %d, want unchanged 3", leader1.Status().VoterCount)
+		if got := membershipVoterCount(t, leader1); got != 3 {
+			t.Fatalf("VoterCount changed on a refused proposal: %d, want unchanged 3", got)
 		}
 
 		tc.crash(leader1ID)
@@ -595,4 +635,58 @@ func TestDM18_MembershipChangeGenerationGateBothSides(t *testing.T) {
 // fmt.Errorf rather than a sentinel (dynamic-membership plan §8.2).
 func containsGenerationGateMessage(err error) bool {
 	return err != nil && strings.Contains(err.Error(), "requires cluster generation >= 2")
+}
+
+// TestMembershipStatusIsOrderedAfterACommittedMembershipChange pins the
+// ordering property membershipCounts relies on, and that the cached
+// Status() deliberately does not provide: once a membership call has
+// returned StatusCommitted, a subsequent MembershipStatus must ALREADY
+// reflect it, with no polling and no retry.
+//
+// The edge is structural, not timing: MembershipStatus dispatches onto
+// Node.run's single-threaded event loop, so it cannot be serviced until
+// the iteration that released the caller has completed, and it computes
+// its answer from Core.ActiveConfig() live. Node.run's cached Status is
+// refreshed only at the end of each iteration, after the caller has
+// already been released from resolveWaiter — which is why reading it
+// immediately after a membership call was a real -race flake
+// (TestDM19_..., "VoterCount = 2, want 1").
+//
+// Several changes in a row, each asserted immediately, so a regression
+// that only sometimes leaves the read unordered still fails here.
+func TestMembershipStatusIsOrderedAfterACommittedMembershipChange(t *testing.T) {
+	tc := newTestCluster(t, 3)
+	leader := tc.leaderNode(5 * time.Second)
+	mustFinalizeToMax(t, tc, leader)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+
+	for i := 1; i <= 5; i++ {
+		learner := raft.NodeID(fmt.Sprintf("ordering-learner-%d", i))
+		outcome, err := leader.AddLearner(ctx, fsm.RequestID(fmt.Sprintf("ordering-add-%d", i)), learner, "127.0.0.1:1")
+		if err != nil {
+			t.Fatalf("AddLearner %s: %v", learner, err)
+		}
+		if outcome.Status != fsm.StatusCommitted {
+			t.Fatalf("AddLearner %s outcome = %+v, want Committed", learner, outcome)
+		}
+		voters, learners := membershipCounts(t, leader)
+		if voters != 3 || learners != i {
+			t.Fatalf("after AddLearner %s returned committed, MembershipStatus reports %d voters / %d learners, want 3/%d — the read was not ordered after the change", learner, voters, learners, i)
+		}
+	}
+
+	// And the same immediately after a removal, the direction DM-19's
+	// own flake was observed in.
+	outcome, err := leader.RemoveServer(ctx, "ordering-remove-1", "ordering-learner-1", 0)
+	if err != nil {
+		t.Fatalf("RemoveServer: %v", err)
+	}
+	if outcome.Status != fsm.StatusCommitted {
+		t.Fatalf("RemoveServer outcome = %+v, want Committed", outcome)
+	}
+	if voters, learners := membershipCounts(t, leader); voters != 3 || learners != 4 {
+		t.Fatalf("after RemoveServer returned committed, MembershipStatus reports %d voters / %d learners, want 3/4", voters, learners)
+	}
 }

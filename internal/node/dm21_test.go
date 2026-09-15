@@ -114,7 +114,7 @@ func dm21BuildSourceBackup(t *testing.T) dm21Fixture {
 		t.Fatalf("PromoteToVoter: %v", promoteErr)
 	}
 	awaitCondition(t, 5*time.Second, "cluster converges on 4 voters", func() bool {
-		return leader.Status().VoterCount == 4
+		return membershipVoterCount(t, leader) == 4
 	})
 
 	if leader.Status().SnapshotIndex != snapBoundary {

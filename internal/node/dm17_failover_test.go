@@ -173,8 +173,8 @@ func TestDM17Promote_WithLeaderFailover(t *testing.T) {
 	}
 
 	newLeader := tc.node(newLeaderID)
-	if newLeader.Status().VoterCount != 4 {
-		t.Fatalf("new leader's VoterCount = %d, want 4 (the promote must not have committed)", newLeader.Status().VoterCount)
+	if got := membershipVoterCount(t, newLeader); got != 4 {
+		t.Fatalf("new leader's VoterCount = %d, want 4 (the promote must not have committed)", got)
 	}
 
 	var promoted fsm.Outcome
@@ -230,8 +230,8 @@ func TestDM17Remove_WithLeaderFailover(t *testing.T) {
 	if !newLeader.core.ActiveConfig().IsVoter(target) {
 		t.Fatalf("target %s is no longer a voter on the new leader, want the removal to not have committed", target)
 	}
-	if newLeader.Status().VoterCount != 4 {
-		t.Fatalf("new leader's VoterCount = %d, want 4 (the removal must not have committed)", newLeader.Status().VoterCount)
+	if got := membershipVoterCount(t, newLeader); got != 4 {
+		t.Fatalf("new leader's VoterCount = %d, want 4 (the removal must not have committed)", got)
 	}
 
 	removeCtx, removeCancel := context.WithTimeout(context.Background(), 5*time.Second)
@@ -278,8 +278,8 @@ func TestDM17SelfRemoval_WithLeaderFailover(t *testing.T) {
 	if !newLeader.core.ActiveConfig().IsVoter(leaderID) {
 		t.Fatalf("former leader %s is no longer a voter on the new leader, want the self-removal to not have committed", leaderID)
 	}
-	if newLeader.Status().VoterCount != 4 {
-		t.Fatalf("new leader's VoterCount = %d, want 4 (the self-removal must not have committed)", newLeader.Status().VoterCount)
+	if got := membershipVoterCount(t, newLeader); got != 4 {
+		t.Fatalf("new leader's VoterCount = %d, want 4 (the self-removal must not have committed)", got)
 	}
 
 	removeCtx, removeCancel := context.WithTimeout(context.Background(), 5*time.Second)
