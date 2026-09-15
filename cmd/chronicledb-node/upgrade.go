@@ -18,7 +18,6 @@ import (
 
 	"github.com/SamudralaAjaykumarrr/chronicledb/internal/fsm"
 	"github.com/SamudralaAjaykumarrr/chronicledb/internal/node"
-	"github.com/SamudralaAjaykumarrr/chronicledb/internal/version"
 )
 
 type precheckPeerJSON struct {
@@ -85,7 +84,7 @@ func (s *controlServer) handleUpgradeFinalize(w http.ResponseWriter, r *http.Req
 	}
 	ctx, cancel := context.WithTimeout(r.Context(), 30*time.Second)
 	defer cancel()
-	outcome, err := s.n.FinalizeUpgrade(ctx)
+	outcome, target, err := s.n.FinalizeUpgrade(ctx)
 	if err != nil {
 		var nle *node.NotLeaderError
 		resp := finalizeResponse{Status: "error", Error: err.Error()}
@@ -95,22 +94,22 @@ func (s *controlServer) handleUpgradeFinalize(w http.ResponseWriter, r *http.Req
 		writeJSON(w, http.StatusConflict, resp)
 		return
 	}
-	// NewGeneration is derived from version.MaxSupportedGeneration (a
-	// compile-time constant), not from s.n.Status() read right after
-	// FinalizeUpgrade returns: Node.run()'s event-loop goroutine only
-	// calls refreshStatusLocked() AFTER handleControlPropose (and the
-	// applyControlEntry inside it that signals FinalizeUpgrade's
-	// resultCh) returns — there is no happens-before edge forcing that
-	// refresh to complete before this HTTP handler goroutine, unblocked
-	// by the resultCh send, gets to read Status(). A successful finalize
-	// (Outcome.Status == StatusCommitted) always raises the cluster to
-	// exactly this binary's own MaxSupportedGeneration by construction
-	// (FinalizeUpgrade only ever proposes that target), so reading the
-	// constant directly is both race-free and correct — no need to
-	// observe the FSM's own state at all for this value.
+	// NewGeneration is the generation FinalizeUpgrade actually attempted
+	// (its own returned target, captured inside its precheck dispatch
+	// before proposing — race-free for the same reason its doc comment
+	// gives for reading IsLeader there rather than a separately-read
+	// Status() snapshot), never internal/version.MaxSupportedGeneration:
+	// FinalizeUpgrade raises the cluster by exactly one generation per
+	// call (current+1, PrecheckResult.TargetGeneration's own doc
+	// comment), so a single call only reaches this binary's own max when
+	// the cluster was already one generation below it — reporting the
+	// constant unconditionally previously misreported the achieved
+	// generation whenever more than one step was needed (e.g. a fresh
+	// cluster's first finalize call, on a binary whose max is 2, only
+	// ever reaches generation 1).
 	newGeneration := uint32(0)
 	if outcome.Status == fsm.StatusCommitted {
-		newGeneration = version.MaxSupportedGeneration
+		newGeneration = target
 	}
 	writeJSON(w, http.StatusOK, finalizeResponse{Status: outcome.Status.String(), NewGeneration: newGeneration})
 }

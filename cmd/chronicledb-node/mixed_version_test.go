@@ -23,6 +23,8 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/SamudralaAjaykumarrr/chronicledb/internal/version"
 )
 
 // buildBinaryAtRef builds chronicledb-node from git ref (a tag or
@@ -391,8 +393,8 @@ func TestMixedVersion_CriticalUpgradeProofScenario(t *testing.T) {
 		if st.ClusterGeneration != 1 {
 			t.Fatalf("node %s ClusterGeneration after full-cluster restart = %d, want 1 (recovered purely from local durable state)", rn.id, st.ClusterGeneration)
 		}
-		if st.MaxSupportedGeneration != 1 {
-			t.Fatalf("node %s MaxSupportedGeneration = %d, want 1", rn.id, st.MaxSupportedGeneration)
+		if st.MaxSupportedGeneration != version.MaxSupportedGeneration {
+			t.Fatalf("node %s MaxSupportedGeneration = %d, want %d", rn.id, st.MaxSupportedGeneration, version.MaxSupportedGeneration)
 		}
 	}
 	// A write after the full restart still works normally.

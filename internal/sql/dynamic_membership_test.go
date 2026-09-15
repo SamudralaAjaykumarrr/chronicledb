@@ -43,7 +43,7 @@ func finalizeSQLClusterToGeneration2(t *testing.T, c *sqlCluster, leader *node.N
 	})
 	for {
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		_, err := leader.FinalizeUpgrade(ctx)
+		_, _, err := leader.FinalizeUpgrade(ctx)
 		cancel()
 		if errors.Is(err, node.ErrAlreadyFinalized) {
 			break
@@ -65,13 +65,12 @@ func finalizeSQLClusterToGeneration2(t *testing.T, c *sqlCluster, leader *node.N
 // momentary possibility during an election). Reading Status() this way
 // concurrently with the cluster's own event-loop goroutines is safe —
 // Status() is exactly the synchronized accessor internal/node.Node
-// exposes for this purpose.
-// clusterNodesMu guards every access to c.nodes from this test only
-// (c.nodes itself carries no synchronization of its own — the tests in
-// distributed_test.go never mutate it concurrently with a reader, but
-// this test's background SQL reader goroutine runs concurrently with
-// the main goroutine's own AddLearner/crash-driven mutations, so it
-// needs one).
+// exposes for this purpose. mu guards every access to c.nodes from this
+// test (c.nodes itself carries no synchronization of its own — the
+// tests in distributed_test.go never mutate it concurrently with a
+// reader, but this test's background SQL reader goroutine runs
+// concurrently with the main goroutine's own AddLearner/crash-driven
+// mutations, so it needs one).
 func currentSQLLeader(c *sqlCluster, mu *sync.Mutex) *node.Node {
 	mu.Lock()
 	defer mu.Unlock()

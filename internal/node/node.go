@@ -968,12 +968,19 @@ var ErrUpgradeNotReady = errors.New("node: upgrade precheck not satisfied; not e
 var ErrAlreadyFinalized = errors.New("node: cluster is already finalized at this binary's max supported generation")
 
 // FinalizeUpgrade is the admin-triggered action that durably, cluster-
-// wide raises the agreed cluster generation to this node's own
-// internal/version.MaxSupportedGeneration (docs/enterprise-v1-plan.md
+// wide raises the agreed cluster generation by exactly one step, to
+// computePrecheck's PrecheckResult.TargetGeneration — current+1, never
+// a flat jump to this node's own internal/version.MaxSupportedGeneration
+// (see TargetGeneration's own doc comment; docs/enterprise-v1-plan.md
 // §7 "finalize is an explicit, admin-gated, audited action that raises
 // the cluster version once every node has actually been upgraded").
-// It first runs the identical check UpgradePrecheck reports (never
-// trusting a caller to have checked separately — see Failure
+// Reaching a binary's own max after a bump of more than one generation
+// (as MaxSupportedGeneration 1 -> 2 is for this phase, dynamic-
+// membership plan §8.1) therefore requires calling FinalizeUpgrade
+// once per intervening generation, exactly like
+// internal/node/upgrade_test.go's own finalizeToMax test helper already
+// does. It first runs the identical check UpgradePrecheck reports
+// (never trusting a caller to have checked separately — see Failure
 // semantics), and only if that passes does it propose a
 // SetClusterVersionCommand through the ordinary Raft log, exactly like
 // any other replicated command: a crash between precheck passing and
@@ -981,6 +988,15 @@ var ErrAlreadyFinalized = errors.New("node: cluster is already finalized at this
 // the underlying Raft/FSM machinery this proposal path already shares
 // with CommitTxn) or not proposed/committed at all, never partially
 // applied.
+//
+// The returned uint32 is the generation this call attempted to reach
+// (PrecheckResult.TargetGeneration, captured before the propose) —
+// meaningful only when err is nil and the returned Outcome's Status is
+// StatusCommitted; a caller reporting the achieved generation (e.g.
+// cmd/chronicledb-node's /admin/upgrade/finalize) must use this value,
+// never internal/version.MaxSupportedGeneration directly, which is
+// simply this binary's own ceiling and is not what a single-step
+// finalize necessarily just reached.
 //
 // FinalizeUpgrade must be called against the current leader (like
 // Propose/BeginReadIndex, it returns *NotLeaderError otherwise) — an
@@ -996,14 +1012,14 @@ var ErrAlreadyFinalized = errors.New("node: cluster is already finalized at this
 // immediately after such a call has no happens-before guarantee it
 // reflects this node's just-changed role. A single live read inside
 // upgradePrecheck's own dispatch has no such gap.
-func (n *Node) FinalizeUpgrade(ctx context.Context) (fsm.Outcome, error) {
+func (n *Node) FinalizeUpgrade(ctx context.Context) (fsm.Outcome, uint32, error) {
 	// unexported upgradePrecheck, not the exported UpgradePrecheck: this
 	// internal re-check must not inflate UpgradePrecheckTotal, a metric
 	// meant to reflect explicit operator/CLI polling — see
 	// upgradePrecheck's own doc comment.
 	pre, err := n.upgradePrecheck(ctx)
 	if err != nil {
-		return fsm.Outcome{}, err
+		return fsm.Outcome{}, 0, err
 	}
 	// A non-leader's own peerGenerations view is architecturally
 	// incomplete (a follower only ever exchanges Raft messages directly
@@ -1016,14 +1032,14 @@ func (n *Node) FinalizeUpgrade(ctx context.Context) (fsm.Outcome, error) {
 	// keeps this honest: only the leader's own precheck view is ever
 	// actually used to gate a real finalize decision.
 	if !pre.IsLeader {
-		return fsm.Outcome{}, &NotLeaderError{Leader: pre.Leader}
+		return fsm.Outcome{}, 0, &NotLeaderError{Leader: pre.Leader}
 	}
 	if pre.AlreadyFinalized {
-		return fsm.Outcome{}, ErrAlreadyFinalized
+		return fsm.Outcome{}, 0, ErrAlreadyFinalized
 	}
 	if !pre.Ready {
 		n.metrics.UpgradeFinalizeFailedTotal.Inc()
-		return fsm.Outcome{}, ErrUpgradeNotReady
+		return fsm.Outcome{}, 0, ErrUpgradeNotReady
 	}
 
 	// Deterministic per-target RequestID (not per-call randomness): a
@@ -1038,14 +1054,14 @@ func (n *Node) FinalizeUpgrade(ctx context.Context) (fsm.Outcome, error) {
 	outcome, err := n.ProposeControl(ctx, reqID, payload)
 	if err != nil {
 		n.metrics.UpgradeFinalizeFailedTotal.Inc()
-		return fsm.Outcome{}, err
+		return fsm.Outcome{}, 0, err
 	}
 	if outcome.Status == fsm.StatusAborted {
 		n.metrics.UpgradeFinalizeFailedTotal.Inc()
-		return outcome, fmt.Errorf("node: finalize to generation %d was rejected by replicated cluster-version state (concurrent finalize, or generation moved between precheck and propose)", pre.TargetGeneration)
+		return outcome, pre.TargetGeneration, fmt.Errorf("node: finalize to generation %d was rejected by replicated cluster-version state (concurrent finalize, or generation moved between precheck and propose)", pre.TargetGeneration)
 	}
 	n.metrics.UpgradeFinalizeTotal.Inc()
-	return outcome, nil
+	return outcome, pre.TargetGeneration, nil
 }
 
 // Propose submits cmd as a replicated mutation (docs/architecture.md

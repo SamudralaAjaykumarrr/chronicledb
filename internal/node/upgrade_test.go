@@ -66,13 +66,13 @@ func TestUpgradePrecheckAndFinalize_RealCluster(t *testing.T) {
 		}
 	}
 	follower := tc.node(followerID)
-	_, ferr := follower.FinalizeUpgrade(ctx)
+	_, _, ferr := follower.FinalizeUpgrade(ctx)
 	var nle *NotLeaderError
 	if !errors.As(ferr, &nle) {
 		t.Fatalf("follower FinalizeUpgrade: err = %v, want *NotLeaderError", ferr)
 	}
 
-	outcome, err := leader.FinalizeUpgrade(ctx)
+	outcome, _, err := leader.FinalizeUpgrade(ctx)
 	if err != nil {
 		t.Fatalf("FinalizeUpgrade: %v", err)
 	}
@@ -93,7 +93,7 @@ func TestUpgradePrecheckAndFinalize_RealCluster(t *testing.T) {
 	}
 
 	// Idempotent retry: finalize again once already at max.
-	if _, err := leader.FinalizeUpgrade(ctx); !errors.Is(err, ErrAlreadyFinalized) {
+	if _, _, err := leader.FinalizeUpgrade(ctx); !errors.Is(err, ErrAlreadyFinalized) {
 		t.Fatalf("second FinalizeUpgrade: err = %v, want ErrAlreadyFinalized", err)
 	}
 }
@@ -154,7 +154,7 @@ func TestFinalizeUpgrade_RestartPersistsGeneration(t *testing.T) {
 func finalizeToMax(t *testing.T, leader *Node, ctx context.Context) {
 	t.Helper()
 	for i := 0; i < int(version.MaxSupportedGeneration)+1; i++ {
-		_, err := leader.FinalizeUpgrade(ctx)
+		_, _, err := leader.FinalizeUpgrade(ctx)
 		if errors.Is(err, ErrAlreadyFinalized) {
 			return
 		}
