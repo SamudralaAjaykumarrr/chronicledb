@@ -99,8 +99,9 @@ func main() {
 		return
 	}
 
-	if *id == "" || *listenAddr == "" || *httpAddr == "" || *dataDir == "" || *allFlag == "" {
+	if *id == "" || *listenAddr == "" || *httpAddr == "" || *dataDir == "" {
 		fmt.Fprintln(os.Stderr, "usage: chronicledb-node -id=ID -listen=HOST:PORT -http=HOST:PORT -datadir=DIR -cluster=id1,id2,id3 -peers=id2=host:port,id3=host:port")
+		fmt.Fprintln(os.Stderr, "       (a not-yet-added learner joining an existing cluster via dynamic membership omits -cluster entirely, docs/membership.md)")
 		os.Exit(2)
 	}
 
@@ -137,9 +138,17 @@ func main() {
 			peerAddrs[raft.NodeID(parts[0])] = parts[1]
 		}
 	}
+	// -cluster empty means a not-yet-added learner (dynamic-membership
+	// plan §3.1): cfg.Peers stays nil, so node.Open's bootstrapConfiguration
+	// seeds an empty Configuration rather than a spurious single-voter
+	// "cluster of one" that would let this process elect itself before
+	// any AddLearner entry ever names it — the exact split-brain risk a
+	// non-empty self-only -cluster value would create.
 	var peers []raft.NodeID
-	for _, p := range strings.Split(*allFlag, ",") {
-		peers = append(peers, raft.NodeID(p))
+	if *allFlag != "" {
+		for _, p := range strings.Split(*allFlag, ",") {
+			peers = append(peers, raft.NodeID(p))
+		}
 	}
 
 	logger := log.New(os.Stderr, fmt.Sprintf("[%s] ", *id), log.LstdFlags|log.Lmicroseconds)
