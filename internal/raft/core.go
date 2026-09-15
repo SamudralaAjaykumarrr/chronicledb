@@ -1081,8 +1081,33 @@ func (c *Core) advanceLeaderCommit(out *Output) {
 // Voters, it steps down to Follower immediately (waiting for commit,
 // not merely append, specifically avoids needlessly giving up
 // leadership for a change that might never actually succeed).
+//
+// "Committed" is the whole rule, and activeConfig alone cannot express
+// it: activeConfig is append-time-effective (§2.2), so from the instant
+// a self-removing EntryConfig is APPENDED this leader is already absent
+// from it. This helper runs after every successful advanceLeaderCommit,
+// including ones that commit an ordinary earlier entry sitting BELOW
+// the removal — a genuinely reachable case, since a C_new majority can
+// acknowledge an index this leader appended before the removal without
+// yet holding the removal itself. Testing activeConfig on its own
+// therefore surrendered leadership for a change that had not committed
+// and could still be truncated away, which is exactly what §4.2 says
+// waiting for commit exists to avoid. The node was then stranded as a
+// selfRemoved() follower — refusing client calls with ErrNodeRemoved
+// while still a committed voter, and neither campaigning nor granting
+// votes — until some new leader truncated the entry; in a two-voter
+// self-removal whose peer never received the entry, that is a
+// restart-surviving deadlock.
+//
+// activeConfigIndex <= commitIndex is that missing "committed" test.
+// It only ever DELAYS a step-down, never skips one: once the removal
+// entry itself commits, the very advanceLeaderCommit call that commits
+// it invokes this helper with commitIndex >= activeConfigIndex. An
+// activeConfigIndex of 0 means the configuration came from the snapshot
+// boundary or the bootstrap seed (§6.3), which is committed by
+// construction and correctly passes.
 func (c *Core) maybeStepDownAfterSelfRemoval(out *Output) {
-	if c.role != Leader || c.activeConfig.IsVoter(c.cfg.ID) {
+	if c.role != Leader || c.activeConfig.IsVoter(c.cfg.ID) || c.activeConfigIndex > c.commitIndex {
 		return
 	}
 	c.role = Follower

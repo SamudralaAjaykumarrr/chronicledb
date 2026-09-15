@@ -53,6 +53,15 @@ work as of this entry.
   entries, the very `EntryConfig` entry that adds the node itself.
 - A nil-map panic when the acknowledgement completing a self-removing
   leader's new quorum arrives mid-call.
+- A self-removing leader stepped down on *any* commit advance after its
+  removal entry was appended — including one committing an ordinary
+  earlier entry below it — because the step-down test consulted only
+  the append-time-effective `activeConfig`. §4.2 gates step-down on
+  that entry itself committing; until it does, the node was stranded as
+  a `selfRemoved()` follower, refusing client calls with
+  `ErrNodeRemoved` while still a committed voter and neither
+  campaigning nor granting votes. Found by the `v0.5.0` final
+  correctness review.
 - That same follower-side four-shape re-check compared whole `Member`
   values, including `Address`. Because every node seeds its bootstrap
   `Configuration` from its own `-listen` for itself and `-peers` for

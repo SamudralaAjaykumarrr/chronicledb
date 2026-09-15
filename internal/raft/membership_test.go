@@ -762,3 +762,71 @@ func TestActivateFromAppendedEntriesAcceptsAddressSpellingDrift(t *testing.T) {
 		t.Fatalf("activeConfig = %+v, want the leader's replicated view %+v (convergence is on what replicated, not on this node's own bootstrap spelling)", c.activeConfig, leaderView)
 	}
 }
+
+// TestSelfRemovalStepDownWaitsForTheRemovalItselfToCommit regresses a
+// real defect found by the v0.5.0 final correctness review:
+// maybeStepDownAfterSelfRemoval tested only activeConfig, which is
+// append-time-effective, so ANY commit advance after a self-removing
+// EntryConfig was appended — including one for an ordinary entry
+// strictly BELOW it — made the leader step down while its own removal
+// was still uncommitted and still truncatable. §4.2 requires the
+// opposite: step down "once the entry COMMITS (not merely appends —
+// waiting for commit specifically avoids needlessly giving up
+// leadership for a change that might never actually succeed)".
+func TestSelfRemovalStepDownWaitsForTheRemovalItselfToCommit(t *testing.T) {
+	c := leaderReadyForConfigChange(t, []NodeID{"a", "b", "c", "d"})
+
+	// An ordinary client entry appended BEFORE the self-removal and not
+	// yet acknowledged by anyone.
+	normal := c.handlePropose([]byte("client-write"))
+	applyPersist(t, c, normal)
+	normalIdx := c.lastIndex()
+
+	out, err := c.ProposeConfigChange(RemoveServerChange, "self-remove", "a", "")
+	if err != nil {
+		t.Fatalf("ProposeConfigChange: %v", err)
+	}
+	applyPersist(t, c, out)
+	cfgIdx := c.activeConfigIndex
+	if cfgIdx <= normalIdx {
+		t.Fatalf("test setup: the config entry (%d) must sit above the normal entry (%d)", cfgIdx, normalIdx)
+	}
+	if c.activeConfig.IsVoter("a") {
+		t.Fatal("activeConfig must exclude the self-removing leader immediately on append (§2.2)")
+	}
+
+	// b and c acknowledge only the EARLIER normal entry: a genuine
+	// C_new ({b,c,d}, majority 2) quorum for normalIdx, and none at all
+	// for the removal.
+	for _, peer := range []NodeID{"b", "c"} {
+		c.Step(Input{Kind: InputMessage, Message: Message{
+			Type: MsgAppendEntriesResponse, From: peer, To: "a", Term: c.currentTerm,
+			Success: true, MatchIndex: normalIdx,
+		}})
+	}
+	if c.commitIndex != normalIdx {
+		t.Fatalf("commitIndex = %d, want the earlier normal entry %d to have committed", c.commitIndex, normalIdx)
+	}
+	if c.commitIndex >= cfgIdx {
+		t.Fatalf("test setup: the self-removal entry must still be uncommitted (commitIndex=%d, cfgIdx=%d)", c.commitIndex, cfgIdx)
+	}
+	if c.role != Leader {
+		t.Fatalf("leader stepped down at commitIndex=%d while its own removal at index %d is still uncommitted; §4.2 gates step-down on that entry committing", c.commitIndex, cfgIdx)
+	}
+
+	// Now the removal itself reaches a C_new majority: the same
+	// advanceLeaderCommit call that commits it must step this leader
+	// down, with no further input needed.
+	for _, peer := range []NodeID{"b", "c"} {
+		c.Step(Input{Kind: InputMessage, Message: Message{
+			Type: MsgAppendEntriesResponse, From: peer, To: "a", Term: c.currentTerm,
+			Success: true, MatchIndex: cfgIdx,
+		}})
+	}
+	if c.commitIndex < cfgIdx {
+		t.Fatalf("commitIndex = %d, want the self-removal entry at %d to have committed", c.commitIndex, cfgIdx)
+	}
+	if c.role != Follower {
+		t.Fatalf("role after the self-removal entry committed = %v, want Follower", c.role)
+	}
+}
