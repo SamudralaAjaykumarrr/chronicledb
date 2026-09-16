@@ -304,10 +304,13 @@ func init() {
 	if entryPayloadTypeSentinel == fsm.ControlCommandMarker {
 		panic(fmt.Sprintf("node: entryPayloadTypeSentinel (%d) collides with fsm.ControlCommandMarker (%d)", entryPayloadTypeSentinel, fsm.ControlCommandMarker))
 	}
-	// commitTxnCommandVersion is not exported, but it is documented (and
-	// tested, fsm.TestEntryPayloadSentinelNeverCollides) to be a small,
-	// sequentially-incrementing integer starting at 1 — realistically
-	// never reaching 0xFF within CommitTxn's own version lineage.
+	// commitTxnCommandVersion is not exported, so it cannot be compared
+	// here; it is documented to be a small, sequentially-incrementing
+	// integer starting at 1 — realistically never reaching 0xFF within
+	// CommitTxn's own version lineage. TestEntryPayloadSentinelNeverCollides
+	// (entry_payload_compat_test.go, this package) pins that by reading
+	// the version byte back off fsm.EncodeCommitTxn's own output rather
+	// than restating the constant.
 }
 
 // testStripTypedHeaderOnStaleGeneration, when true, makes
