@@ -272,9 +272,26 @@ this ADR. By level:
   table's idempotency and generation-gated persistence, the snapshot v2
   format including its `hasConfig`/`configLen` cross-check, the
   restore membership-isolation transform including its negative
-  control, `FuzzDecodeEntryConfig`, `FuzzDecodeEntryPayload`,
-  `TestControlKindRangesNeverCollide`, and
-  `TestEntryPayloadSentinelNeverCollides`.
+  control, `FuzzDecodeEntryConfig`, `FuzzDecodeEntryPayload`, and
+  `TestControlKindRangesNeverCollide`.
+- Cross-package format compatibility (`internal/node`, the smallest
+  package that legitimately imports both `internal/raft` and
+  `internal/fsm`): `TestEntryPayloadSentinelNeverCollides`, plus the two
+  independent old-binary-fails-closed proofs §19 gate 5 requires —
+  `TestOldBinaryFailsClosedOnEntryConfigWirePayload` (the §2.5 wire
+  path: `gob` drops `Entry.Type`, so a pre-`v0.5.0` binary routes the
+  entry on `Data[0] == 0xF0` into `fsm.DecodeSetClusterVersion`, which
+  must fail closed on the membership kind byte) and
+  `TestOldBinaryFailsClosedOnTypedEntryConfigWALPayload` (the §6.1a disk
+  path, independent of the wire path because it exercises the typed
+  header the wire never carries: an old `decodeEntryPayload` returns
+  everything after the term, so the sentinel lands in
+  `fsm.DecodeCommitTxn`'s version position and must be refused). Both
+  assert against a genuine durable WAL record for an entry
+  `Core.ProposeConfigChange` produced, not a synthesized payload
+  (`internal/node/entry_payload_compat_test.go`). These three landed
+  after the rest of this ADR, in the `v0.5.0` release-qualification
+  pass that found them missing.
 - Real-process level (`internal/node`, `cmd/chronicledb-node`): the
   full add/promote/remove lifecycle against a genuinely new process
   joining with an empty peer list, the sub-three-voter confirmation

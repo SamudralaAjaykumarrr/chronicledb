@@ -11,11 +11,19 @@ jobs:
       - uses: actions/checkout@v7
         with:
           # Full history (not the default shallow, single-commit
-          # checkout) is required: cmd/chronicledb-node/mixed_version_test.go
-          # builds a real "old" chronicledb-node binary from the
-          # previous release tag (v0.3.0) via a temporary `git worktree
-          # add`, which needs that historical commit to actually be
-          # present in this checkout's object database.
+          # checkout) is required: the compatibility tests under
+          # cmd/chronicledb-node build real "old" chronicledb-node
+          # binaries from previously-released tags via a temporary `git
+          # worktree add`, which needs those historical commits to
+          # actually be present in this checkout's object database.
+          # More than one tag is used, and the set grows with each
+          # release that adds a compatibility boundary:
+          #   - v0.3.0 — mixed_version_test.go's pre-v0.4.0 baseline,
+          #     for the generation/rollback boundary v0.4.0 introduced.
+          #   - v0.4.0 — mixed_version_membership_test.go and
+          #     membership_snapshot_backup_test.go, for v0.5.0's
+          #     FormatVersion 1 snapshot, real old-binary backup, and
+          #     mixed-binary dynamic-membership proofs.
           fetch-depth: 0
       - uses: actions/setup-go@v7
         with:
@@ -92,6 +100,10 @@ jobs:
         run: go test ./internal/raft/... -fuzz FuzzAppendEntriesReconciliation -fuzztime 15s
       - name: fuzz smoke (raft request-vote handling)
         run: go test ./internal/raft/... -fuzz FuzzRequestVoteHandling -fuzztime 15s
+      - name: fuzz smoke (raft membership config-change decode)
+        run: go test ./internal/raft/... -fuzz FuzzDecodeEntryConfig -fuzztime 15s
+      - name: fuzz smoke (node typed entry payload decode)
+        run: go test ./internal/node/... -fuzz FuzzDecodeEntryPayload -fuzztime 15s
       - name: fuzz smoke (transport frame decode)
         run: go test ./internal/transport/... -fuzz FuzzReadFrame -fuzztime 15s
       - name: fuzz smoke (sql parser)
