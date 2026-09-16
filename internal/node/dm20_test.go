@@ -137,7 +137,7 @@ func TestDM20_EntryTypeSurvivesWALRoundTripAcrossFinalizationBoundary(t *testing
 		t.Fatalf("F's durable WAL payload for the EntryConfig entry at index %d does not begin with the typed-entry header (0xFF, EntryConfig): %x", entryIdx, payload)
 	}
 
-	preRestartConfig := f.core.ActiveConfig()
+	preRestartConfig := liveConfig(t, f)
 	if !preRestartConfig.IsMember("dm20-learner") {
 		t.Fatal("test setup: F's pre-restart activeConfig does not include the learner it just caught up on")
 	}
@@ -145,7 +145,7 @@ func TestDM20_EntryTypeSurvivesWALRoundTripAcrossFinalizationBoundary(t *testing
 	tc.crash(fID)
 	f2 := tc.restart(fID)
 
-	if got := f2.core.ActiveConfig(); !got.Equal(preRestartConfig) {
+	if got := liveConfig(t, f2); !got.Equal(preRestartConfig) {
 		t.Fatalf("F's recovered activeConfig after restart = %+v, want byte-identical to its pre-restart one %+v", got, preRestartConfig)
 	}
 
@@ -192,7 +192,7 @@ func TestDM20_NegativeControlGenerationGatedEncodingFailsTheProof(t *testing.T) 
 	tc.crash(fID)
 	f2 := tc.restart(fID)
 
-	if got := f2.core.ActiveConfig(); got.IsMember("dm20-learner-neg") {
+	if got := liveConfig(t, f2); got.IsMember("dm20-learner-neg") {
 		t.Fatalf("negative control: F's recovered configuration includes the learner despite the stripped typed header — expected a stale, pre-change configuration, got %+v", got)
 	}
 }

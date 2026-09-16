@@ -52,11 +52,73 @@ func membershipVoterCount(t *testing.T, n *Node) int {
 	return voters
 }
 
+// liveConfig returns n's active raft.Configuration, read through the
+// event loop rather than off Core directly.
+//
+// A live *Node's Core belongs exclusively to its run() goroutine
+// (dynamic-membership plan §6.3a's event-loop-only rule), and
+// activateFromAppendedEntries writes activeConfig from there the instant
+// an EntryConfig is appended. A test that reaches into n.core from the
+// test goroutine therefore races that write for real — not theoretically:
+// under `-race -tags=integration` it is reported as a genuine DATA RACE
+// between Core.ActiveConfig and Core.activateFromAppendedEntries, and it
+// was doing so in roughly 1 run in 15 of this package. MembershipStatus
+// already dispatches through the same event loop that owns Core, so it
+// is the accessor tests must use for a live node. (Core may still be
+// touched directly by a harness that runs no event loop at all — see
+// newDeterministicLeaderForDM17 — because there is no second goroutine
+// to race with there.)
+//
+// MatchIndex/Lag/Generation are deliberately dropped: this reconstructs
+// exactly the ID/Address pairs raft.Configuration carries, so the result
+// compares with Configuration.Equal as callers expect.
+func liveConfig(t *testing.T, n *Node) raft.Configuration {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	res, err := n.MembershipStatus(ctx)
+	if err != nil {
+		t.Fatalf("MembershipStatus: %v", err)
+	}
+	toMembers := func(ms []MemberStatus) []raft.Member {
+		if len(ms) == 0 {
+			return nil
+		}
+		out := make([]raft.Member, 0, len(ms))
+		for _, m := range ms {
+			out = append(out, raft.Member{ID: m.ID, Address: m.Address})
+		}
+		return out
+	}
+	return raft.Configuration{Voters: toMembers(res.Voters), Learners: toMembers(res.Learners)}
+}
+
 // mustFinalizeToMax brings tc's cluster all the way to this binary's own
 // MaxSupportedGeneration via the leader, so membership operations (which
 // require generation >= 2) are legal (dynamic-membership plan §8.2).
 func mustFinalizeToMax(t *testing.T, tc *testCluster, leader *Node) {
 	t.Helper()
+	// Finalization is every caller's precondition, never the thing under
+	// test: a multi-round-trip, leader-only sequence (precheck
+	// convergence, then one ProposeControl per generation) driven
+	// against a leader reference the caller already holds. A spontaneous
+	// re-election anywhere inside it deposes that leader and surfaces
+	// here as "not leader (leader unknown)" — indistinguishable, from
+	// this helper, from a real defect.
+	//
+	// configFor's election budget is 50-100ms (5+jitter 5 ticks at
+	// 10ms). That is ample for ordinary per-entry fsync latency, but
+	// under `go test -race -tags=integration ./...` several
+	// race-instrumented package binaries run concurrently and a
+	// follower's event loop can be descheduled past it, so the
+	// re-election is not rare: it cost roughly 1 run in 6 of this
+	// package. Freeze the election clock for the duration instead of
+	// widening that budget — testCluster.pauseTicking's own doc comment
+	// explains why that is the right remedy, and heartbeat ticks keep
+	// running so replication and catch-up are unaffected.
+	tc.pauseTicking()
+	defer tc.resumeTicking()
+
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	awaitPrecheckReady(t, leader, "every node runs this same binary and all are reachable")

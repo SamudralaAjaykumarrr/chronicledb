@@ -227,7 +227,7 @@ func TestDM17Remove_WithLeaderFailover(t *testing.T) {
 	}
 
 	newLeader := tc.node(newLeaderID)
-	if !newLeader.core.ActiveConfig().IsVoter(target) {
+	if !liveConfig(t, newLeader).IsVoter(target) {
 		t.Fatalf("target %s is no longer a voter on the new leader, want the removal to not have committed", target)
 	}
 	if got := membershipVoterCount(t, newLeader); got != 4 {
@@ -275,7 +275,7 @@ func TestDM17SelfRemoval_WithLeaderFailover(t *testing.T) {
 	}
 
 	newLeader := tc.node(newLeaderID)
-	if !newLeader.core.ActiveConfig().IsVoter(leaderID) {
+	if !liveConfig(t, newLeader).IsVoter(leaderID) {
 		t.Fatalf("former leader %s is no longer a voter on the new leader, want the self-removal to not have committed", leaderID)
 	}
 	if got := membershipVoterCount(t, newLeader); got != 4 {

@@ -93,7 +93,7 @@ func TestFirstConfigChangeToleratesBootstrapAddressSpellingDrift(t *testing.T) {
 	// this test is exercising the fault it claims to.
 	spellings := make(map[string]bool)
 	for _, id := range ids {
-		for _, v := range nodes[id].core.ActiveConfig().Voters {
+		for _, v := range liveConfig(t, nodes[id]).Voters {
 			if v.ID == "n1" {
 				spellings[v.Address] = true
 			}
@@ -102,6 +102,34 @@ func TestFirstConfigChangeToleratesBootstrapAddressSpellingDrift(t *testing.T) {
 	if len(spellings) < 2 {
 		t.Fatalf("test setup: every node agrees on n1's bootstrap address (%v); this test must inject a genuine spelling divergence", spellings)
 	}
+
+	// Finalization is this test's precondition, not its subject: it is a
+	// multi-round-trip, leader-only sequence, and a spontaneous
+	// re-election or a not-yet-converged precheck anywhere inside it
+	// fails the test for reasons that have nothing to do with address
+	// spelling. Both guards below mirror what every other finalize call
+	// site in this package already does (mustFinalizeToMax); this one
+	// was the single site 88868ae's sweep missed, and it is why this
+	// test failed roughly 2 runs in 11 under `-race -tags=integration`
+	// with the host loaded.
+	//
+	// Freeze the election clock first, so the leader reference stays
+	// valid across the sequence (heartbeats keep flowing — see
+	// testCluster.pauseTicking / Node.electionTicksPaused for why this
+	// is the right remedy rather than a wider timeout), then wait for
+	// precheck to actually report Ready: FinalizeUpgrade requires the
+	// leader to have recorded a generation for every voter peer, which
+	// it only ever learns from a message it RECEIVES, so calling it
+	// straight after the election is a race, not a slow path.
+	for _, id := range ids {
+		nodes[id].PauseTicksForTest()
+	}
+	defer func() {
+		for _, id := range ids {
+			nodes[id].ResumeTicksForTest()
+		}
+	}()
+	awaitPrecheckReady(t, leader, "every node runs this same binary and all are reachable")
 
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
@@ -127,11 +155,11 @@ func TestFirstConfigChangeToleratesBootstrapAddressSpellingDrift(t *testing.T) {
 		t.Fatalf("AddLearner outcome = %+v, want committed", outcome)
 	}
 
-	want := leader.core.ActiveConfig()
+	want := liveConfig(t, leader)
 	for _, id := range ids {
 		id := id
 		awaitCondition(t, 10*time.Second, "node "+string(id)+" adopts the replicated configuration", func() bool {
-			return nodes[id].core.ActiveConfig().Equal(want)
+			return liveConfig(t, nodes[id]).Equal(want)
 		})
 		if err := nodes[id].Err(); err != nil {
 			t.Fatalf("node %s stopped with a fatal error: %v", id, err)
@@ -139,7 +167,7 @@ func TestFirstConfigChangeToleratesBootstrapAddressSpellingDrift(t *testing.T) {
 	}
 	// Convergence is on the leader's spelling, replicated — not on each
 	// node's own bootstrap view.
-	got := nodes["n1"].core.ActiveConfig()
+	got := liveConfig(t, nodes["n1"])
 	if len(got.Learners) != 1 || got.Learners[0].ID != "n4" {
 		t.Fatalf("n1's configuration after the add = %+v, want exactly one learner n4", got)
 	}

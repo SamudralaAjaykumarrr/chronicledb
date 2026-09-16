@@ -236,8 +236,13 @@ func TestDM21_RestoreCarriesNoSourceMembershipFromEitherCarrier(t *testing.T) {
 	awaitCondition(t, 5*time.Second, "m1 elects itself leader under its bootstrap configuration", func() bool {
 		return m1.Status().Role == raft.Leader
 	})
+	// Read through Status, not off Core/appliedIndex directly: both
+	// belong to m1's run() goroutine, and this is a polling loop on the
+	// test goroutine — exactly the shape the race detector reports as a
+	// genuine DATA RACE elsewhere in this package (see liveConfig).
 	awaitCondition(t, 5*time.Second, "m1 applies its full restored log", func() bool {
-		return m1.core.CommitIndex() == m1.core.LastIndex() && m1.appliedIndex >= uint64(m1.core.LastIndex())
+		st := m1.Status()
+		return st.CommitIndex == st.LastIndex && st.AppliedIndex >= uint64(st.LastIndex)
 	})
 
 	cfg, atIdx := m1.core.ConfigAt(m1.core.LastIndex())
