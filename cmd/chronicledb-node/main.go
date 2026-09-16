@@ -469,6 +469,25 @@ func (s *controlServer) handleFault(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	action := r.URL.Query().Get("action")
+
+	// Node-scoped actions, checked before the peer requirement below:
+	// unlike the transport faults, these name no peer. They hold and
+	// release dynamic-membership plan §11's post-election not-ready
+	// boundary (internal/node.HoldElectionNoOpForTest), which no
+	// transport fault can express — the election and the no-op commit
+	// need the same majority of the same voters, so any block that
+	// stalls the no-op also prevents the election before it.
+	switch action {
+	case "holdelectionnoop":
+		s.n.HoldElectionNoOpForTest()
+		w.WriteHeader(http.StatusOK)
+		return
+	case "releaseelectionnoop":
+		s.n.ReleaseElectionNoOpForTest()
+		w.WriteHeader(http.StatusOK)
+		return
+	}
+
 	peer := raft.NodeID(r.URL.Query().Get("peer"))
 	if peer == "" {
 		http.Error(w, "peer is required", http.StatusBadRequest)

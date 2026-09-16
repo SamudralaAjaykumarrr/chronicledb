@@ -125,11 +125,64 @@ func TestRealMembership_GenerationGateBothSides(t *testing.T) {
 	}
 }
 
+// requireHeldLeaderNotReady asserts §11's boundary on a leader whose
+// election no-op is held: changesReady:false with notReadyReason
+// "no-current-term-commit". Because the hold makes that state stable,
+// this is an assertion, not a wait — the only thing it retries is the
+// question of *which* survivor is currently leader, since a leader that
+// steps down mid-call answers the unrelated "not-leader" instead. Any
+// other reason, and any ready answer, fails on the spot rather than
+// being retried away.
+func requireHeldLeaderNotReady(t *testing.T, survivors []*realNode, leader *realNode) *realNode {
+	t.Helper()
+	for attempt := 0; attempt < len(survivors)+1; attempt++ {
+		st, status, err := membershipStatusHTTP(leader)
+		if err != nil || status != http.StatusOK {
+			t.Fatalf("membership status on held leader %s: status=%d err=%v", leader.id, status, err)
+		}
+		if st.ChangesReady {
+			t.Fatalf("leader %s reports changesReady:true while its election no-op is held — "+
+				"it cannot have committed an entry of its own term (§11); status=%+v", leader.id, st)
+		}
+		if st.NotReadyReason == "no-current-term-commit" {
+			return leader
+		}
+		if st.NotReadyReason != "not-leader" {
+			t.Fatalf("held leader %s reports notReadyReason %q, want \"no-current-term-commit\"; status=%+v",
+				leader.id, st.NotReadyReason, st)
+		}
+		leader = awaitLeaderV2(t, survivors, 10*time.Second)
+	}
+	t.Fatalf("leadership never settled across %d survivors while the election no-op was held", len(survivors))
+	return nil
+}
+
 // TestRealMembership_PostElectionNotReadyWindowIsRealAndTransient
 // proves dynamic-membership plan §11 against real processes: right
 // after a real election, /admin/membership/status must report
 // changesReady:false with notReadyReason "no-current-term-commit",
 // and that must flip to true without any operator action.
+//
+// The boundary is held open deliberately rather than raced for. Every
+// surviving node is put into internal/node's HoldElectionNoOpForTest
+// state through the existing /fault control plane before the leader is
+// killed, so whichever node wins the ensuing real election stops at
+// exactly §11's boundary — genuinely Leader, genuinely with no entry of
+// its own term committed — and *stays* there. Both halves of §11 are
+// then ordinary assertions on a stable state: not-ready while held, and
+// ready after the hold is released, the release returning only once the
+// node has actually re-proposed the no-op.
+//
+// The revision this replaces polled in a tight loop hoping to catch the
+// window before the no-op committed, which is one real fsync-backed
+// AppendEntries round trip in *uninstrumented* child processes. Under
+// -race or CPU contention the observer slows down while that window does
+// not, so the poller lost the race and the test failed spuriously —
+// reproduced at roughly 1 run in 7 under contention, and observed
+// without -race too. Nothing about the product was ever wrong; the
+// observation method was. Do not reintroduce polling here: the
+// assertions below must stay statements about a state the test controls,
+// never about how fast it can issue HTTP requests.
 func TestRealMembership_PostElectionNotReadyWindowIsRealAndTransient(t *testing.T) {
 	bin := buildBinary(t)
 	nodes := newRealCluster(t, bin, 3)
@@ -137,46 +190,41 @@ func TestRealMembership_PostElectionNotReadyWindowIsRealAndTransient(t *testing.
 	finalizeRealClusterToGeneration2(t, leader, nodes)
 
 	oldLeaderID := leader.id
-	leader.crash()
-
-	// Race, in one tight loop with no sleep at all, against every
-	// remaining node's /admin/membership/status: waiting for
-	// awaitLeaderV2 first (50ms poll granularity against /status) would
-	// very likely miss this transient window entirely, since the
-	// election no-op's own commit (bounded by one real fsync-backed
-	// AppendEntries round trip to a majority) can complete well inside
-	// that granularity. A node not yet leader, or one that is leader
-	// but has not yet even attempted the no-op, simply reports
-	// ChangesReady:false for a different reason (or an empty response);
-	// only a genuine transition away from "no-current-term-commit"
-	// counts as the observation this test needs.
-	observedNotReady := false
-	var newLeaderID string
-	deadline := time.Now().Add(10 * time.Second)
-	for time.Now().Before(deadline) {
-		for _, rn := range nodes {
-			if rn.id == oldLeaderID {
-				continue
-			}
-			st, status, err := membershipStatusHTTP(rn)
-			if err != nil || status != http.StatusOK {
-				continue
-			}
-			if !st.ChangesReady && st.NotReadyReason == "no-current-term-commit" {
-				observedNotReady = true
-				newLeaderID = rn.id
-			}
-			if observedNotReady && rn.id == newLeaderID && st.ChangesReady {
-				goto observed
-			}
+	survivors := make([]*realNode, 0, len(nodes)-1)
+	for _, rn := range nodes {
+		if rn.id != oldLeaderID {
+			survivors = append(survivors, rn)
 		}
 	}
-observed:
-	if !observedNotReady {
-		t.Fatal("never observed changesReady:false with notReadyReason \"no-current-term-commit\" after the real election")
+
+	// Arm every survivor, not just the eventual winner: which one wins
+	// the real election is genuinely not this test's to choose, and
+	// arming all of them makes "the new leader is held" true regardless.
+	for _, rn := range survivors {
+		if err := postFault(rn, "holdelectionnoop", ""); err != nil {
+			t.Fatalf("arming election-no-op hold on %s: %v", rn.id, err)
+		}
 	}
-	newLeader := thirdVoterNode(nodes, newLeaderID)
-	awaitCondition2(t, 5*time.Second, "changesReady flips to true without operator action", func() bool {
+
+	leader.crash()
+	newLeader := awaitLeaderV2(t, survivors, 10*time.Second)
+
+	// Held, so this is a stable state, asserted directly rather than
+	// waited for. A leader that lost leadership between awaitLeaderV2
+	// and this call would answer "not-leader"; that is a different
+	// (correct) reason, so it is retried against the new leader rather
+	// than failed on — but every other answer, including a ready one,
+	// fails immediately. This tolerates leader identity churn; it does
+	// not wait for the property under test to appear.
+	newLeader = requireHeldLeaderNotReady(t, survivors, newLeader)
+
+	// Release only the leader's hold. Readiness must then advance with
+	// no membership call, no write, and no operator action — by the
+	// production path (proposeElectionNoOp) alone.
+	if err := postFault(newLeader, "releaseelectionnoop", ""); err != nil {
+		t.Fatalf("releasing election-no-op hold on %s: %v", newLeader.id, err)
+	}
+	awaitCondition2(t, 10*time.Second, "changesReady flips to true without operator action", func() bool {
 		st, status, err := membershipStatusHTTP(newLeader)
 		return err == nil && status == http.StatusOK && st.ChangesReady
 	})

@@ -410,6 +410,33 @@ type Node struct {
 	// from a test goroutine but read from run()'s event-loop goroutine.
 	electionTicksPaused atomic.Bool
 
+	// electionNoOpHeld, when set via HoldElectionNoOpForTest, makes this
+	// node skip proposeElectionNoOp on winning an election, holding it
+	// at exactly the boundary dynamic-membership plan §11 describes:
+	// Leader, but with no entry of its own current term committed, so
+	// Core.ConfigChangeReady() reports "no-current-term-commit". It is
+	// the readiness-boundary analogue of electionTicksPaused above — a
+	// test-only determinism seam of the same kind, baked into production
+	// code but only ever set by a test.
+	//
+	// It exists because that boundary is otherwise unobservable without
+	// racing the wall clock: the window closes as soon as the no-op
+	// commits, which is one fsync-backed AppendEntries round trip, and
+	// no transport-level control can hold it open. Election quorum and
+	// no-op-commit quorum are the same majority of the same voter set,
+	// each needing the same peers to both receive and send, so
+	// Transport.Block/BlockSend/BlockRecv cannot permit the election
+	// while denying the commit — blocking enough peers to stall the
+	// no-op also prevents the election that precedes it.
+	//
+	// Holding suppresses only this node's own synthetic no-op. It
+	// changes no Raft rule and no readiness rule: a held leader is
+	// genuinely not ready by the ordinary production predicate, and an
+	// ordinary client write in the new term would close the window
+	// exactly as it always does. An atomic.Bool because it is written
+	// from a test/control goroutine but read from run()'s event loop.
+	electionNoOpHeld atomic.Bool
+
 	appliedIndex uint64
 	waiters      map[raft.Index]waiter
 	pendingReads []pendingRead
@@ -477,9 +504,14 @@ type Node struct {
 	precheckCh         chan precheckReq
 	membershipCh       chan membershipReq
 	membershipStatusCh chan membershipStatusReq
-	stopCh             chan struct{}
-	doneCh             chan struct{}
-	stopOnce           sync.Once
+	// releaseNoOpCh carries ReleaseElectionNoOpForTest's request onto
+	// run()'s goroutine, which is the only one permitted to touch Core
+	// (and therefore the only one that may re-propose the no-op the
+	// hold suppressed). Test-only; nothing in production ever sends.
+	releaseNoOpCh chan chan struct{}
+	stopCh        chan struct{}
+	doneCh        chan struct{}
+	stopOnce      sync.Once
 
 	statusMu sync.Mutex
 	status   Status
@@ -671,6 +703,7 @@ func Open(cfg Config) (*Node, error) {
 		precheckCh:         make(chan precheckReq),
 		membershipCh:       make(chan membershipReq),
 		membershipStatusCh: make(chan membershipStatusReq),
+		releaseNoOpCh:      make(chan chan struct{}),
 		stopCh:             make(chan struct{}),
 		doneCh:             make(chan struct{}),
 	}
@@ -747,6 +780,39 @@ func (n *Node) PauseTicksForTest() { n.electionTicksPaused.Store(true) }
 // ResumeTicksForTest reverses PauseTicksForTest. Safe to call from any
 // goroutine.
 func (n *Node) ResumeTicksForTest() { n.electionTicksPaused.Store(false) }
+
+// HoldElectionNoOpForTest makes this node skip proposeElectionNoOp the
+// next time it wins an election, holding it at dynamic-membership plan
+// §11's post-election not-ready boundary — Leader, with no current-term
+// entry committed, so /admin/membership/status reports
+// changesReady:false, notReadyReason:"no-current-term-commit" — as a
+// stable state rather than a window a test has to catch.
+//
+// Test-only — never called from production code (in cmd/chronicledb-node
+// it is reachable only through the /fault control plane, which is itself
+// off unless -enable-fault-endpoint is passed). It weakens no invariant:
+// the no-op is a liveness convenience (see proposeElectionNoOp), not a
+// safety requirement, and a held leader is not-ready by the ordinary
+// production predicate, not by a test-only one. Safe to call from any
+// goroutine. See Node.electionNoOpHeld for why a transport-level
+// control cannot express this boundary.
+func (n *Node) HoldElectionNoOpForTest() { n.electionNoOpHeld.Store(true) }
+
+// ReleaseElectionNoOpForTest reverses HoldElectionNoOpForTest and, if
+// this node is currently Leader, immediately proposes the no-op its
+// election skipped — so readiness then advances by exactly the
+// production path, with no operator action, as §11 describes. It
+// returns once run() has done so, giving a test a happens-before edge
+// instead of a sleep. Test-only. Safe to call from any goroutine; a
+// no-op once the node has stopped.
+func (n *Node) ReleaseElectionNoOpForTest() {
+	ack := make(chan struct{})
+	select {
+	case n.releaseNoOpCh <- ack:
+		<-ack
+	case <-n.doneCh:
+	}
+}
 
 // Status returns a snapshot of the node's current diagnostic state.
 // Safe to call from any goroutine.
@@ -1224,6 +1290,18 @@ func (n *Node) run() {
 			n.handleMembership(req)
 		case req := <-n.membershipStatusCh:
 			req.resultCh <- n.computeMembershipStatus()
+		case ack := <-n.releaseNoOpCh:
+			// Test-only (ReleaseElectionNoOpForTest). Clearing the hold
+			// alone would leave a leader that already won its election
+			// stuck below the readiness predicate forever, since
+			// proposeElectionNoOp is only ever reached from the
+			// BecameLeader edge — so the release re-runs it here, on the
+			// one goroutine allowed to drive Core.
+			n.electionNoOpHeld.Store(false)
+			if n.core.Role() == raft.Leader {
+				n.proposeElectionNoOp()
+			}
+			close(ack)
 		case <-n.stopCh:
 			return
 		}
@@ -1510,7 +1588,9 @@ func (n *Node) processOutput(out raft.Output) {
 	if out.BecameLeader {
 		n.metrics.LeaderChangesTotal.Inc()
 		n.logf("node %s became leader for term %d", n.cfg.ID, n.core.CurrentTerm())
-		n.proposeElectionNoOp()
+		if !n.electionNoOpHeld.Load() {
+			n.proposeElectionNoOp()
+		}
 	}
 
 	n.checkPendingReads()
