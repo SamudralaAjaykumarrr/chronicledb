@@ -23,8 +23,10 @@ review process is now open; no review has concluded, and no maturity
 claim beyond `EXTERNAL-REVIEW READY` is made until one does (see
 [`docs/external-review-findings.md`](docs/external-review-findings.md),
 currently zero entries). See [`docs/roadmap.md`](docs/roadmap.md)
-§Maturity Model for exactly why that distinction matters here, and
-[`CHANGELOG.md`](CHANGELOG.md) for what `v0.1.0` contains.
+§Maturity Model for exactly why that distinction matters here.
+`v0.5.0` (Dynamic Membership) is the current published release; see
+[`CHANGELOG.md`](CHANGELOG.md) for the full release history since
+`v0.1.0`.
 
 ## Quickstart
 
@@ -379,24 +381,24 @@ untested.
 - **No joins, subqueries, secondary indexes, or PostgreSQL wire
   compatibility** in the SQL frontend — see [`docs/sql.md`](docs/sql.md)
   §8.
-- **Dynamic Membership is implemented** (as of `v0.5.0`, not yet tagged)
-  — a running cluster's voter/learner membership can change with no
-  downtime: add a learner, promote a caught-up learner to voter, and
-  remove a voter or learner, including a leader removing itself (it
-  steps down the instant that removal commits and the remaining voters
-  elect a successor). Membership is Raft-consensus-level state, so a
-  removed or restarted node recovers the same configuration
-  deterministically. Four admin-gated, audited HTTP endpoints
-  (`/admin/membership/add`/`promote`/`remove`/`status`) drive it, and
-  every mutating call is gated on the cluster having finalized to
-  generation 2 (`docs/upgrades.md` §8a). **Exactly one change may be
-  outstanding at a time** — single-server transitions, not joint
-  consensus — and every change is operator-triggered; there is no
-  automatic or failure-triggered reconfiguration. Targets three-to-seven
-  voters plus learners. See [`docs/membership.md`](docs/membership.md)
-  for the operator runbook and
-  [`ADR-0018`](docs/adr/0018-dynamic-membership-architecture.md) for the
-  design.
+- **Dynamic Membership is implemented** (as of `v0.5.0`, the current
+  published release) — a running cluster's voter/learner membership
+  can change with no downtime: add a learner, promote a caught-up
+  learner to voter, and remove a voter or learner, including a leader
+  removing itself (it steps down the instant that removal commits and
+  the remaining voters elect a successor). Membership is
+  Raft-consensus-level state, so a removed or restarted node recovers
+  the same configuration deterministically. Four admin-gated, audited
+  HTTP endpoints (`/admin/membership/add`/`promote`/`remove`/`status`)
+  drive it, and every mutating call is gated on the cluster having
+  finalized to generation 2 (`docs/upgrades.md` §8a). **Exactly one
+  change may be outstanding at a time** — single-server transitions,
+  not joint consensus — and every change is operator-triggered; there
+  is no automatic or failure-triggered reconfiguration. Targets
+  three-to-seven voters plus learners. See
+  [`docs/membership.md`](docs/membership.md) for the operator runbook
+  and [`ADR-0018`](docs/adr/0018-dynamic-membership-architecture.md)
+  for the design.
 - **Single logical shard** — no sharding, no multi-shard architecture or
   cross-shard distributed transactions, and no cross-region replication.
   Membership can change at runtime (above), but the cluster is always

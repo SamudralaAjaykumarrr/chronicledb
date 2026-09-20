@@ -4,11 +4,11 @@ All notable changes to ChronicleDB are documented here. Format loosely
 follows [Keep a Changelog](https://keepachangelog.com/); versioning
 follows [`docs/versioning.md`](docs/versioning.md) (SemVer, pre-1.0).
 
-## [Unreleased] — `v0.5.0` Dynamic Membership (in progress)
+## [0.5.0] - 2026-09-20
 
 Dynamic Membership — the fourth phase of the
 `docs/enterprise-v1-plan.md` Enterprise V1 roadmap (§8, target release
-`v0.5.0`). **Not yet tagged or released.** See
+`v0.5.0`). See
 `docs/dynamic-membership-plan.md` and
 `docs/adr/0018-dynamic-membership-architecture.md` for the complete
 design, `docs/membership.md` for the operator runbook, and that ADR's

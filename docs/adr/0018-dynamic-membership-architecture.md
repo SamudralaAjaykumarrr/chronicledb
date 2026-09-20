@@ -237,7 +237,7 @@ design question.
   byte layout* (never an import) for its restore-side transform.
 - Several real, previously-latent defects were found and fixed while
   implementing this design, all now regression-tested — see
-  `CHANGELOG.md`'s `[Unreleased]` entry for the complete list. Two are
+  `CHANGELOG.md`'s `[0.5.0]` entry for the complete list. Two are
   worth calling out here because real-cluster testing (not unit tests)
   is specifically what found them: `raft.Core.handleInstallSnapshotRequest`
   accepted a stale/duplicated `InstallSnapshotRequest` already below
