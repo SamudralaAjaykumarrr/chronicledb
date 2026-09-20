@@ -30,3 +30,7 @@ skeleton.
 | [0015](0015-security-foundation.md) | Security Foundation architecture |
 | [0016](0016-backup-disaster-recovery-and-pitr.md) | Backup / Disaster Recovery / PITR architecture |
 | [0017](0017-compatibility-and-rolling-upgrades.md) | Compatibility / Rolling Upgrades architecture |
+| [0018](0018-dynamic-membership-architecture.md) | Dynamic membership architecture |
+| [0019](0019-admission-control-architecture.md) | Admission control / resource protection architecture (**Proposed**) |
+| [0020](0020-mvcc-gc-replicated-watermark.md) | MVCC garbage collection as replicated state, with a snapshot horizon (**Proposed**) |
+| [0021](0021-storage-lifecycle-retention-and-scrub.md) | Storage lifecycle — retention, disk-pressure semantics, and integrity scrub (**Proposed**) |
