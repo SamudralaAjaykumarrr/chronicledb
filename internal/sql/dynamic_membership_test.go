@@ -35,6 +35,26 @@ import (
 // (dynamic-membership plan §8.2).
 func finalizeSQLClusterToGeneration2(t *testing.T, c *sqlCluster, leader *node.Node) {
 	t.Helper()
+	// Finalization is a multi-round-trip, leader-only sequence driven
+	// against a leader reference this helper already holds. A
+	// spontaneous re-election anywhere inside it deposes that leader
+	// and surfaces here as "not leader (leader unknown)" —
+	// indistinguishable, from this helper, from a real defect. This is
+	// the same root cause internal/node's mustFinalizeToMax documents
+	// (82397b4): configFor's election budget (5+jitter 5 ticks at
+	// 10ms, 50-100ms) is ample for ordinary fsync latency but not for a
+	// follower descheduled on a loaded host. Freeze the election clock
+	// across the sequence instead of widening that budget; heartbeat
+	// ticks keep running so replication and catch-up are unaffected.
+	for _, n := range c.nodes {
+		n.PauseTicksForTest()
+	}
+	defer func() {
+		for _, n := range c.nodes {
+			n.ResumeTicksForTest()
+		}
+	}()
+
 	awaitConditionSQL(t, 5*time.Second, "precheck reports Ready", func() bool {
 		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 		defer cancel()

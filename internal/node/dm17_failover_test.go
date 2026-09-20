@@ -2,6 +2,7 @@ package node
 
 import (
 	"context"
+	"errors"
 	"testing"
 	"time"
 
@@ -234,12 +235,29 @@ func TestDM17Remove_WithLeaderFailover(t *testing.T) {
 		t.Fatalf("new leader's VoterCount = %d, want 4 (the removal must not have committed)", got)
 	}
 
-	removeCtx, removeCancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer removeCancel()
-	removed, err := newLeader.RemoveServer(removeCtx, "dm17fo-remove-retry", target, 0)
-	if err != nil {
-		t.Fatalf("RemoveServer against the new leader: %v", err)
-	}
+	// Bounded-poll, retrying on the transient post-election not-ready
+	// window (§11/§2.2a's P1 gate, raft.ErrConfigChangeNoCurrentTermCommit):
+	// newLeaderID was only just observed to satisfy Role==Leader &&
+	// Term>oldTerm, with no guarantee its own current-term no-op has
+	// committed yet. Retrying here (rather than widening the timeout or
+	// sleeping) mirrors this package's own documented remedy for this
+	// exact window (docs/testing-strategy.md §4; see the DM-6 removal
+	// test's identical retry and this test's own sibling,
+	// TestDM17Promote_WithLeaderFailover's retry loop).
+	var removed fsm.Outcome
+	awaitCondition(t, 5*time.Second, "RemoveServer against the new leader eventually succeeds once it clears the P1 gate", func() bool {
+		removeCtx, removeCancel := context.WithTimeout(context.Background(), time.Second)
+		defer removeCancel()
+		o, err := newLeader.RemoveServer(removeCtx, "dm17fo-remove-retry", target, 0)
+		if err != nil {
+			if errors.Is(err, raft.ErrConfigChangeNoCurrentTermCommit) || errors.Is(err, raft.ErrConfigChangeInheritedSuffixUncommitted) {
+				return false // retryable, keep polling
+			}
+			t.Fatalf("RemoveServer against the new leader: %v", err)
+		}
+		removed = o
+		return true
+	})
 	if removed.Status != fsm.StatusCommitted {
 		t.Fatalf("RemoveServer outcome = %+v, want Committed", removed)
 	}
