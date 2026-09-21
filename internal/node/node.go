@@ -961,7 +961,25 @@ func Open(cfg Config) (*Node, error) {
 	}
 	n.refreshStatusLocked()
 
-	go n.run()
+	// The recover here is exclusively for faultPointCrash
+	// (faultpoint.go, §33 slice 10a): run()'s own defer chain
+	// (shutdown, ticker.Stop) still executes normally as the panic
+	// unwinds through it — see faultPointCrash's own doc comment for
+	// why that is the intended, already-established fidelity level, not
+	// a gap. Any other panic value is a real bug and is re-panicked
+	// immediately, so it still crashes the process exactly as an
+	// unrecovered panic always has.
+	go func() {
+		defer func() {
+			if r := recover(); r != nil {
+				if _, ok := r.(faultPointCrash); ok {
+					return
+				}
+				panic(r)
+			}
+		}()
+		n.run()
+	}()
 	return n, nil
 }
 
@@ -2452,20 +2470,26 @@ func (n *Node) maybeSnapshot() {
 		n.fail(fmt.Errorf("node: creating snapshot at index %d: %w", meta.LastIncludedIndex, err))
 		return
 	}
+	triggerFaultPoint(FaultAfterSnapshotCreate)
 	if err := n.walog.AppendMetadataSnapshot(meta.LastIncludedIndex); err != nil {
 		n.fail(fmt.Errorf("node: recording snapshot pointer at index %d: %w", meta.LastIncludedIndex, err))
 		return
 	}
+	triggerFaultPoint(FaultAfterAppendMetadataSnapshot)
 	n.core.Compact(raft.Index(meta.LastIncludedIndex))
+	triggerFaultPoint(FaultAfterCoreCompact)
 	n.storage.Compact(raft.Index(meta.LastIncludedIndex))
+	triggerFaultPoint(FaultAfterStorageCompact)
 	if err := n.storage.Reaffirm(); err != nil {
 		n.fail(fmt.Errorf("node: reaffirming hard state before compaction: %w", err))
 		return
 	}
+	triggerFaultPoint(FaultAfterReaffirm)
 	if err := n.walog.CompactBefore(meta.LastIncludedIndex); err != nil {
 		n.fail(fmt.Errorf("node: compacting log before index %d: %w", meta.LastIncludedIndex, err))
 		return
 	}
+	triggerFaultPoint(FaultAfterCompactBefore)
 	n.metrics.SnapshotsCreatedTotal.Inc()
 	n.logf("node %s: created snapshot at index %d, compacted log", n.cfg.ID, meta.LastIncludedIndex)
 }
@@ -2622,12 +2646,15 @@ func (n *Node) handleInstallSnapshot(msg raft.Message) {
 		lastIncluded > n.core.SnapshotIndex() &&
 		lastIncluded > n.core.CommitIndex()
 	if willAdvance {
+		triggerFaultPoint(FaultBeforeInstallSnapshotStorage)
 		if err := n.storage.InstallSnapshot(raft.Index(snap.Meta.LastIncludedIndex)); err != nil {
 			n.fail(fmt.Errorf("node: installing snapshot at index %d: %w", snap.Meta.LastIncludedIndex, err))
 			return
 		}
+		triggerFaultPoint(FaultAfterInstallSnapshotBeforeFSMSwap)
 		n.fsmachine.Store(snap.FSM)
 		n.appliedIndex = snap.Meta.LastIncludedIndex
+		triggerFaultPoint(FaultAfterFSMSwapBeforeGenerationAdopt)
 		// A follower catching up via a peer's snapshot, rather than
 		// replaying the committed SetClusterVersionCommand log entry
 		// itself (e.g. that entry was already compacted away by the
