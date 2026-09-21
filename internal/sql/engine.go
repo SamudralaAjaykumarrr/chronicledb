@@ -209,7 +209,11 @@ func (s *standaloneTxn) Commit(requestID string) (uint64, error) {
 func (s *standaloneTxn) Abort() error { return s.t.Abort() }
 
 func (s *standaloneTxn) ScanPrefix(prefix string) ([]KV, error) {
-	return mergeScan(prefix, s.t.StartSeq(), s.mgr.Store(), s.t.LocalWrites()), nil
+	committed, err := s.mgr.Store().ScanVisible(prefix, s.t.StartSeq())
+	if err != nil {
+		return nil, err
+	}
+	return mergeLocalWrites(prefix, committed, s.t.LocalWrites()), nil
 }
 
 // --- Replicated adapter (internal/node.Node) ---
@@ -282,8 +286,7 @@ func (r *replicatedTxn) Read(key string) ([]byte, bool, error) {
 		}
 		return m.Value, true, nil
 	}
-	v, ok := r.node.FSM().Store().Visible(key, r.startSeq)
-	return v, ok, nil
+	return r.node.FSM().Store().Visible(key, r.startSeq)
 }
 
 func (r *replicatedTxn) recordWrite(key string, value []byte, tombstone bool) {
@@ -308,7 +311,11 @@ func (r *replicatedTxn) ScanPrefix(prefix string) ([]KV, error) {
 	for _, k := range r.order {
 		local = append(local, r.writes[k])
 	}
-	return mergeScan(prefix, r.startSeq, r.node.FSM().Store(), local), nil
+	committed, err := r.node.FSM().Store().ScanVisible(prefix, r.startSeq)
+	if err != nil {
+		return nil, err
+	}
+	return mergeLocalWrites(prefix, committed, local), nil
 }
 
 // txnIDFromRequestID deterministically derives a CommitTxnCommand's
@@ -365,24 +372,24 @@ func (r *replicatedTxn) Abort() error {
 	return nil
 }
 
-// mergeScan implements the committed-data half of ScanPrefix
-// (docs/mvcc.md §3 applied to a whole key-prefix rather than one key)
-// merged with a transaction's own local writes, deterministically
-// (sorted ascending by key). store.Export (docs/mvcc.md's own doc
-// comment on Export) already returns every key's full version chain,
-// deep-copied and sorted by key — this is a full scan of the entire
-// store, filtered down to prefix, not an indexed range scan; see
-// docs/sql.md §5.2 for why that is an accepted, documented limitation
-// of this constrained subset rather than an oversight.
-func mergeScan(prefix string, startSeq uint64, store *mvcc.Store, local []mvcc.Mutation) []KV {
-	present := make(map[string][]byte)
-	for _, kc := range store.Export() {
-		if !strings.HasPrefix(kc.Key, prefix) {
-			continue
-		}
-		if v, ok := visibleInChain(kc.Versions, startSeq); ok {
-			present[kc.Key] = v
-		}
+// mergeLocalWrites merges committed (already visibility-filtered and
+// horizon-checked by mvcc.Store.ScanVisible — docs/v0.6.0-plan.md
+// §15.2a) with a transaction's own local write set, deterministically
+// (sorted ascending by key): own writes always shadow committed data
+// (a local write present) or shadow it into absence (a local
+// tombstone), regardless of what ScanVisible returned. This is the
+// merge half of ScanPrefix that stays in internal/sql, where it
+// belongs — the committed-data half (the visibility rule itself, and
+// now the horizon check) lives entirely inside internal/mvcc, in the
+// one place every committed read passes through. There is no local
+// re-implementation of the visibility rule here anymore: the bypass
+// that made that possible (mergeScan reading mvcc.Store.Export
+// directly) is gone, and TestExportOnlyCalledFromSnapshotEncoding
+// keeps it from reappearing.
+func mergeLocalWrites(prefix string, committed []mvcc.KV, local []mvcc.Mutation) []KV {
+	present := make(map[string][]byte, len(committed))
+	for _, kv := range committed {
+		present[kv.Key] = kv.Value
 	}
 	for _, m := range local {
 		if !strings.HasPrefix(m.Key, prefix) {
@@ -404,21 +411,4 @@ func mergeScan(prefix string, startSeq uint64, store *mvcc.Store, local []mvcc.M
 		out[i] = KV{Key: k, Value: present[k]}
 	}
 	return out
-}
-
-// visibleInChain mirrors mvcc.Store.Visible's own binary-search
-// visibility rule (docs/mvcc.md §3), applied to an already-exported
-// version chain (mvcc.Store.Export, which maintains the same
-// ascending-by-CommitSeq ordering Visible relies on) rather than a
-// fresh live lookup.
-func visibleInChain(chain []mvcc.Version, startSeq uint64) (value []byte, found bool) {
-	idx := sort.Search(len(chain), func(i int) bool { return chain[i].CommitSeq > startSeq }) - 1
-	if idx < 0 {
-		return nil, false
-	}
-	v := chain[idx]
-	if v.Tombstone {
-		return nil, false
-	}
-	return v.Value, true
 }

@@ -10,7 +10,9 @@ import (
 	"errors"
 	"fmt"
 	"sort"
+	"strings"
 	"sync"
+	"sync/atomic"
 )
 
 // ErrNonMonotonicCommit indicates an internal caller attempted to apply
@@ -20,6 +22,18 @@ import (
 // single ordering point), so its presence indicates an internal
 // invariant violation, not a legitimate runtime condition.
 var ErrNonMonotonicCommit = errors.New("mvcc: non-monotonic commit sequence")
+
+// ErrSnapshotTooOld is returned by every committed-read entry point
+// (Visible, ScanVisible) when startSeq is below the Store's applied GC
+// watermark (docs/v0.6.0-plan.md §15.1/§15.2, GC SAFETY): the version
+// such a snapshot would be entitled to see may already have been
+// reclaimed. Refusing is a correctness requirement, not a convenience —
+// silently answering from the surviving chain would be an undetectable
+// Snapshot Isolation violation (§15.1's analysis). Both entry points
+// check this under the same lock that reads the chain/watermark, so
+// there is no window in which a concurrent watermark advance lets a
+// stale read slip through.
+var ErrSnapshotTooOld = errors.New("mvcc: snapshot older than the GC horizon")
 
 // Version is one committed version of a key: a value or a tombstone,
 // produced by exactly one committed transaction's write, tagged with
@@ -41,18 +55,159 @@ type Mutation struct {
 
 // Store holds every key's version chain: the ordered (by CommitSeq,
 // ascending) list of all versions ever committed for that key
-// (docs/mvcc.md §2). Chains only grow by appending; existing versions
-// are never mutated or removed (MVCC GC is explicitly not implemented
-// in V1 — docs/mvcc.md §6, docs/non-goals.md). Store is safe for
-// concurrent use by multiple goroutines.
+// (docs/mvcc.md §2). Chains grow by appending; MVCC GC (docs/mvcc.md
+// §6, docs/v0.6.0-plan.md Part B) additionally removes superseded
+// versions from the front of a chain, deterministically and only
+// inside internal/fsm.Apply — Store itself performs no GC decision-
+// making of its own (ReclaimKey does exactly what its caller tells it
+// to; see its own doc comment). Store is safe for concurrent use by
+// multiple goroutines.
 type Store struct {
 	mu     sync.RWMutex
 	chains map[string][]Version
+	// orderedKeys is chains' key set maintained in ascending sorted
+	// order via binary-search insertion (docs/v0.6.0-plan.md §14.4,
+	// fact 8b): what makes KeysFrom's bounded traversal possible
+	// without a per-call full sort. The key set never shrinks under GC
+	// (§14.1 never removes a key's newest version), so this needs an
+	// insertion path but no deletion path.
+	orderedKeys []string
+	// gcWatermark is the applied GC horizon (docs/v0.6.0-plan.md §15.2):
+	// monotonically non-decreasing, read and written under mu alongside
+	// the chains it guards so a horizon check and the chain read it
+	// guards are one atomic instant.
+	gcWatermark uint64
+
+	// skipHorizonGuardForTest, when set via SetSkipHorizonGuardForTest,
+	// disables the startSeq < gcWatermark check in Visible/ScanVisible —
+	// SL-3's negative control (docs/v0.6.0-plan.md §29): with it set, a
+	// property test driving GC SAFETY's positive property (SL-1) must
+	// detect the resulting silent stale read. Never set in production.
+	skipHorizonGuardForTest atomic.Bool
+}
+
+// SetSkipHorizonGuardForTest is SL-3's negative-control hook (see
+// skipHorizonGuardForTest's doc comment). Test-only; production code
+// never calls it.
+func (s *Store) SetSkipHorizonGuardForTest(skip bool) {
+	s.skipHorizonGuardForTest.Store(skip)
 }
 
 // NewStore returns an empty Store.
 func NewStore() *Store {
 	return &Store{chains: make(map[string][]Version)}
+}
+
+// insertOrderedKeyLocked inserts key into s.orderedKeys, preserving
+// sorted order, via binary search. Caller must hold s.mu (write lock).
+// Must only be called for a key not already present — every call site
+// already checks this as part of deciding a chain is new.
+func (s *Store) insertOrderedKeyLocked(key string) {
+	idx := sort.SearchStrings(s.orderedKeys, key)
+	s.orderedKeys = append(s.orderedKeys, "")
+	copy(s.orderedKeys[idx+1:], s.orderedKeys[idx:])
+	s.orderedKeys[idx] = key
+}
+
+// KeysFrom returns at most limit keys in ascending order, strictly
+// after cursor ("" means "from the beginning"), without sorting or
+// scanning the whole key set (docs/v0.6.0-plan.md §14.4) — the
+// traversal cost is a function of limit, not of total key count. Used
+// by ApplyAdvanceGCWatermark's bounded, resumable keyspace walk.
+func (s *Store) KeysFrom(cursor string, limit int) []string {
+	if limit <= 0 {
+		return nil
+	}
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	start := sort.SearchStrings(s.orderedKeys, cursor)
+	if start < len(s.orderedKeys) && s.orderedKeys[start] == cursor {
+		start++
+	}
+	if start >= len(s.orderedKeys) {
+		return nil
+	}
+	end := start + limit
+	if end > len(s.orderedKeys) {
+		end = len(s.orderedKeys)
+	}
+	out := make([]string, end-start)
+	copy(out, s.orderedKeys[start:end])
+	return out
+}
+
+// ReclaimKey removes every version of key superseded per docs/mvcc.md
+// §6's rule, verbatim (docs/v0.6.0-plan.md §14.1): a version
+// (CommitSeq=c) may be removed iff there exists a version (CommitSeq=
+// c') of the same key with c < c' <= w. The newest version of a key is
+// never removed (there is, by definition, no later c' to satisfy the
+// predicate for it) — nothing else is ever removed, tombstone or not
+// (S-3: a tombstone is a version, reclaimed under exactly this
+// predicate, no special case).
+//
+// budget bounds how many versions this call removes; ReclaimKey removes
+// the OLDEST superseded versions first (chain is sorted ascending by
+// CommitSeq) up to budget, and returns the actual count removed. The
+// caller (ApplyAdvanceGCWatermark) is responsible for the separate
+// keys-examined bound (KeysFrom's limit) — this method's own cost is
+// O(1) beyond the removed count itself, never a function of total chain
+// length beyond what is actually being removed.
+func (s *Store) ReclaimKey(key string, w uint64, budget int) int {
+	if budget <= 0 {
+		return 0
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	chain := s.chains[key]
+	if len(chain) < 2 {
+		return 0 // a single (or absent) version is always the newest: never removed
+	}
+	// idx: the largest index with CommitSeq <= w (or -1 if none). Every
+	// version strictly before idx has some later version (at least
+	// chain[idx] itself) with CommitSeq <= w, so is reclaimable; idx
+	// itself is never reclaimable (by construction, no later version
+	// also has CommitSeq <= w — that is exactly what makes idx maximal).
+	idx := sort.Search(len(chain), func(i int) bool { return chain[i].CommitSeq > w }) - 1
+	if idx <= 0 {
+		return 0
+	}
+	n := idx // versions [0, idx-1], i.e. idx many
+	if n > budget {
+		n = budget
+	}
+	// A fresh backing array (not chain[n:], which would alias and leak
+	// the reclaimed versions' memory via the old array, and would let a
+	// concurrent reader's already-taken slice header keep observing a
+	// mutated array if this were ever changed in place).
+	s.chains[key] = append([]Version(nil), chain[n:]...)
+	return n
+}
+
+// SetGCWatermark sets the Store's applied horizon, monotonically (a
+// lower value is a no-op) — matching docs/v0.6.0-plan.md §14.4's
+// monotone max() rule at the single point that must agree with it: the
+// value the read-side guard (Visible/ScanVisible) refuses below.
+//
+// Called from exactly two places (docs/v0.6.0-plan.md §15.2b): from
+// fsm.Apply's ApplyAdvanceGCWatermark (the live, replicated path), and
+// from RestoreStore's caller immediately after constructing a fresh
+// Store from decoded snapshot state — a restored Store must never run
+// with the guard silently disabled at watermark 0 while FSM.gcWatermark
+// already reflects the source's real value. See RestoreStore's own doc
+// comment for the exact restore-path sequencing this requires.
+func (s *Store) SetGCWatermark(w uint64) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if w > s.gcWatermark {
+		s.gcWatermark = w
+	}
+}
+
+// GCWatermark returns the Store's currently applied GC horizon.
+func (s *Store) GCWatermark() uint64 {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.gcWatermark
 }
 
 // Visible implements the read half of the binding visibility rule
@@ -66,9 +221,18 @@ func NewStore() *Store {
 // visible version (if any) is a tombstone — in the Snapshot Isolation
 // visibility rule, both cases mean "does not exist as of this
 // snapshot" to the caller.
-func (s *Store) Visible(key string, startSeq uint64) (value []byte, found bool) {
+//
+// err is ErrSnapshotTooOld when startSeq is below the applied GC
+// horizon (docs/v0.6.0-plan.md §15.1/§15.2) — checked under the same
+// lock as the chain read, so the check and the read are one atomic
+// instant. This is SNAPSHOT HORIZON ENFORCEMENT's structural boundary:
+// the one place every single-key committed read passes through.
+func (s *Store) Visible(key string, startSeq uint64) (value []byte, found bool, err error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
+	if startSeq < s.gcWatermark && !s.skipHorizonGuardForTest.Load() {
+		return nil, false, ErrSnapshotTooOld
+	}
 	chain := s.chains[key]
 	// chain is maintained sorted ascending by CommitSeq (ApplyCommit only
 	// ever appends a strictly larger CommitSeq), so the newest version
@@ -76,13 +240,60 @@ func (s *Store) Visible(key string, startSeq uint64) (value []byte, found bool) 
 	// with CommitSeq > startSeq and stepping back one.
 	idx := sort.Search(len(chain), func(i int) bool { return chain[i].CommitSeq > startSeq }) - 1
 	if idx < 0 {
-		return nil, false
+		return nil, false, nil
 	}
 	v := chain[idx]
 	if v.Tombstone {
-		return nil, false
+		return nil, false, nil
 	}
-	return v.Value, true
+	return v.Value, true, nil
+}
+
+// KV is one key/value pair returned by ScanVisible.
+type KV struct {
+	Key   string
+	Value []byte
+}
+
+// ScanVisible returns every key with the given prefix currently
+// committed-visible as of startSeq, sorted ascending by key
+// (docs/v0.6.0-plan.md §15.2a): the prefix filter and the per-key
+// visibility search both happen here, inside internal/mvcc, under the
+// same RLock that checks startSeq against the GC horizon — exactly as
+// Visible does, and for the identical reason (SNAPSHOT HORIZON
+// ENFORCEMENT's structural boundary must be the same one place for
+// every committed-read entry point, not duplicated in a caller
+// package). Callers (internal/sql) merge this with a transaction's own
+// local write set — that merge stays outside this package, where it
+// belongs.
+//
+// This is a full scan of the entire store, filtered down to prefix,
+// not an indexed range scan — docs/sql.md §5.2's already-accepted,
+// documented limitation of the SQL subset built on it; ScanVisible does
+// not change that complexity, only where the horizon check lives.
+func (s *Store) ScanVisible(prefix string, startSeq uint64) ([]KV, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if startSeq < s.gcWatermark && !s.skipHorizonGuardForTest.Load() {
+		return nil, ErrSnapshotTooOld
+	}
+	var out []KV
+	for _, k := range s.orderedKeys {
+		if !strings.HasPrefix(k, prefix) {
+			continue
+		}
+		chain := s.chains[k]
+		idx := sort.Search(len(chain), func(i int) bool { return chain[i].CommitSeq > startSeq }) - 1
+		if idx < 0 {
+			continue
+		}
+		v := chain[idx]
+		if v.Tombstone {
+			continue
+		}
+		out = append(out, KV{Key: k, Value: v.Value})
+	}
+	return out, nil
 }
 
 // LatestCommitSeq returns the CommitSeq of the newest committed version
@@ -144,6 +355,18 @@ type KeyChain struct {
 // snapshots, a useful and tested property). Each chain's Versions slice
 // remains sorted ascending by CommitSeq, exactly as Store maintains it
 // internally.
+//
+// Export's only legitimate caller is internal/fsm's snapshot encoding,
+// and it must return every version regardless of any horizon
+// (docs/v0.6.0-plan.md §15.2a): unlike every other read path, it is not
+// itself a committed-READ for some transaction's snapshot — it is the
+// full durable state a future restore must reconstruct from, GC horizon
+// and all. TestExportOnlyCalledFromSnapshotEncoding (an AST test,
+// mirroring TestControlKindRangesNeverCollide's class) asserts no
+// package other than internal/fsm references this method — the
+// bypass that made SL-6's gap possible in the first place
+// (internal/sql's mergeScan/visibleInChain, deleted) must not
+// reappear.
 func (s *Store) Export() []KeyChain {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
@@ -166,12 +389,35 @@ func (s *Store) Export() []KeyChain {
 // own checksum-verified decode). Each chain's Versions must already be
 // sorted ascending by CommitSeq, matching what Export produces —
 // Visible's binary search depends on this invariant.
-func RestoreStore(chains []KeyChain) *Store {
+//
+// gcWatermark is the restored Store's initial GC horizon, required —
+// not optional or defaulted — as a parameter (docs/v0.6.0-plan.md
+// §15.2b): it is impossible to construct a restored Store without one,
+// which is what closes the hazard an earlier draft left open ("called
+// only from fsm.Apply" as a mere doc comment would have silently left
+// the read-side guard at watermark 0 after every restart/InstallSnapshot/
+// backup-restore, since this function otherwise builds a fresh Store
+// from nothing). The caller (fsm.DecodeState) passes the value decoded
+// from the generation-3 trailing block, before the FSM carrying this
+// Store is ever returned — the binding property, stated so it can be
+// tested rather than reviewed: Store.GCWatermark() == FSM.gcWatermark
+// at every instant, on every node, including immediately after
+// DecodeState.
+//
+// The outer key order is re-sorted here unconditionally (a one-time,
+// O(n log n) cost at restore time — never on the GC Apply hot path
+// §14.4 bounds) rather than trusted from the caller, so orderedKeys'
+// invariant holds regardless of the exact order a snapshot decoder
+// happens to preserve.
+func RestoreStore(chains []KeyChain, gcWatermark uint64) *Store {
 	m := make(map[string][]Version, len(chains))
+	keys := make([]string, 0, len(chains))
 	for _, kc := range chains {
 		m[kc.Key] = kc.Versions
+		keys = append(keys, kc.Key)
 	}
-	return &Store{chains: m}
+	sort.Strings(keys)
+	return &Store{chains: m, orderedKeys: keys, gcWatermark: gcWatermark}
 }
 
 // ApplyCommit atomically appends one new version per mutation, all
@@ -196,6 +442,9 @@ func (s *Store) ApplyCommit(commitSeq uint64, mutations []Mutation) error {
 		}
 	}
 	for _, m := range mutations {
+		if _, exists := s.chains[m.Key]; !exists {
+			s.insertOrderedKeyLocked(m.Key)
+		}
 		s.chains[m.Key] = append(s.chains[m.Key], Version{CommitSeq: commitSeq, Value: m.Value, Tombstone: m.Tombstone})
 	}
 	return nil

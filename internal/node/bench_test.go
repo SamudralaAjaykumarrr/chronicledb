@@ -182,7 +182,7 @@ func BenchmarkPrimaryKeyRead(b *testing.B) {
 		if err != nil {
 			b.Fatalf("BeginReadIndex: %v", err)
 		}
-		if _, found := leader.FSM().Store().Visible("k", startSeq); !found {
+		if _, found, _ := leader.FSM().Store().Visible("k", startSeq); !found {
 			b.Fatalf("key not visible at StartSeq %d", startSeq)
 		}
 	}
@@ -233,7 +233,7 @@ func BenchmarkMixedWorkload80Read20Write(b *testing.B) {
 		if err != nil {
 			b.Fatalf("BeginReadIndex: %v", err)
 		}
-		if _, found := leader.FSM().Store().Visible("mixed-key", startSeq); !found {
+		if _, found, _ := leader.FSM().Store().Visible("mixed-key", startSeq); !found {
 			b.Fatalf("mixed-key not visible at StartSeq %d", startSeq)
 		}
 	}

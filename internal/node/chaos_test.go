@@ -64,7 +64,7 @@ func TestChaos_RepeatedCrashRestartCycles(t *testing.T) {
 
 		restarted := tc.restart(flapper)
 		awaitCondition(t, 5*time.Second, fmt.Sprintf("cycle %d: flapper catches up on %s", cycle, key), func() bool {
-			v, ok := restarted.FSM().Store().Visible(key, outcome.CommitSeq)
+			v, ok, _ := restarted.FSM().Store().Visible(key, outcome.CommitSeq)
 			return ok && string(v) == "v"
 		})
 
@@ -73,7 +73,7 @@ func TestChaos_RepeatedCrashRestartCycles(t *testing.T) {
 		// one.
 		for i, o := range outcomes {
 			ek := fmt.Sprintf("k%d", i)
-			if v, ok := restarted.FSM().Store().Visible(ek, o.CommitSeq); !ok || string(v) != "v" {
+			if v, ok, _ := restarted.FSM().Store().Visible(ek, o.CommitSeq); !ok || string(v) != "v" {
 				t.Fatalf("cycle %d: earlier key %s missing/wrong after flapper's restart: ok=%v v=%q", cycle, ek, ok, v)
 			}
 		}
@@ -283,7 +283,7 @@ func TestChaos_AsymmetricPartitionNoSafetyViolation(t *testing.T) {
 	for _, id := range tc.ids {
 		id := id
 		awaitCondition(t, 5*time.Second, fmt.Sprintf("node %s converges after asymmetric partition heals", id), func() bool {
-			v, ok := tc.node(id).FSM().Store().Visible("k1", outcome.CommitSeq)
+			v, ok, _ := tc.node(id).FSM().Store().Visible("k1", outcome.CommitSeq)
 			return ok && string(v) == "v1"
 		})
 	}
@@ -345,7 +345,7 @@ func TestChaos_RepeatedPartitionHealAcrossLeaders(t *testing.T) {
 		for _, id := range tc.ids {
 			id := id
 			awaitCondition(t, 5*time.Second, fmt.Sprintf("cycle %d: node %s converges after heal", cycle, id), func() bool {
-				v, ok := tc.node(id).FSM().Store().Visible(midKey, midOutcome.CommitSeq)
+				v, ok, _ := tc.node(id).FSM().Store().Visible(midKey, midOutcome.CommitSeq)
 				return ok && string(v) == midVal
 			})
 		}
@@ -354,7 +354,7 @@ func TestChaos_RepeatedPartitionHealAcrossLeaders(t *testing.T) {
 		// every live node right now.
 		for _, id := range tc.ids {
 			for k, f := range oracle {
-				v, ok := tc.node(id).FSM().Store().Visible(k, f.commitSeq)
+				v, ok, _ := tc.node(id).FSM().Store().Visible(k, f.commitSeq)
 				if !ok || string(v) != f.value {
 					t.Fatalf("cycle %d: node %s lost or altered earlier fact %s=%s (got ok=%v v=%q)", cycle, id, k, f.value, ok, v)
 				}
@@ -406,7 +406,7 @@ func TestChaos_TransactionAtomicityAcrossLeaderCrash(t *testing.T) {
 		store := tc.node(id).FSM().Store()
 		seen := 0
 		for _, k := range []string{"x", "y", "z"} {
-			if _, ok := store.Visible(k, ^uint64(0)); ok {
+			if _, ok, _ := store.Visible(k, ^uint64(0)); ok {
 				seen++
 			}
 		}
@@ -446,7 +446,7 @@ func TestChaos_TransactionAtomicityAcrossLeaderCrash(t *testing.T) {
 			awaitCondition(t, 5*time.Second, fmt.Sprintf("node %s converges on all 3 keys", id), func() bool {
 				store := tc.node(id).FSM().Store()
 				for _, k := range []string{"x", "y", "z"} {
-					if _, ok := store.Visible(k, retry.CommitSeq); !ok {
+					if _, ok, _ := store.Visible(k, retry.CommitSeq); !ok {
 						return false
 					}
 				}
@@ -542,7 +542,7 @@ func TestChaos_SnapshotFollowerCrashDuringCatchupResumesCleanly(t *testing.T) {
 		store := restarted.FSM().Store()
 		seen := 0
 		for i := 0; i < numKeys; i++ {
-			if _, ok := store.Visible(fmt.Sprintf("k%d", i), last.CommitSeq); ok {
+			if _, ok, _ := store.Visible(fmt.Sprintf("k%d", i), last.CommitSeq); ok {
 				seen++
 			}
 		}

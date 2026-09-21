@@ -262,7 +262,7 @@ func TestDM21_RestoreCarriesNoSourceMembershipFromEitherCarrier(t *testing.T) {
 	if outcome, ok := m1.fsmachine.Load().GetOutcome(fx.writeReqID); !ok || outcome.Status != fsm.StatusCommitted {
 		t.Fatalf("restored FSM outcome for %q = %+v, ok=%v, want a Committed outcome", fx.writeReqID, outcome, ok)
 	}
-	if value, found := m1.fsmachine.Load().Store().Visible(fx.writeKey, ^uint64(0)); !found || string(value) != fx.writeValue {
+	if value, found, _ := m1.fsmachine.Load().Store().Visible(fx.writeKey, ^uint64(0)); !found || string(value) != fx.writeValue {
 		t.Fatalf("restored value for key %q = %q, found=%v, want %q", fx.writeKey, value, found, fx.writeValue)
 	}
 
@@ -304,7 +304,7 @@ func TestDM21_RestoreCarriesNoSourceMembershipFromEitherCarrier(t *testing.T) {
 		st := m2.Status()
 		return st.VoterCount == 1 && st.LearnerCount == 1
 	})
-	if value, found := m2.fsmachine.Load().Store().Visible(fx.writeKey, ^uint64(0)); !found || string(value) != fx.writeValue {
+	if value, found, _ := m2.fsmachine.Load().Store().Visible(fx.writeKey, ^uint64(0)); !found || string(value) != fx.writeValue {
 		t.Fatalf("m2's replicated value for key %q = %q, found=%v, want %q", fx.writeKey, value, found, fx.writeValue)
 	}
 }

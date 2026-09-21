@@ -241,14 +241,14 @@ func TestPeerMTLS_PartitionHealAcrossLeadersRecovers(t *testing.T) {
 		for _, id := range tc.ids {
 			id := id
 			awaitCondition(t, 10*time.Second, fmt.Sprintf("cycle %d: node %s converges over mTLS after heal", cycle, id), func() bool {
-				v, ok := tc.node(id).FSM().Store().Visible(midKey, midOutcome.CommitSeq)
+				v, ok, _ := tc.node(id).FSM().Store().Visible(midKey, midOutcome.CommitSeq)
 				return ok && string(v) == midVal
 			})
 		}
 
 		for _, id := range tc.ids {
 			for k, f := range oracle {
-				v, ok := tc.node(id).FSM().Store().Visible(k, f.commitSeq)
+				v, ok, _ := tc.node(id).FSM().Store().Visible(k, f.commitSeq)
 				if !ok || string(v) != f.value {
 					t.Fatalf("cycle %d: node %s lost or altered earlier fact %s=%s over mTLS (got ok=%v v=%q)", cycle, id, k, f.value, ok, v)
 				}
@@ -317,7 +317,7 @@ func TestPeerMTLS_FollowerCatchesUpViaSnapshotAfterLeaderCompaction(t *testing.T
 	}
 	for i := 0; i < numKeys; i++ {
 		key := fmt.Sprintf("k%d", i)
-		if v, ok := fnode.FSM().Store().Visible(key, last); !ok || string(v) != "v" {
+		if v, ok, _ := fnode.FSM().Store().Visible(key, last); !ok || string(v) != "v" {
 			t.Fatalf("follower missing/wrong key %s after mTLS snapshot catch-up: ok=%v v=%q", key, ok, v)
 		}
 	}

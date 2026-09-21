@@ -382,7 +382,7 @@ func TestRF1_NormalReplicationConvergesAcrossRealNodes(t *testing.T) {
 	for _, id := range tc.ids {
 		id := id
 		awaitCondition(t, 3*time.Second, fmt.Sprintf("node %s converges on k1=v1", id), func() bool {
-			v, ok := tc.node(id).FSM().Store().Visible("k1", outcome.CommitSeq)
+			v, ok, _ := tc.node(id).FSM().Store().Visible("k1", outcome.CommitSeq)
 			return ok && string(v) == "v1"
 		})
 	}
@@ -496,13 +496,13 @@ func TestRF13_OldLeaderRejoinsAndConverges(t *testing.T) {
 	for _, id := range tc.ids {
 		id := id
 		awaitCondition(t, 5*time.Second, fmt.Sprintf("node %s converges on k1=v1 after heal", id), func() bool {
-			v, ok := tc.node(id).FSM().Store().Visible("k1", outcome.CommitSeq)
+			v, ok, _ := tc.node(id).FSM().Store().Visible("k1", outcome.CommitSeq)
 			return ok && string(v) == "v1"
 		})
 	}
 	// The stale, never-committed key must never appear anywhere.
 	for _, id := range tc.ids {
-		if _, ok := tc.node(id).FSM().Store().Visible("stale-key", outcome.CommitSeq); ok {
+		if _, ok, _ := tc.node(id).FSM().Store().Visible("stale-key", outcome.CommitSeq); ok {
 			t.Fatalf("node %s materialized the old leader's uncommitted speculative write", id)
 		}
 	}
@@ -619,7 +619,7 @@ func TestFollowerRestartCatchesUpViaLogReplication(t *testing.T) {
 
 	restarted := tc.restart(followerID)
 	awaitCondition(t, 5*time.Second, "restarted follower catches up", func() bool {
-		v, ok := restarted.FSM().Store().Visible("k1", outcome.CommitSeq)
+		v, ok, _ := restarted.FSM().Store().Visible("k1", outcome.CommitSeq)
 		return ok && string(v) == "v1"
 	})
 }
@@ -660,7 +660,7 @@ func TestIdempotencyAcrossFailover(t *testing.T) {
 	}
 
 	// The value must reflect exactly one application, not two.
-	v, ok := tc.node(newLeaderID).FSM().Store().Visible("balance", outcome1.CommitSeq)
+	v, ok, _ := tc.node(newLeaderID).FSM().Store().Visible("balance", outcome1.CommitSeq)
 	if !ok || string(v) != "100" {
 		t.Fatalf("balance = %q ok=%v, want \"100\" applied exactly once", v, ok)
 	}
@@ -694,7 +694,7 @@ func TestMultiKeyTransactionReplicationAtomic(t *testing.T) {
 		awaitCondition(t, 3*time.Second, fmt.Sprintf("node %s has all three keys", id), func() bool {
 			store := tc.node(id).FSM().Store()
 			for k, want := range map[string]string{"a": "1", "b": "2", "c": "3"} {
-				v, ok := store.Visible(k, outcome.CommitSeq)
+				v, ok, _ := store.Visible(k, outcome.CommitSeq)
 				if !ok || string(v) != want {
 					return false
 				}
@@ -787,7 +787,7 @@ func TestDurablePersistenceFailureStopsNodeWithoutFalseAck(t *testing.T) {
 		if id == leaderID {
 			continue
 		}
-		if _, ok := tc.node(id).FSM().Store().Visible("k1", ^uint64(0)); ok {
+		if _, ok, _ := tc.node(id).FSM().Store().Visible("k1", ^uint64(0)); ok {
 			t.Fatalf("node %s materialized a write that was never durably committed", id)
 		}
 	}
@@ -919,7 +919,7 @@ func TestClusterRestartRecoversFSMAndRequestIDOutcomes(t *testing.T) {
 	}
 	awaitCondition(t, 3*time.Second, "all nodes apply before restart", func() bool {
 		for _, id := range tc.ids {
-			if _, ok := tc.node(id).FSM().Store().Visible("k1", outcome.CommitSeq); !ok {
+			if _, ok, _ := tc.node(id).FSM().Store().Visible("k1", outcome.CommitSeq); !ok {
 				return false
 			}
 		}
@@ -944,7 +944,7 @@ func TestClusterRestartRecoversFSMAndRequestIDOutcomes(t *testing.T) {
 	for _, id := range tc.ids {
 		id := id
 		awaitCondition(t, 5*time.Second, fmt.Sprintf("node %s recovers k1=v1 after full cluster restart", id), func() bool {
-			v, ok := tc.node(id).FSM().Store().Visible("k1", outcome.CommitSeq)
+			v, ok, _ := tc.node(id).FSM().Store().Visible("k1", outcome.CommitSeq)
 			return ok && string(v) == "v1"
 		})
 	}
@@ -1009,7 +1009,7 @@ func TestSN1_RestartRestoresFromSnapshotAndCompactsLog(t *testing.T) {
 	}
 	for i := 0; i < numKeys; i++ {
 		key := fmt.Sprintf("k%d", i)
-		if _, ok := restarted.FSM().Store().Visible(key, outcomes[i].CommitSeq); !ok {
+		if _, ok, _ := restarted.FSM().Store().Visible(key, outcomes[i].CommitSeq); !ok {
 			t.Fatalf("key %s (covered by the snapshot) not immediately visible after restart", key)
 		}
 	}
@@ -1087,7 +1087,7 @@ func TestSN5_FollowerCatchesUpViaSnapshotAfterLeaderCompaction(t *testing.T) {
 	}
 	for i := 0; i < numKeys; i++ {
 		key := fmt.Sprintf("k%d", i)
-		if _, ok := fnode.FSM().Store().Visible(key, outcomes[i].CommitSeq); !ok {
+		if _, ok, _ := fnode.FSM().Store().Visible(key, outcomes[i].CommitSeq); !ok {
 			t.Fatalf("key %s not visible on the follower after snapshot catch-up", key)
 		}
 	}

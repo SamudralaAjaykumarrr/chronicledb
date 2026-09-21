@@ -9,7 +9,7 @@ import (
 
 func TestVisibleNonExistentKey(t *testing.T) {
 	s := NewStore()
-	if _, found := s.Visible("K", 100); found {
+	if _, found, _ := s.Visible("K", 100); found {
 		t.Fatal("Visible on a never-written key: found = true, want false")
 	}
 }
@@ -23,7 +23,7 @@ func TestVisibleBasicOrdering(t *testing.T) {
 		t.Fatalf("ApplyCommit: %v", err)
 	}
 
-	v, found := s.Visible("K", 10)
+	v, found, _ := s.Visible("K", 10)
 	if !found || string(v) != "a" {
 		t.Fatalf("Visible(K, 10) = %q, %v, want \"a\", true", v, found)
 	}
@@ -34,13 +34,13 @@ func TestVisibleBasicOrdering(t *testing.T) {
 
 	// A transaction whose snapshot predates CommitSeq=11 must still see
 	// "a" (docs/mvcc.md §3.2).
-	v, found = s.Visible("K", 10)
+	v, found, _ = s.Visible("K", 10)
 	if !found || string(v) != "a" {
 		t.Fatalf("Visible(K, 10) after newer commit = %q, %v, want \"a\", true (stable snapshot)", v, found)
 	}
 
 	// A new snapshot at/after CommitSeq=11 sees "b".
-	v, found = s.Visible("K", 11)
+	v, found, _ = s.Visible("K", 11)
 	if !found || string(v) != "b" {
 		t.Fatalf("Visible(K, 11) = %q, %v, want \"b\", true", v, found)
 	}
@@ -51,10 +51,10 @@ func TestVisibleExactBoundary(t *testing.T) {
 	if err := s.ApplyCommit(5, []Mutation{{Key: "K", Value: []byte("a"), Tombstone: false}}); err != nil {
 		t.Fatalf("ApplyCommit: %v", err)
 	}
-	if _, found := s.Visible("K", 4); found {
+	if _, found, _ := s.Visible("K", 4); found {
 		t.Fatal("Visible(K, 4) with only CommitSeq=5 version: found = true, want false (4 < 5)")
 	}
-	v, found := s.Visible("K", 5)
+	v, found, _ := s.Visible("K", 5)
 	if !found || string(v) != "a" {
 		t.Fatalf("Visible(K, 5) = %q, %v, want \"a\", true (CommitSeq<=StartSeq is inclusive)", v, found)
 	}
@@ -70,14 +70,14 @@ func TestVisibleTombstone(t *testing.T) {
 	}
 
 	// Before the delete: visible.
-	if v, found := s.Visible("K", 6); !found || string(v) != "a" {
+	if v, found, _ := s.Visible("K", 6); !found || string(v) != "a" {
 		t.Fatalf("Visible(K, 6) = %q, %v, want \"a\", true", v, found)
 	}
 	// At/after the delete: not found.
-	if _, found := s.Visible("K", 9); found {
+	if _, found, _ := s.Visible("K", 9); found {
 		t.Fatal("Visible(K, 9) after tombstone at CommitSeq=9: found = true, want false")
 	}
-	if _, found := s.Visible("K", 100); found {
+	if _, found, _ := s.Visible("K", 100); found {
 		t.Fatal("Visible(K, 100) after tombstone: found = true, want false")
 	}
 }
@@ -125,10 +125,10 @@ func TestApplyCommitAtomicOnMonotonicityViolation(t *testing.T) {
 	if !errors.Is(err, ErrNonMonotonicCommit) {
 		t.Fatalf("ApplyCommit with non-monotonic CommitSeq: err = %v, want ErrNonMonotonicCommit", err)
 	}
-	if _, found := s.Visible("B", 100); found {
+	if _, found, _ := s.Visible("B", 100); found {
 		t.Fatal("B became visible despite the batch failing on A: atomicity violated")
 	}
-	v, _ := s.Visible("A", 100)
+	v, _, _ := s.Visible("A", 100)
 	if string(v) != "1" {
 		t.Fatalf("A's value changed despite the batch failing: got %q, want \"1\"", v)
 	}
@@ -152,7 +152,7 @@ func TestApplyCommitMultiKeyAtomicity(t *testing.T) {
 		{"B", "20", true},
 		{"C", "", false},
 	} {
-		v, found := s.Visible(tc.key, 7)
+		v, found, _ := s.Visible(tc.key, 7)
 		if found != tc.wantFound || (found && string(v) != tc.wantValue) {
 			t.Fatalf("Visible(%s, 7) = %q, %v, want %q, %v", tc.key, v, found, tc.wantValue, tc.wantFound)
 		}
@@ -220,7 +220,7 @@ func TestVisibilityPropertyAgainstReferenceModel(t *testing.T) {
 				wantValue = ref[idx].value
 			}
 
-			gotValue, gotFound := s.Visible("K", startSeq)
+			gotValue, gotFound, _ := s.Visible("K", startSeq)
 			if gotFound != wantFound || (gotFound && string(gotValue) != wantValue) {
 				t.Fatalf("trial %d: Visible(K, %d) = %q,%v; reference model = %q,%v (chain=%v)",
 					trial, startSeq, gotValue, gotFound, wantValue, wantFound, ref)

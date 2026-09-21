@@ -123,7 +123,7 @@ func TestInstallSnapshotBelowCommitIndexIsNeverDurablyInstalled(t *testing.T) {
 	}
 	for i := 0; i < numKeys; i++ {
 		key := fmt.Sprintf("k%d", i)
-		if _, ok := follower.FSM().Store().Visible(key, outcomes[i].CommitSeq); !ok {
+		if _, ok, _ := follower.FSM().Store().Visible(key, outcomes[i].CommitSeq); !ok {
 			t.Fatalf("committed key %s vanished from the follower's state machine after a stale InstallSnapshotRequest", key)
 		}
 	}

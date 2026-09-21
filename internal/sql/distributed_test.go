@@ -196,7 +196,7 @@ func TestDistributedSQLInsertReplicates(t *testing.T) {
 	for _, id := range c.ids {
 		n := c.nodes[id]
 		awaitConditionSQL(t, 5*time.Second, fmt.Sprintf("node %s applies the INSERT", id), func() bool {
-			_, ok := n.FSM().Store().Visible(key, n.Status().AppliedIndex)
+			_, ok, _ := n.FSM().Store().Visible(key, n.Status().AppliedIndex)
 			return ok
 		})
 	}
@@ -281,7 +281,7 @@ func TestDistributedSQLSnapshotCompactionSurvivesRestart(t *testing.T) {
 
 	for i := 0; i < rows; i++ {
 		key := rowKey("t", intValue(int64(i)))
-		if _, ok := restarted.FSM().Store().Visible(key, restarted.Status().AppliedIndex); !ok {
+		if _, ok, _ := restarted.FSM().Store().Visible(key, restarted.Status().AppliedIndex); !ok {
 			t.Errorf("row id=%d missing on restarted node after snapshot restore", i)
 		}
 	}

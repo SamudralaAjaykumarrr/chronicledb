@@ -35,7 +35,7 @@ func BenchmarkVisibleByChainDepth(b *testing.B) {
 			b.ReportAllocs()
 			b.ResetTimer()
 			for i := 0; i < b.N; i++ {
-				if _, ok := s.Visible("k", uint64(depth)); !ok {
+				if _, ok, _ := s.Visible("k", uint64(depth)); !ok {
 					b.Fatalf("Visible: key unexpectedly not found")
 				}
 			}

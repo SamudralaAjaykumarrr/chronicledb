@@ -40,10 +40,10 @@ func TestEncodeDecodeRoundTrip(t *testing.T) {
 	if !metasEqual(snap.Meta, meta) {
 		t.Fatalf("Meta mismatch: got %+v, want %+v", snap.Meta, meta)
 	}
-	if _, found := snap.FSM.Store().Visible("a", 3); found {
+	if _, found, _ := snap.FSM.Store().Visible("a", 3); found {
 		t.Fatalf("expected key a tombstoned as of seq 3")
 	}
-	v, found := snap.FSM.Store().Visible("b", 3)
+	v, found, _ := snap.FSM.Store().Visible("b", 3)
 	if !found || string(v) != "2" {
 		t.Fatalf("expected b=2, got %q found=%v", v, found)
 	}

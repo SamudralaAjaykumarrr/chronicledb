@@ -73,13 +73,13 @@ func TestEncodeStateDecodeStateRoundTrip(t *testing.T) {
 		t.Fatalf("maxSeq = %d, want 2", maxSeq)
 	}
 
-	if v, ok := restored.Store().Visible("k1", 3); !ok || string(v) != "v1b" {
+	if v, ok, _ := restored.Store().Visible("k1", 3); !ok || string(v) != "v1b" {
 		t.Fatalf("k1 visible@3 = %q ok=%v, want v1b", v, ok)
 	}
-	if v, ok := restored.Store().Visible("k1", 1); !ok || string(v) != "v1" {
+	if v, ok, _ := restored.Store().Visible("k1", 1); !ok || string(v) != "v1" {
 		t.Fatalf("k1 visible@1 = %q ok=%v, want v1 (older version still reachable)", v, ok)
 	}
-	if _, ok := restored.Store().Visible("k2", 3); ok {
+	if _, ok, _ := restored.Store().Visible("k2", 3); ok {
 		t.Fatal("k2 must be invisible (tombstoned) as of seq 3")
 	}
 
@@ -122,7 +122,7 @@ func TestEncodeStateDecodeStateEmptyFSM(t *testing.T) {
 	if _, ok := restored.GetOutcome("anything"); ok {
 		t.Fatal("a freshly-decoded empty FSM must have no outcomes")
 	}
-	if _, ok := restored.Store().Visible("anything", 0); ok {
+	if _, ok, _ := restored.Store().Visible("anything", 0); ok {
 		t.Fatal("a freshly-decoded empty FSM must have no keys")
 	}
 }

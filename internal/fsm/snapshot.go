@@ -461,8 +461,15 @@ func DecodeState(data []byte) (*FSM, uint64, error) {
 		}
 	}
 
+	// gcWatermark is always 0 through v0.6.0 slice 7: the generation-3
+	// trailing block that carries a real decoded value lands in slice 8
+	// (docs/v0.6.0-plan.md §16.2, §15.2b) — this call site is exactly
+	// where that decoded value will be threaded through once it exists.
+	// Passing it explicitly now (rather than overloading a zero-value
+	// struct field) is what RestoreStore's required parameter enforces.
+	const gcWatermark = 0
 	return &FSM{
-		store:              mvcc.RestoreStore(chains),
+		store:              mvcc.RestoreStore(chains, gcWatermark),
 		outcomes:           outcomes,
 		controlOutcomes:    controlOutcomes,
 		membershipOutcomes: membershipOutcomes,
