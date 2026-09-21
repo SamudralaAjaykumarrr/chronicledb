@@ -134,6 +134,18 @@ type Metrics struct {
 	// DiskUsage call itself errored (docs/v0.6.0-plan.md §6.2's
 	// fail-safe direction) — chronicledb_disk_probe_failures_total.
 	DiskProbeFailuresTotal metrics.Counter
+
+	// ScrubRunsTotal/ScrubFindingsTotal/ScrubLastDurationMillis are
+	// §25's scrub observability triple (chronicledb_scrub_runs_total,
+	// _findings_total, _last_duration_seconds — the last one rendered
+	// from this millisecond gauge at the /metrics layer, matching every
+	// other latency figure in this codebase). ScrubFindingsTotal counts
+	// every finding across every run (cumulative, like every other
+	// _total); ScrubLastDurationMillis is a gauge (the most recent run
+	// only), unlike the two counters.
+	ScrubRunsTotal          metrics.Counter
+	ScrubFindingsTotal      metrics.Counter
+	ScrubLastDurationMillis metrics.Gauge
 }
 
 // MetricsSnapshot is a point-in-time, safe-to-read-anywhere copy of a
@@ -172,6 +184,10 @@ type MetricsSnapshot struct {
 	RaftMessageProcessSeconds metrics.HistogramSnapshot
 
 	DiskProbeFailuresTotal uint64
+
+	ScrubRunsTotal          uint64
+	ScrubFindingsTotal      uint64
+	ScrubLastDurationMillis int64
 }
 
 // Metrics returns a snapshot of this node's current diagnostic
@@ -212,6 +228,10 @@ func (n *Node) Metrics() MetricsSnapshot {
 		RaftMessageProcessSeconds: m.RaftMessageProcessSeconds.Snapshot(),
 
 		DiskProbeFailuresTotal: m.DiskProbeFailuresTotal.Value(),
+
+		ScrubRunsTotal:          m.ScrubRunsTotal.Value(),
+		ScrubFindingsTotal:      m.ScrubFindingsTotal.Value(),
+		ScrubLastDurationMillis: m.ScrubLastDurationMillis.Value(),
 	}
 }
 

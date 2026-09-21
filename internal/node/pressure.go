@@ -176,7 +176,7 @@ func setupDiskPressure(cfg Config) (*diskPressureSetup, error) {
 // goroutine: reads only atomics/immutable config plus the monitor's own
 // safe Current().
 func (n *Node) diskPressureStatusString() string {
-	p := n.pressureMon.Current()
+	p := n.pressureMon.Load().Current()
 	if (n.diskPressureSet || n.diskCriticalSet) && errors.Is(p.Err, storage.ErrDiskUsageUnsupported) {
 		return "unsupported"
 	}
@@ -198,7 +198,7 @@ func (n *Node) diskPressureStatusString() string {
 // (same-package tests also call it directly, from a test goroutine, with
 // pressureMon replaced by SetPressureSourceForTest first).
 func (n *Node) checkResourcePressure() {
-	p := n.pressureMon.Current()
+	p := n.pressureMon.Load().Current()
 	if p.Err != nil {
 		n.metrics.DiskProbeFailuresTotal.Inc()
 	}
@@ -409,10 +409,9 @@ func (n *Node) auditHealth(action, detail string) {
 // (same-package tests only) after each Set. Production code never calls
 // this.
 func (n *Node) SetPressureSourceForTest(source admission.PressureSource) {
-	old := n.pressureMon
 	mon := admission.NewPressureMonitor(source, time.Hour)
 	mon.Start()
-	n.pressureMon = mon
+	old := n.pressureMon.Swap(mon)
 	old.Stop()
 }
 

@@ -93,6 +93,8 @@ var endpointHTTP = map[string]struct {
 	authz.EndpointMembershipPromote: {"POST", "/admin/membership/promote"},
 	authz.EndpointMembershipRemove:  {"POST", "/admin/membership/remove"},
 	authz.EndpointMembershipStatus:  {"GET", "/admin/membership/status"},
+	authz.EndpointStorageScrub:      {"POST", "/admin/storage/scrub"},
+	authz.EndpointStorageStatus:     {"GET", "/admin/storage/status"},
 }
 
 func TestRBAC_DecisionTable_HTTPLayer_EveryRoleEveryEndpoint(t *testing.T) {

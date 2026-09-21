@@ -245,6 +245,21 @@ type Config struct {
 	// *audit.Log instances Append-ing to the same on-disk chain would
 	// corrupt it.
 	AuditLog *audit.Log
+	// AuditLogDir, when set, is the directory Node.Scrub reads to verify
+	// the audit-log hash chain (§21.3) — a plain path, deliberately
+	// separate from AuditLog itself: scrub never touches a live
+	// *audit.Log (which is single-caller-owned, exactly like
+	// n.walog/n.snapMgr), only the directory's on-disk contents, via its
+	// own read-only internal/audit.Scrub (§21.4). "" skips the audit
+	// chain check (auditRecordsChecked stays 0) — a Go-API caller that
+	// never configured an audit log has nothing to scrub there anyway.
+	AuditLogDir string
+	// ScrubBytesPerSec is -scrub-bytes-per-sec (§21.4): caps Node.Scrub's
+	// combined WAL+snapshot+audit read rate. 0 means unlimited — a
+	// legitimate configuration, not merely "unset", so it is not
+	// defaulted in setDefaults; cmd/chronicledb-node's own flag default
+	// (64MiB) supplies the recommended out-of-the-box value.
+	ScrubBytesPerSec int64
 }
 
 // PeerTLSEnabled reports whether Config requests peer mTLS.
@@ -759,7 +774,14 @@ type Node struct {
 	// §6.4, §19, §20) — see pressure.go. pressureMon always runs, even
 	// with every threshold off, purely for /status diagnostics (§6.1) —
 	// it never itself decides admission; pressureState is what does.
-	pressureMon        *admission.PressureMonitor
+	// pressureMon is an atomic.Pointer, not a plain field, because
+	// refreshStatusLocked reads it (via diskPressureStatusString) on
+	// every single event-loop iteration regardless of
+	// resourcePollTicks, while SetPressureSourceForTest reassigns it
+	// from a test goroutine (found by this slice's own -race run: a
+	// plain-field version of this raced a live node's refreshStatusLocked
+	// against SetPressureSourceForTest's swap).
+	pressureMon        atomic.Pointer[admission.PressureMonitor]
 	diskPressureSet    bool // -disk-pressure-threshold configured
 	diskCriticalSet    bool // -disk-critical-threshold configured
 	diskPressureThresh admission.Threshold
@@ -894,6 +916,15 @@ type Node struct {
 
 	statusMu sync.Mutex
 	status   Status
+
+	// scrubMu/lastScrubReport hold the most recent Scrub result for
+	// GET /admin/storage/status (§21.1) — Scrub itself never runs
+	// concurrently with another Scrub call (bounded by
+	// admission.scrubSlot's single-slot capacity), but this mutex is
+	// still required for the READ side, from an unrelated HTTP request
+	// goroutine.
+	scrubMu         sync.Mutex
+	lastScrubReport *ScrubReport
 
 	// metrics holds this node's diagnostic counters (docs/roadmap.md
 	// Phase 9, see metrics.go). Every field is itself concurrency-safe
@@ -1120,18 +1151,18 @@ func Open(cfg Config) (*Node, error) {
 		stopCh:               make(chan struct{}),
 		doneCh:               make(chan struct{}),
 
-		pressureMon:        pressureSetup.mon,
 		diskPressureSet:    pressureSetup.pressureSet,
 		diskCriticalSet:    pressureSetup.criticalSet,
 		diskPressureThresh: pressureSetup.pressureThresh,
 		diskCriticalThresh: pressureSetup.criticalThresh,
 		fsyncFailuresTotal: newFsyncFailuresTotal(),
 	}
+	n.pressureMon.Store(pressureSetup.mon)
 	n.fsmachine.Store(fsmachine)
 	n.metrics.RaftMessageProcessSeconds = metrics.NewHistogram(metrics.DefaultLatencyBounds...)
 	n.electionArmed = true
 	n.electionTicksLeft = core.NewElectionTimeout()
-	n.pressureMon.Start()
+	n.pressureMon.Load().Start()
 	// ResourcePollInterval expressed in TickInterval units, mirroring
 	// gcIntervalTicks immediately below — always > 0 (setDefaults never
 	// leaves it at 0), unlike GCInterval, so resourcePollTicks is always
@@ -1927,7 +1958,7 @@ func (n *Node) shutdown() {
 	n.pendingReads = nil
 	n.tr.Close()
 	n.walog.Close()
-	n.pressureMon.Stop()
+	n.pressureMon.Load().Stop()
 	close(n.doneCh)
 }
 

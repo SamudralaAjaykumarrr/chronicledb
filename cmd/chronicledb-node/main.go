@@ -129,6 +129,7 @@ func main() {
 		maxHeapBytes          = flag.Uint64("max-heap-bytes", 0, "heap ceiling above which admission tightens exactly as disk LowSpace does (§6.3); an admission threshold, never an allocator limit — set GOMEMLIMIT for that; 0 disables it")
 		resourcePollInterval  = flag.Duration("resource-poll-interval", 5*time.Second, "disk/heap pressure sampling cadence (§6.1)")
 		fsyncFailureThreshold = flag.Int("fsync-failure-threshold", 3, "consecutive non-Raft-path (snapshot/backup/audit) fsync failures before this node marks itself storage-unhealthy (§20.2)")
+		scrubBytesPerSec      = flag.Int64("scrub-bytes-per-sec", 64<<20, "POST /admin/storage/scrub's combined WAL+snapshot+audit read-rate cap (§21.4); 0 = unlimited")
 
 		// HTTP server hardening (docs/v0.6.0-plan.md §10.1, §10.4 — the
 		// one v0.6.0 default-behavior change: on by default, since "no
@@ -331,6 +332,8 @@ func main() {
 		ResourcePollInterval:  *resourcePollInterval,
 		FsyncFailureThreshold: *fsyncFailureThreshold,
 		AuditLog:              auditLog,
+		AuditLogDir:           secFlags.auditLogDir,
+		ScrubBytesPerSec:      *scrubBytesPerSec,
 	}
 
 	n, err := node.Open(cfg)
@@ -509,6 +512,8 @@ func newControlServer(n *node.Node, logger *log.Logger, sec *security, clientTLS
 	s.mux.HandleFunc("/admin/membership/promote", sec.wrap(authz.EndpointMembershipPromote, s.handleMembershipPromote))
 	s.mux.HandleFunc("/admin/membership/remove", sec.wrap(authz.EndpointMembershipRemove, s.handleMembershipRemove))
 	s.mux.HandleFunc("/admin/membership/status", sec.wrap(authz.EndpointMembershipStatus, s.handleMembershipStatus))
+	s.mux.HandleFunc("/admin/storage/scrub", sec.wrap(authz.EndpointStorageScrub, s.handleStorageScrub))
+	s.mux.HandleFunc("/admin/storage/status", sec.wrap(authz.EndpointStorageStatus, s.handleStorageStatus))
 	if enableFault {
 		s.mux.HandleFunc("/fault", sec.wrap(authz.EndpointFault, s.handleFault))
 	}
@@ -564,6 +569,11 @@ func (s *controlServer) handleMetrics(w http.ResponseWriter, r *http.Request) {
 	for _, p := range []node.FsyncPath{node.FsyncPathRaft, node.FsyncPathSnapshot, node.FsyncPathBackup, node.FsyncPathAudit} {
 		fmt.Fprintf(w, "chronicledb_fsync_failures_total{path=%q} %d\n", string(p), fsyncFailures[p])
 	}
+
+	// Storage integrity verification (docs/v0.6.0-plan.md §21, §25).
+	line("chronicledb_scrub_runs_total", "completed Node.Scrub calls", "counter", float64(m.ScrubRunsTotal))
+	line("chronicledb_scrub_findings_total", "findings across every scrub run", "counter", float64(m.ScrubFindingsTotal))
+	line("chronicledb_scrub_last_duration_seconds", "the most recent scrub run's wall-clock duration", "gauge", float64(m.ScrubLastDurationMillis)/1000)
 
 	// Compatibility / Rolling Upgrades metrics (docs/enterprise-v1-plan.md
 	// §7 Observability: "cluster version gauge, per-node reported-version

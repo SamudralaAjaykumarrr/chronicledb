@@ -174,6 +174,11 @@ type Segment struct {
 	path string
 	file *os.File
 	size int64
+	// readOnly is set only by OpenSegmentReadOnly (segment_readonly.go)
+	// — see ErrReadOnlySegment's doc comment for why this, plus opening
+	// with O_RDONLY, is what makes SCRUB NON-DESTRUCTIVE (§27.10) a
+	// structural property rather than a convention.
+	readOnly bool
 }
 
 // ID returns the segment's id.
@@ -190,6 +195,9 @@ func (s *Segment) Path() string { return s.path }
 // page cache) but not persisted: only a subsequent successful Sync
 // guarantees the bytes survive a crash (docs/architecture.md §4).
 func (s *Segment) Append(p []byte) (offset int64, err error) {
+	if s.readOnly {
+		return s.size, ErrReadOnlySegment
+	}
 	offset = s.size
 	n, err := s.file.WriteAt(p, offset)
 	s.size += int64(n)
@@ -206,6 +214,9 @@ func (s *Segment) Append(p []byte) (offset int64, err error) {
 // after Sync returns successfully are the bytes appended since the
 // previous successful Sync persisted (docs/storage.md §5).
 func (s *Segment) Sync() error {
+	if s.readOnly {
+		return ErrReadOnlySegment
+	}
 	if err := s.file.Sync(); err != nil {
 		return classifyWriteErr(fmt.Errorf("storage: sync segment %s: %w", s.path, err))
 	}
@@ -246,6 +257,9 @@ func (s *Segment) ReadAt(p []byte, offset int64) (int, error) {
 // It exists exclusively to repair a torn final record left by a crash
 // during an in-progress append (docs/wal.md §6.1).
 func (s *Segment) Truncate(size int64) error {
+	if s.readOnly {
+		return ErrReadOnlySegment
+	}
 	if err := s.file.Truncate(size); err != nil {
 		return classifyWriteErr(fmt.Errorf("storage: truncate segment %s to %d: %w", s.path, size, err))
 	}

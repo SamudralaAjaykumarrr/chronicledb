@@ -109,15 +109,17 @@ type candidate struct {
 	path  string
 }
 
-// candidatesDescending lists every *.snap file in dir, parsed by
-// filename, sorted by index descending (newest first) — used by Load's
-// newest-first, fall-back-to-older-on-corruption search
-// (docs/snapshots.md §6). Files that do not match the naming convention
-// are ignored (they are not files this package ever created).
-func (m *Manager) candidatesDescending() ([]candidate, error) {
-	entries, err := os.ReadDir(m.dir)
+// listSnapshotCandidates lists every *.snap file directly in dir,
+// parsed by filename, in no particular order — the shared listing logic
+// behind both candidatesDescending (Manager's own newest-first search)
+// and Scrub (which needs every file, not just this Manager's retained
+// set, and must not go through a live *Manager at all — see Scrub's own
+// doc comment). Files that do not match the naming convention are
+// ignored (they are not files this package ever created).
+func listSnapshotCandidates(dir string) ([]candidate, error) {
+	entries, err := os.ReadDir(dir)
 	if err != nil {
-		return nil, fmt.Errorf("snapshot: listing %s: %w", m.dir, err)
+		return nil, fmt.Errorf("snapshot: listing %s: %w", dir, err)
 	}
 	var out []candidate
 	for _, e := range entries {
@@ -133,7 +135,20 @@ func (m *Manager) candidatesDescending() ([]candidate, error) {
 		if err != nil {
 			continue
 		}
-		out = append(out, candidate{index: id, path: filepath.Join(m.dir, name)})
+		out = append(out, candidate{index: id, path: filepath.Join(dir, name)})
+	}
+	return out, nil
+}
+
+// candidatesDescending lists every *.snap file in dir, parsed by
+// filename, sorted by index descending (newest first) — used by Load's
+// newest-first, fall-back-to-older-on-corruption search
+// (docs/snapshots.md §6). Files that do not match the naming convention
+// are ignored (they are not files this package ever created).
+func (m *Manager) candidatesDescending() ([]candidate, error) {
+	out, err := listSnapshotCandidates(m.dir)
+	if err != nil {
+		return nil, err
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].index > out[j].index })
 	return out, nil
