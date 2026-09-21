@@ -42,6 +42,16 @@ jobs:
           fi
       - name: go vet
         run: go vet ./...
+      - name: go vet (windows cross-compile check)
+        # docs/v0.6.0-plan.md §6.2/§33 slice 3: internal/storage's
+        # DiskUsage has a real (unix) implementation and an
+        # ErrDiskUsageUnsupported stub (!unix) — this runner is
+        # Linux-only (docs/support-matrix.md), so the stub's own build
+        # tag excludes it from every other step above. This is the
+        # stub's continuous "tested by build tag" evidence: it must at
+        # least type-check for a non-unix target on every push, even
+        # though its test cannot actually run here.
+        run: GOOS=windows go vet ./internal/storage/...
       - name: go test
         run: go test ./...
       - name: go test -race

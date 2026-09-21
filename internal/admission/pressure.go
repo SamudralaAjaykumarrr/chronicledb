@@ -5,6 +5,8 @@ import (
 	"math"
 	"strconv"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -33,6 +35,70 @@ type Pressure struct {
 // inject a fake and never touch a real filesystem or sleep", C2).
 type PressureSource interface {
 	Sample() Pressure
+}
+
+// PressureMonitor samples a PressureSource on a fixed interval and
+// stores an immutable Pressure snapshot in an atomic.Pointer
+// (docs/v0.6.0-plan.md §6.1): gates and the disk-full state machine
+// read Current() with no syscall, no lock, and no blocking — only this
+// one goroutine ever calls Sample(). An initial sample is taken
+// synchronously at construction, so Current() never returns a zero
+// Pressure before the first tick.
+type PressureMonitor struct {
+	source   PressureSource
+	interval time.Duration
+	current  atomic.Pointer[Pressure]
+
+	stopCh   chan struct{}
+	doneCh   chan struct{}
+	stopOnce sync.Once
+}
+
+// NewPressureMonitor returns a PressureMonitor that will sample source
+// every interval once Start is called. interval must be > 0.
+func NewPressureMonitor(source PressureSource, interval time.Duration) *PressureMonitor {
+	if interval <= 0 {
+		panic("admission: NewPressureMonitor requires interval > 0")
+	}
+	m := &PressureMonitor{
+		source:   source,
+		interval: interval,
+		stopCh:   make(chan struct{}),
+		doneCh:   make(chan struct{}),
+	}
+	initial := source.Sample()
+	m.current.Store(&initial)
+	return m
+}
+
+// Start begins periodic sampling on a new goroutine. Call at most once.
+func (m *PressureMonitor) Start() { go m.run() }
+
+func (m *PressureMonitor) run() {
+	defer close(m.doneCh)
+	ticker := time.NewTicker(m.interval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ticker.C:
+			p := m.source.Sample()
+			m.current.Store(&p)
+		case <-m.stopCh:
+			return
+		}
+	}
+}
+
+// Current returns the most recently sampled Pressure. Safe to call from
+// any goroutine, including before Start (returns the constructor's
+// synchronous initial sample).
+func (m *PressureMonitor) Current() Pressure { return *m.current.Load() }
+
+// Stop halts sampling and waits for the sampling goroutine to exit.
+// Idempotent.
+func (m *PressureMonitor) Stop() {
+	m.stopOnce.Do(func() { close(m.stopCh) })
+	<-m.doneCh
 }
 
 // Threshold is a parsed -disk-pressure-threshold / -disk-critical-
