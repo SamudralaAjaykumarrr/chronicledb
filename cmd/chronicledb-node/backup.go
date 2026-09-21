@@ -49,6 +49,10 @@ func (s *controlServer) handleBackup(w http.ResponseWriter, r *http.Request) {
 	defer cancel()
 	m, err := s.n.Backup(ctx, dir, continuous, s.clusterID)
 	if err != nil {
+		if rej, ok := asAdmissionRejection(err); ok {
+			writeAdmissionRejection(w, rej)
+			return
+		}
 		writeJSON(w, http.StatusInternalServerError, backupResponse{Error: err.Error()})
 		return
 	}

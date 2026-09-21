@@ -59,6 +59,20 @@ const membershipRetryAfterSeconds = 1
 // logs (§13.4).
 func membershipErrorResponse(err error) (status int, resp membershipMutateResponse) {
 	resp = membershipMutateResponse{Status: "error", Error: err.Error()}
+	// Overload/capacity (docs/v0.6.0-plan.md §8.3): checked first,
+	// before every other case — a saturated Lane A1 control gate is a
+	// distinct, always-503 outcome, never conflated with "not leader"
+	// or any membership-specific refusal below.
+	if rej, ok := asAdmissionRejection(err); ok {
+		resp.Reason = string(rej.Reason)
+		if rej.RetryAfter > 0 {
+			resp.RetryAfterSeconds = int(rej.RetryAfter.Seconds())
+			if resp.RetryAfterSeconds < 1 {
+				resp.RetryAfterSeconds = 1
+			}
+		}
+		return http.StatusServiceUnavailable, resp
+	}
 	var nle *node.NotLeaderError
 	if errors.As(err, &nle) {
 		resp.Reason = "not-leader"

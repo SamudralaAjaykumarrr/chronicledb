@@ -24,6 +24,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"net"
 	"net/http"
 	"os"
 	"os/signal"
@@ -78,6 +79,29 @@ func main() {
 		// §7): a standalone dry-run against an already-running node's
 		// control plane, never touching -datadir/node.Open.
 		upgradePrecheckAddr = flag.String("upgrade-precheck", "", "dry-run: query an already-running node's HTTP control-plane address (host:port) for /admin/upgrade/precheck and print the result, then exit; does not start a node or touch -datadir (plain HTTP only in this release — see docs/upgrades.md)")
+
+		// Admission control (docs/v0.6.0-plan.md §10.1). The four
+		// "MaxConcurrent"-shaped flags below default to their §10.1
+		// production values, so 0 can only reach node.Config as an
+		// operator's explicit, deliberate override — validated as fatal
+		// below (ADMISSION FAILS CLOSED: there is no "unlimited").
+		maxInflightProposals      = flag.Int("max-inflight-proposals", 256, "Lane B write concurrency, and the event-loop len(waiters) ceiling (BOUNDED ADMITTED WORK); 0 is a startup error, not \"unlimited\"")
+		maxConcurrentReads        = flag.Int("max-concurrent-reads", 512, "Lane B BeginReadIndex concurrency, and the event-loop len(pendingReads) ceiling; 0 is a startup error")
+		admissionQueueDepth       = flag.Int("admission-queue-depth", 256, "Lane B waiting-room capacity beyond the concurrency limits above (0 = reject immediately, never wait — a legitimate permanent configuration)")
+		admissionMaxWait          = flag.Duration("admission-max-wait", 500*time.Millisecond, "upper bound on queued wait before queue_timeout (0 = bounded only by the caller's own context)")
+		maxAdminConcurrency       = flag.Int("max-admin-concurrency", 2, "Lane A1 (control: membership, upgrade precheck/finalize, TLS reload) concurrency; 0 is a startup error")
+		maxMaintenanceConcurrency = flag.Int("max-maintenance-concurrency", 2, "Lane A2 (maintenance: backup, scrub) concurrency; each kind is additionally single-slot; 0 is a startup error")
+		maxPeerConnections        = flag.Int("max-peer-connections", 64, "bounded accept on the Raft peer listener (0 = unlimited, v0.5.0 behavior)")
+		peerIdleTimeout           = flag.Duration("peer-idle-timeout", 60*time.Second, "read deadline on an inbound peer connection, re-armed per frame (0 = no deadline, v0.5.0 behavior)")
+
+		// HTTP server hardening (docs/v0.6.0-plan.md §10.1, §10.4 — the
+		// one v0.6.0 default-behavior change: on by default, since "no
+		// timeouts at all" was never a behavior worth preserving).
+		maxHTTPConnections    = flag.Int("max-http-connections", 1024, "bounded accept on the control-plane HTTP listener (0 = unlimited)")
+		httpReadHeaderTimeout = flag.Duration("http-read-header-timeout", 5*time.Second, "http.Server ReadHeaderTimeout")
+		httpReadTimeout       = flag.Duration("http-read-timeout", 30*time.Second, "http.Server ReadTimeout")
+		httpWriteTimeout      = flag.Duration("http-write-timeout", 60*time.Second, "http.Server WriteTimeout")
+		httpIdleTimeout       = flag.Duration("http-idle-timeout", 120*time.Second, "http.Server IdleTimeout")
 	)
 	flag.Parse()
 
@@ -178,6 +202,28 @@ func main() {
 		}
 	}
 
+	// ADMISSION FAILS CLOSED (docs/v0.6.0-plan.md §10.1, §27.4): each of
+	// these flags' own default is already its production value (never
+	// 0), so an operator reaching 0 here did so explicitly — refuse to
+	// start rather than silently treat it as "unlimited". node.Config
+	// itself keeps a different, ergonomic "0 = package default"
+	// convention for direct Go-API construction (see Config.setDefaults'
+	// own comment); this is the CLI-specific boundary that rule binds.
+	for _, f := range []struct {
+		name string
+		val  int
+	}{
+		{"max-inflight-proposals", *maxInflightProposals},
+		{"max-concurrent-reads", *maxConcurrentReads},
+		{"max-admin-concurrency", *maxAdminConcurrency},
+		{"max-maintenance-concurrency", *maxMaintenanceConcurrency},
+	} {
+		if f.val == 0 {
+			fmt.Fprintf(os.Stderr, "chronicledb-node: -%s must be > 0 (got 0) — there is no \"unlimited\" admission configuration\n", f.name)
+			os.Exit(2)
+		}
+	}
+
 	cfg := node.Config{
 		ID:                         raft.NodeID(*id),
 		Peers:                      peers,
@@ -193,6 +239,15 @@ func main() {
 		PeerTLSCertFile:            secFlags.peerTLSCertFile,
 		PeerTLSKeyFile:             secFlags.peerTLSKeyFile,
 		PeerTLSCAFile:              secFlags.peerTLSCAFile,
+
+		MaxInflightProposals:      *maxInflightProposals,
+		MaxConcurrentReads:        *maxConcurrentReads,
+		AdmissionQueueDepth:       *admissionQueueDepth,
+		AdmissionMaxWait:          *admissionMaxWait,
+		MaxAdminConcurrency:       *maxAdminConcurrency,
+		MaxMaintenanceConcurrency: *maxMaintenanceConcurrency,
+		MaxPeerConnections:        *maxPeerConnections,
+		PeerIdleTimeout:           *peerIdleTimeout,
 	}
 
 	n, err := node.Open(cfg)
@@ -218,7 +273,31 @@ func main() {
 	}
 
 	srv := newControlServer(n, logger, sec, clientTLSHolder, secFlags.enableFault, *allFlag)
-	httpSrv := &http.Server{Addr: *httpAddr, Handler: srv}
+	httpSrv := &http.Server{
+		Addr:    *httpAddr,
+		Handler: srv,
+		// docs/v0.6.0-plan.md §10.4: the one v0.6.0 default-behavior
+		// change — "no timeouts at all" was never a behavior worth
+		// preserving compatibility with. A client holding an idle
+		// connection longer than -http-idle-timeout, or streaming a
+		// request body for longer than -http-read-timeout, is now
+		// disconnected.
+		ReadHeaderTimeout: *httpReadHeaderTimeout,
+		ReadTimeout:       *httpReadTimeout,
+		WriteTimeout:      *httpWriteTimeout,
+		IdleTimeout:       *httpIdleTimeout,
+	}
+
+	// -max-http-connections (§10.1): a manually constructed, wrapped
+	// listener rather than ListenAndServe(TLS)'s own internal one, so
+	// the connection cap applies before TLS handshake overhead for a
+	// TLS-configured node too.
+	httpLn, err := net.Listen("tcp", *httpAddr)
+	if err != nil {
+		n.Stop()
+		logger.Fatalf("control-plane listener: %v", err)
+	}
+	limitedLn := newLimitListener(httpLn, *maxHTTPConnections)
 
 	if clientTLSHolder != nil {
 		clientAuth := tls.NoClientCert
@@ -229,14 +308,15 @@ func main() {
 			clientAuth = tls.VerifyClientCertIfGiven
 		}
 		httpSrv.TLSConfig = buildTLSConfig(clientTLSHolder, clientAuth)
+		tlsLn := tls.NewListener(limitedLn, httpSrv.TLSConfig)
 		go func() {
-			if err := httpSrv.ListenAndServeTLS("", ""); err != nil && err != http.ErrServerClosed {
+			if err := httpSrv.Serve(tlsLn); err != nil && err != http.ErrServerClosed {
 				logger.Fatalf("control-plane HTTPS server: %v", err)
 			}
 		}()
 	} else {
 		go func() {
-			if err := httpSrv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			if err := httpSrv.Serve(limitedLn); err != nil && err != http.ErrServerClosed {
 				logger.Fatalf("control-plane HTTP server: %v", err)
 			}
 		}()
@@ -567,6 +647,13 @@ func (s *controlServer) handlePropose(w http.ResponseWriter, r *http.Request) {
 	defer cancel()
 	outcome, err := s.n.Propose(ctx, cmd)
 	if err != nil {
+		// Overload/capacity is always 503, distinct from every
+		// correctness outcome (docs/v0.6.0-plan.md §8.3's table) —
+		// checked first, before the not-leader/409 case below.
+		if rej, ok := asAdmissionRejection(err); ok {
+			writeAdmissionRejection(w, rej)
+			return
+		}
 		var nle *node.NotLeaderError
 		resp := proposeResponse{Error: err.Error()}
 		if errors.As(err, &nle) {

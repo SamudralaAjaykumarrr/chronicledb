@@ -141,6 +141,14 @@ type Config struct {
 	// concurrency (-max-maintenance-concurrency); each kind is
 	// additionally single-slot (§3.2a).
 	MaxMaintenanceConcurrency int
+	// MaxPeerConnections bounds concurrent inbound Raft peer connections
+	// (-max-peer-connections). 0 means unlimited — v0.5.0 behavior
+	// exactly.
+	MaxPeerConnections int
+	// PeerIdleTimeout is the read deadline applied to an inbound peer
+	// connection (-peer-idle-timeout). 0 means no deadline — v0.5.0
+	// behavior exactly.
+	PeerIdleTimeout time.Duration
 }
 
 // PeerTLSEnabled reports whether Config requests peer mTLS.
@@ -779,6 +787,8 @@ func Open(cfg Config) (*Node, error) {
 		w.Close()
 		return nil, err
 	}
+	tr.SetMaxPeerConnections(cfg.MaxPeerConnections)
+	tr.SetPeerIdleTimeout(cfg.PeerIdleTimeout)
 
 	admissionGates, err := newAdmissionGates(cfg)
 	if err != nil {
@@ -861,7 +871,20 @@ var ErrPeerTLSNotConfigured = errors.New("node: peer TLS is not configured on th
 // internal/identity.Holder's hot-swap semantics — see its doc comment).
 // A live connection using the previously loaded certificate is never
 // forcibly dropped by this call.
-func (n *Node) ReloadPeerTLS() error {
+func (n *Node) ReloadPeerTLS(ctx context.Context) error {
+	// Lane A1 (docs/v0.6.0-plan.md §3.2): the seventh Lane A1 member,
+	// living in cmd/chronicledb-node's own call sites (SIGHUP, /admin/
+	// reload-tls) — this method is internal/node's own gated entry
+	// point for both. Acquired even though the reload itself never
+	// touches the event loop, for the same reason every other Lane A1
+	// action is gated: a saturated client workload must not be able to
+	// delay an operator's TLS rotation either.
+	release, err := n.admission.control.Acquire(ctx)
+	if err != nil {
+		return err
+	}
+	defer release()
+
 	if n.identityHolder == nil {
 		return ErrPeerTLSNotConfigured
 	}

@@ -545,6 +545,15 @@ func TestAC22Partial_BackupDoesNotBlockMembershipChange(t *testing.T) {
 	// Membership changes require generation >= 2 (§8.2).
 	mustFinalizeToMax(t, tc, leader)
 
+	// A spontaneous re-election anywhere in this test is
+	// indistinguishable from a real defect from the test's own point of
+	// view (see mustFinalizeToMax's identical remedy, and its doc
+	// comment on why this is not rare under `go test -race`): freeze
+	// the election clock for the duration. Heartbeat ticks keep
+	// running, so replication/backup/membership are unaffected.
+	tc.pauseTicking()
+	defer tc.resumeTicking()
+
 	// Drive some load so the backup has real work to do and genuinely
 	// overlaps the membership call below, not a same-tick coincidence.
 	for i := 0; i < 20; i++ {

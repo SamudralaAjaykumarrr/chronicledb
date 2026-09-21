@@ -1,9 +1,11 @@
 package main
 
 import (
+	"context"
 	"errors"
 	"log"
 	"net/http"
+	"time"
 
 	"github.com/SamudralaAjaykumarrr/chronicledb/internal/identity"
 	"github.com/SamudralaAjaykumarrr/chronicledb/internal/node"
@@ -17,8 +19,10 @@ import (
 // not an error, for whichever surface was never configured, since a
 // deployment may legitimately have only one of the two enabled.
 func reloadTLS(n *node.Node, clientHolder *identity.Holder, logger *log.Logger) error {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
 	var errs []error
-	if err := n.ReloadPeerTLS(); err != nil && !errors.Is(err, node.ErrPeerTLSNotConfigured) {
+	if err := n.ReloadPeerTLS(ctx); err != nil && !errors.Is(err, node.ErrPeerTLSNotConfigured) {
 		errs = append(errs, err)
 	}
 	if clientHolder != nil {
@@ -41,6 +45,10 @@ func (s *controlServer) handleReloadTLS(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 	if err := reloadTLS(s.n, s.clientTLSHolder, s.logger); err != nil {
+		if rej, ok := asAdmissionRejection(err); ok {
+			writeAdmissionRejection(w, rej)
+			return
+		}
 		http.Error(w, "reload failed: "+err.Error(), http.StatusInternalServerError)
 		return
 	}

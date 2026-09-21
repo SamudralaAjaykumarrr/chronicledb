@@ -59,6 +59,10 @@ func (s *controlServer) handleUpgradePrecheck(w http.ResponseWriter, r *http.Req
 	defer cancel()
 	res, err := s.n.UpgradePrecheck(ctx)
 	if err != nil {
+		if rej, ok := asAdmissionRejection(err); ok {
+			writeAdmissionRejection(w, rej)
+			return
+		}
 		writeJSON(w, http.StatusInternalServerError, precheckResponse{Error: err.Error()})
 		return
 	}
@@ -86,6 +90,10 @@ func (s *controlServer) handleUpgradeFinalize(w http.ResponseWriter, r *http.Req
 	defer cancel()
 	outcome, target, err := s.n.FinalizeUpgrade(ctx)
 	if err != nil {
+		if rej, ok := asAdmissionRejection(err); ok {
+			writeAdmissionRejection(w, rej)
+			return
+		}
 		var nle *node.NotLeaderError
 		resp := finalizeResponse{Status: "error", Error: err.Error()}
 		if errors.As(err, &nle) {
