@@ -6,6 +6,7 @@ import (
 	"context"
 	"fmt"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -41,20 +42,38 @@ func awaitNodeStopped(t *testing.T, n *Node, timeout time.Duration) {
 	}
 }
 
-// armOnce arms a fault hook that fires exactly once, at target, and
-// reports firing by closing the returned channel — a stronger signal
-// than CrashOnceAtFaultPointForTest alone, since this smoke test needs
-// to know reachability was actually exercised, not merely that the
-// node eventually stopped for some unrelated reason.
+// armOnce arms a fault hook that crashes exactly once, the first time
+// target is reached, and reports that by closing the returned channel —
+// a stronger signal than CrashOnceAtFaultPointForTest alone, since a
+// caller needs to know reachability was actually exercised, not merely
+// that the node eventually stopped for some unrelated reason.
+//
+// The hook must stop returning true after its first match, not just
+// stop re-closing fired: a node restarted after the injected crash
+// (SL-8/SL-26) can legitimately reach the very same FaultPoint again on
+// a later, ordinary snapshot cycle (most easily for
+// FaultAfterSnapshotCreate, literally the first line of maybeSnapshot),
+// and the package-level fault hook stays armed across that restart
+// (SetFaultPointForTest is not per-Node). An earlier version of this
+// helper only guarded the channel close with sync.Once while still
+// unconditionally returning true on every match, so the restarted node
+// crashed again immediately, silently, on its very first post-restart
+// snapshot cycle — observed as the restarted node getting permanently
+// stuck reporting a stale pre-election Follower status forever, not as
+// a visible second crash, since nothing in these tests re-observes
+// armOnce's own fired channel a second time.
 func armOnce(t *testing.T, target FaultPoint) <-chan struct{} {
 	t.Helper()
 	fired := make(chan struct{})
-	var once sync.Once
+	var didFire atomic.Bool
 	SetFaultPointForTest(func(p FaultPoint) bool {
 		if p != target {
 			return false
 		}
-		once.Do(func() { close(fired) })
+		if !didFire.CompareAndSwap(false, true) {
+			return false
+		}
+		close(fired)
 		return true
 	})
 	t.Cleanup(func() { SetFaultPointForTest(nil) })
@@ -155,5 +174,59 @@ func TestFaultPointSmoke_HandleInstallSnapshotThreePoints(t *testing.T) {
 			awaitNodeStopped(t, followerNode, 3*time.Second)
 			delete(tc.nodes, follower)
 		})
+	}
+}
+
+// TestMaybeSnapshotSixStepCallOrder_SL24 is SL-24
+// (docs/v0.6.0-plan.md §17.2, C4): a call-order assertion proving
+// maybeSnapshot's six steps run in the exact documented order, so a
+// future refactor cannot silently permute them. Reuses the slice 10a
+// fault-point facility purely as an observation point (the hook always
+// returns false — never crashes) rather than as a crash injector.
+func TestMaybeSnapshotSixStepCallOrder_SL24(t *testing.T) {
+	const threshold = 3
+	tc := newTestClusterWithSnapshotThreshold(t, 1, threshold)
+	leaderID := tc.awaitLeader(10 * time.Second)
+	leader := tc.node(leaderID)
+
+	var mu sync.Mutex
+	var order []FaultPoint
+	SetFaultPointForTest(func(p FaultPoint) bool {
+		mu.Lock()
+		order = append(order, p)
+		mu.Unlock()
+		return false
+	})
+	defer SetFaultPointForTest(nil)
+
+	for i := 0; i < 3*threshold; i++ {
+		outcome, err := propose(t, leader, cmd(fmt.Sprintf("order-%d", i), uint64(i), ^uint64(0), fmt.Sprintf("k%d", i), "v"), 3*time.Second)
+		if err != nil || outcome.Status != fsm.StatusCommitted {
+			t.Fatalf("Propose #%d: outcome=%+v err=%v", i, outcome, err)
+		}
+	}
+	awaitCondition(t, 5*time.Second, "leader creates a snapshot", func() bool {
+		return uint64(leader.Status().SnapshotIndex) > 0
+	})
+
+	want := []FaultPoint{
+		FaultAfterSnapshotCreate,
+		FaultAfterAppendMetadataSnapshot,
+		FaultAfterCoreCompact,
+		FaultAfterStorageCompact,
+		FaultAfterReaffirm,
+		FaultAfterCompactBefore,
+	}
+	mu.Lock()
+	got := append([]FaultPoint(nil), order...)
+	mu.Unlock()
+	if len(got) < len(want) {
+		t.Fatalf("observed only %d fault-point events, want at least %d (one full maybeSnapshot cycle): %v", len(got), len(want), got)
+	}
+	first6 := got[:len(want)]
+	for i, p := range want {
+		if first6[i] != p {
+			t.Fatalf("maybeSnapshot's six-step call order was permuted: got %v, want %v", first6, want)
+		}
 	}
 }

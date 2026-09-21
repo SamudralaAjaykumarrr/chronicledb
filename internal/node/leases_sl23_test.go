@@ -119,19 +119,35 @@ func TestReadLeaseLifecycle_SL23(t *testing.T) {
 		})
 	})
 
-	// Leadership lost while a read is pending: the two followers, cut
-	// off from this (about-to-be-former) leader, elect a new leader
-	// among themselves; healing the partition delivers that new
-	// leader's higher-term messages to the old leader, forcing
-	// SteppedDown. checkPendingReads' role/term-mismatch branch must
-	// release the lease and resolve the caller with ErrLeadershipLost —
-	// this leader's own Role() stays "Leader" locally for as long as it
-	// is merely isolated (docs/replication.md §5; the same premise
-	// admission_behavior_test.go's isolate(leaderID) tests already rely
-	// on), so the read genuinely registers and stays pending rather
-	// than failing immediately with NotLeaderError.
+	// Leadership lost while a read is pending: the leader is isolated
+	// BEFORE the read is even issued — not after — so it genuinely can
+	// never resolve on its own (no quorum acks reachable), guaranteeing
+	// a stable "registered but pending" state for this subtest to
+	// observe. Isolating only after issuing the read was tried first and
+	// is unsound: on a healthy leader, ackSeq values from ambient
+	// heartbeats can already satisfy a fresh read's requiredSeq, so
+	// registration and resolution can complete within the very same
+	// handleReadIndex/processOutput call — one single run() loop
+	// iteration — before Metrics().ReadLeasesActiveGauge (refreshed only
+	// once per iteration) ever reports the transient "live" count an
+	// outside poller could catch; this raced roughly 1 run in 4 under
+	// load, exactly the class of flake docs/testing-strategy.md warns
+	// against masking with a bigger timeout instead of fixing the race.
+	// The two followers, cut off from this (about-to-be-former) leader,
+	// elect a new leader among themselves; healing the partition
+	// delivers that new leader's higher-term messages to the old leader,
+	// forcing SteppedDown. checkPendingReads' role/term-mismatch branch
+	// must release the lease and resolve the caller with
+	// ErrLeadershipLost — this leader's own Role() stays "Leader"
+	// locally for as long as it is merely isolated (docs/replication.md
+	// §5; the same premise admission_behavior_test.go's
+	// isolate(leaderID) tests already rely on), so the read genuinely
+	// registers and stays pending rather than failing immediately with
+	// NotLeaderError.
 	t.Run("leadership_lost_while_pending", func(t *testing.T) {
 		before := leaderLiveLeases(leader)
+		tc.isolate(leaderID) // no quorum reachable: this read can never resolve on its own
+
 		resultCh := make(chan error, 1)
 		go func() {
 			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
@@ -139,11 +155,10 @@ func TestReadLeaseLifecycle_SL23(t *testing.T) {
 			_, _, err := leader.BeginReadIndex(ctx)
 			resultCh <- err
 		}()
-		awaitCondition(t, 2*time.Second, "read lease registered and pending", func() bool {
+		awaitCondition(t, 3*time.Second, "read lease registered and pending", func() bool {
 			return leaderLiveLeases(leader) > before
 		})
 
-		tc.isolate(leaderID)
 		var others []raft.NodeID
 		for _, id := range tc.ids {
 			if id != leaderID {

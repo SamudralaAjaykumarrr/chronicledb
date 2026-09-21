@@ -27,14 +27,21 @@ const (
 //	  <lastIncludedIndex, 20 digits>.snap
 //	  tmp/                 in-progress files, never trusted
 //
-// V1 retains exactly one snapshot at a time (docs/snapshots.md §6's
-// explicitly allowed simplification): a new snapshot's file is written
-// and confirmed fully durable *before* any older one is deleted, so at
-// least one valid snapshot is present on disk at every instant —
-// stronger than the minimum §6 requires, and what makes the brief
-// window where two files transiently coexist double as free,
-// no-extra-code support for "fall back to the next-older valid
-// snapshot" (Load already tries every candidate, newest first).
+// V1 retains, by default, exactly one snapshot at a time
+// (docs/snapshots.md §6's explicitly allowed simplification): a new
+// snapshot's file is written and confirmed fully durable *before* any
+// older one is deleted, so at least one valid snapshot is present on
+// disk at every instant — stronger than the minimum §6 requires, and
+// what makes the brief window where two files transiently coexist
+// double as free, no-extra-code support for "fall back to the
+// next-older valid snapshot" (Load already tries every candidate,
+// newest first). SetRetainCount (docs/v0.6.0-plan.md §18.2,
+// `-snapshot-retain-count`) raises how many of the newest snapshot
+// files are kept, to shrink the §18.1 snapshot-serve-miss window a
+// leader can hit while filling a MsgInstallSnapshotRequest for an index
+// a since-superseded prune already deleted; retaining more never
+// changes the single-valid-snapshot-at-every-instant guarantee, only
+// widens it.
 //
 // Manager is not safe for concurrent use by multiple goroutines; it is
 // designed to be owned by a single caller (internal/node's event-loop
@@ -44,6 +51,10 @@ const (
 // WALStorage does).
 type Manager struct {
 	dir string
+	// retainCount is how many of the newest snapshot files Prune keeps;
+	// always >= 1 (SetRetainCount enforces this, and NewManager's own
+	// default reproduces today's exact single-retention behavior).
+	retainCount int
 }
 
 // NewManager ensures dir and dir/tmp exist and removes any stale
@@ -66,7 +77,21 @@ func NewManager(dir string) (*Manager, error) {
 	for _, e := range entries {
 		_ = os.Remove(filepath.Join(tmp, e.Name())) // best-effort; never trusted regardless
 	}
-	return &Manager{dir: dir}, nil
+	return &Manager{dir: dir, retainCount: 1}, nil
+}
+
+// SetRetainCount sets how many of the newest snapshot files Prune
+// retains from here on (docs/v0.6.0-plan.md §18.2). n must be >= 1 —
+// retaining zero would mean occasionally having no valid snapshot on
+// disk at all, violating Manager's own always-at-least-one invariant
+// (see its own doc comment). Not safe to call concurrently with
+// Create/Install, matching Manager's own single-caller contract.
+func (m *Manager) SetRetainCount(n int) error {
+	if n < 1 {
+		return fmt.Errorf("snapshot: retain count must be >= 1, got %d", n)
+	}
+	m.retainCount = n
+	return nil
 }
 
 func (m *Manager) tmpDir() string { return filepath.Join(m.dir, tmpDirName) }
@@ -116,33 +141,54 @@ func (m *Manager) candidatesDescending() ([]candidate, error) {
 
 // writeDurable performs the crash-safe temp-file + fsync + atomic
 // rename + directory fsync sequence (docs/snapshots.md §3) for a
-// snapshot whose framed bytes are already fully encoded, then prunes
-// every other retained snapshot file now that the new one is confirmed
-// durable (see Manager's doc comment on single-snapshot retention).
-// index must match meta.LastIncludedIndex encoded inside data — callers
-// are responsible for that consistency (both Create and Install decode
-// index from the same meta they pass here).
+// snapshot whose framed bytes are already fully encoded. It
+// deliberately does NOT prune any other retained snapshot file itself
+// — see Prune's own doc comment for why that used to happen here and
+// was moved out (docs/v0.6.0-plan.md §22, SL-8). index must match
+// meta.LastIncludedIndex encoded inside data — callers are responsible
+// for that consistency (both Create and Install decode index from the
+// same meta they pass here).
 func (m *Manager) writeDurable(index uint64, data []byte) error {
 	finalPath := m.path(index)
-	if err := storage.WriteFileDurable(m.tmpDir(), finalPath, data); err != nil {
-		return err
-	}
-	return m.pruneExcept(index)
+	return storage.WriteFileDurable(m.tmpDir(), finalPath, data)
 }
 
-// pruneExcept deletes every retained snapshot file other than keepIndex
-// (docs/snapshots.md §6's V1 "retain only the latest" choice). Never
-// called until the new snapshot at keepIndex is itself already
-// confirmed durable, so this never risks leaving zero valid snapshots
-// on disk even if interrupted partway through (each deletion is its own
-// fsync'd directory operation, exactly like WAL segment compaction).
-func (m *Manager) pruneExcept(keepIndex uint64) error {
-	cands, err := m.candidatesDescending()
+// Prune deletes every retained snapshot file except the newest
+// SetRetainCount files (by index) and, defensively, keepIndex itself.
+// n < 1 is treated as 1, matching SetRetainCount's own floor.
+//
+// The caller MUST NOT call this until keepIndex's own file is not only
+// durable but the corresponding durable pointer that will make Load
+// trust it has ALSO already been recorded (internal/wal.WAL.
+// AppendMetadataSnapshot for a locally created snapshot, or
+// WALStorage.InstallSnapshot for a received one) — i.e. not until
+// ReclaimBoundary (docs/v0.6.0-plan.md §17.1) has actually moved to
+// keepIndex. Pruning any earlier is the exact hazard SL-8 found and
+// this method's own introduction fixes: writeDurable used to prune
+// eagerly, inside Create/Install themselves, before the caller had
+// durably recorded anything — so a crash between "the new file is on
+// disk" and "the pointer names it" left the OLD (still-pointer-named)
+// file already deleted and the new one un-adopted, an unrecoverable gap
+// (docs/recovery.md §4's "gap requires operator intervention"), exactly
+// contradicting §22's own "Load never trusts a file above the durable
+// pointer" safety claim for that row, which implicitly assumed the old
+// file would still be there to fall back to. Called only after that
+// ordering is honored, each deletion is its own fsync'd directory
+// operation and interrupting this method partway through is safe
+// (docs/snapshots.md §6's newest-first fallback — see §22's own
+// "Mid-pruneKeepingNewest" row, which this ordering is what actually
+// makes true).
+func (m *Manager) Prune(keepIndex uint64) error {
+	n := m.retainCount
+	if n < 1 {
+		n = 1
+	}
+	cands, err := m.candidatesDescending() // newest first
 	if err != nil {
 		return err
 	}
-	for _, c := range cands {
-		if c.index == keepIndex {
+	for i, c := range cands {
+		if i < n || c.index == keepIndex {
 			continue
 		}
 		if err := os.Remove(c.path); err != nil && !os.IsNotExist(err) {

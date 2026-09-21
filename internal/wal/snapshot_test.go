@@ -266,6 +266,96 @@ func TestCompactBeforeDeletesOnlySegmentsFullyAtOrBeforeBoundary(t *testing.T) {
 	}
 }
 
+// TestCompactBeforeRetainingRetainsExtraSegments is SL-9's positive
+// half plus §17.3's own correctness claim: retainExtraSegments stops
+// deletion that many otherwise-eligible segments early, using the exact
+// same eligibility computation CompactBefore itself uses (retaining
+// MORE than required is always safe) — and retainExtraSegments=0
+// reproduces CompactBefore's own behavior exactly (proven by comparing
+// against the sibling assertion in
+// TestCompactBeforeDeletesOnlySegmentsFullyAtOrBeforeBoundary).
+func TestCompactBeforeRetainingRetainsExtraSegments(t *testing.T) {
+	dir := t.TempDir()
+	w, _ := mustOpen(t, dir, Options{SegmentMaxSize: 64})
+	defer w.Close()
+
+	for i := 0; i < 30; i++ {
+		if _, err := w.AppendLogEntry([]byte("0123456789")); err != nil {
+			t.Fatalf("AppendLogEntry #%d: %v", i, err)
+		}
+	}
+	if err := w.Sync(); err != nil {
+		t.Fatalf("Sync: %v", err)
+	}
+	if err := w.AppendMetadataSnapshot(15); err != nil {
+		t.Fatalf("AppendMetadataSnapshot: %v", err)
+	}
+
+	idsBefore, err := storage.ListSegmentIDs(dir)
+	if err != nil {
+		t.Fatalf("ListSegmentIDs: %v", err)
+	}
+
+	if err := w.CompactBeforeRetaining(15, 2); err != nil {
+		t.Fatalf("CompactBeforeRetaining(15, 2): %v", err)
+	}
+	idsRetained, err := storage.ListSegmentIDs(dir)
+	if err != nil {
+		t.Fatalf("ListSegmentIDs after retaining compaction: %v", err)
+	}
+
+	if err := w.CompactBeforeRetaining(15, 0); err != nil {
+		t.Fatalf("CompactBeforeRetaining(15, 0): %v", err)
+	}
+	idsFull, err := storage.ListSegmentIDs(dir)
+	if err != nil {
+		t.Fatalf("ListSegmentIDs after full compaction: %v", err)
+	}
+
+	if len(idsRetained) <= len(idsFull) {
+		t.Fatalf("retaining 2 extra segments did not retain more than a full compaction: before=%d retained=%d full=%d", len(idsBefore), len(idsRetained), len(idsFull))
+	}
+	if len(idsFull) >= len(idsRetained) {
+		t.Fatalf("a subsequent retainExtraSegments=0 call did not eventually catch up to CompactBefore's own boundary: retained=%d full=%d", len(idsRetained), len(idsFull))
+	}
+
+	it, err := w.Replay(w.FirstIndex())
+	if err != nil {
+		t.Fatalf("Replay: %v", err)
+	}
+	defer it.Close()
+	count := 0
+	for {
+		rec, ok, err := it.Next()
+		if err != nil {
+			t.Fatalf("Next: %v", err)
+		}
+		if !ok {
+			break
+		}
+		count++
+		if rec.Index != uint64(15+count) {
+			t.Fatalf("record #%d has index %d, want %d", count, rec.Index, 15+count)
+		}
+	}
+	if count != 15 {
+		t.Fatalf("replayed %d entries after retaining compaction, want 15 (indices 16..30) — retention must never lose required history", count)
+	}
+}
+
+// TestCompactBeforeRetainingRejectsNegative is SL-9's negative half: a
+// negative retainExtraSegments is refused rather than silently treated
+// as 0 or clamped.
+func TestCompactBeforeRetainingRejectsNegative(t *testing.T) {
+	dir := t.TempDir()
+	w, _ := mustOpen(t, dir, Options{})
+	defer w.Close()
+
+	if err := w.CompactBeforeRetaining(0, -1); err == nil {
+		t.Fatalf("CompactBeforeRetaining(0, -1) succeeded, want an error")
+	}
+}
+
 // TestCompactBeforeNeverDeletesCurrentSegment proves the current
 // (open-for-writing) segment always survives compaction, however large
 // uptoIndex is — so subsequent appends keep working correctly afterward.

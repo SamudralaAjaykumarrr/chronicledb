@@ -30,6 +30,17 @@ const (
 	FaultBeforeInstallSnapshotStorage      // before n.storage.InstallSnapshot
 	FaultAfterInstallSnapshotBeforeFSMSwap // after storage.InstallSnapshot, before n.fsmachine.Store
 	FaultAfterFSMSwapBeforeGenerationAdopt // after the FSM swap, before adoptClusterGeneration
+
+	// FaultAfterSnapshotPrune is not one of §17.2's original six or
+	// §22's original three: it is the SL-8-discovered fix's own point,
+	// after snapshot-file pruning (Manager.Prune), which maybeSnapshot
+	// now performs explicitly at the very end of its sequence rather
+	// than Manager doing it eagerly inside Create/Install (see
+	// Manager.Prune's doc comment for the crash-safety hazard this
+	// fixes). Exercised by its own crash test, kept separate from
+	// SL-8's six-point loop so that proof obligation stays scoped to
+	// exactly the six points §17.2 names.
+	FaultAfterSnapshotPrune
 )
 
 // faultHook, when armed, is consulted at every named FaultPoint. It is

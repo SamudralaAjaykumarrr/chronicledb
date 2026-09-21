@@ -627,16 +627,37 @@ func (w *WAL) SetClusterGeneration(generation uint32) error {
 // completed compaction is never a correctness problem, only a
 // (temporary, self-healing on the next successful call) disk-space one.
 func (w *WAL) CompactBefore(uptoIndex uint64) error {
+	return w.CompactBeforeRetaining(uptoIndex, 0)
+}
+
+// CompactBeforeRetaining is CompactBefore's more general form
+// (docs/v0.6.0-plan.md §17.3, `-wal-retain-extra-segments`): the same
+// unchanged eligibility computation (segment ids alone, never by
+// re-reading contents — see CompactBefore's own doc comment), but stops
+// deleting once retainExtraSegments otherwise-eligible segments remain,
+// giving a lagging follower a chance to catch up by log replication
+// rather than a full InstallSnapshot (per §4.4, one of the most
+// event-loop-expensive things a leader can be asked to do).
+// retainExtraSegments must be >= 0; retaining more history than required
+// is always safe, so this only ever moves the stopping point earlier,
+// never deletes anything CompactBefore itself would not have.
+// retainExtraSegments == 0 reproduces CompactBefore's exact behavior
+// (today's default).
+func (w *WAL) CompactBeforeRetaining(uptoIndex uint64, retainExtraSegments int) error {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	if w.closed {
 		return ErrClosed
+	}
+	if retainExtraSegments < 0 {
+		return fmt.Errorf("wal: retainExtraSegments must be >= 0, got %d", retainExtraSegments)
 	}
 	ids, err := storage.ListSegmentIDs(w.dir)
 	if err != nil {
 		return err
 	}
 	currentID := w.current.ID()
+	var eligible []uint64
 	for i, id := range ids {
 		if id == currentID {
 			break
@@ -653,6 +674,12 @@ func (w *WAL) CompactBefore(uptoIndex uint64) error {
 		if maxIndexInSegment > uptoIndex {
 			break // this segment (and every later one) is still needed
 		}
+		eligible = append(eligible, id)
+	}
+	if retainExtraSegments >= len(eligible) {
+		return nil // retain everything eligible; nothing to delete yet
+	}
+	for _, id := range eligible[:len(eligible)-retainExtraSegments] {
 		if err := storage.RemoveSegment(w.dir, id); err != nil {
 			return err
 		}

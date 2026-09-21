@@ -54,6 +54,16 @@ type Metrics struct {
 	// peer-provided snapshot that actually advanced this node's state
 	// (handleInstallSnapshot).
 	SnapshotsInstalledTotal metrics.Counter
+	// SnapshotServeMissTotal counts every time this node, as leader, was
+	// asked by processOutput to fill a MsgInstallSnapshotRequest's bytes
+	// for an index its own snapMgr no longer retains (docs/v0.6.0-plan.md
+	// §18.1's self-healing race: a snapshot created between Core
+	// deciding a follower needs index X and the message actually being
+	// filled can prune X away first). Nonzero is an expected, bounded
+	// operating signal — Core re-derives a request for the newer index
+	// on the next heartbeat — not a bug signal by itself; SL-11 is what
+	// proves the follower still converges via retry.
+	SnapshotServeMissTotal metrics.Counter
 
 	// RaftMessagesSentTotal/RaftMessagesReceivedTotal count outbound
 	// and inbound internal/raft protocol messages processed by this
@@ -134,6 +144,7 @@ type MetricsSnapshot struct {
 	RequestIDDuplicatesTotal   uint64
 	SnapshotsCreatedTotal      uint64
 	SnapshotsInstalledTotal    uint64
+	SnapshotServeMissTotal     uint64
 	RaftMessagesSentTotal      uint64
 	RaftMessagesReceivedTotal  uint64
 	BackupsTotal               uint64
@@ -171,6 +182,7 @@ func (n *Node) Metrics() MetricsSnapshot {
 		RequestIDDuplicatesTotal:   m.RequestIDDuplicatesTotal.Value(),
 		SnapshotsCreatedTotal:      m.SnapshotsCreatedTotal.Value(),
 		SnapshotsInstalledTotal:    m.SnapshotsInstalledTotal.Value(),
+		SnapshotServeMissTotal:     m.SnapshotServeMissTotal.Value(),
 		RaftMessagesSentTotal:      m.RaftMessagesSentTotal.Value(),
 		RaftMessagesReceivedTotal:  m.RaftMessagesReceivedTotal.Value(),
 		BackupsTotal:               m.BackupsTotal.Value(),

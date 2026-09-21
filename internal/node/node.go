@@ -178,6 +178,26 @@ type Config struct {
 	// performs byte-identical work regardless of its own flags.
 	GCMaxVersionsPerPass uint32
 	GCMaxKeysPerPass     uint32
+
+	// --- Retention knobs (docs/v0.6.0-plan.md §17.3, §18.2) ---
+
+	// WALRetainExtraSegments is passed through to
+	// WAL.CompactBeforeRetaining on every maybeSnapshot cycle
+	// (-wal-retain-extra-segments). 0 (the default) reproduces
+	// CompactBefore's own exact v0.5.0 behavior. Must be >= 0;
+	// Open refuses a negative value (SL-9).
+	WALRetainExtraSegments int
+	// SnapshotRetainCount is how many of the newest snapshot files
+	// Manager retains (-snapshot-retain-count). 0 means "unset, keep
+	// Manager's own built-in default of 1" — today's exact v0.5.0
+	// behavior — for a direct Go-API caller that never sets it; the CLI
+	// itself defaults its flag to 1 and refuses 0 explicitly (SL-9),
+	// since an operator typing -snapshot-retain-count=0 almost
+	// certainly means "I want no retention," which is not an available
+	// configuration (Manager.SetRetainCount's own floor — retaining
+	// zero would risk having no valid snapshot on disk at all). A
+	// negative value is refused by Open either way.
+	SnapshotRetainCount int
 }
 
 // PeerTLSEnabled reports whether Config requests peer mTLS.
@@ -296,6 +316,12 @@ func (c Config) validate() error {
 			return fmt.Errorf("node: peer mTLS requires PeerTLSCertFile, PeerTLSKeyFile, and PeerTLSCAFile all set (got cert=%q key=%q ca=%q) — partial peer-TLS configuration is not supported (NO PLAINTEXT PEER REPLICATION)",
 				c.PeerTLSCertFile, c.PeerTLSKeyFile, c.PeerTLSCAFile)
 		}
+	}
+	if c.WALRetainExtraSegments < 0 {
+		return fmt.Errorf("node: Config.WALRetainExtraSegments must be >= 0, got %d", c.WALRetainExtraSegments)
+	}
+	if c.SnapshotRetainCount < 0 {
+		return fmt.Errorf("node: Config.SnapshotRetainCount must be >= 0 (0 means \"use Manager's default of 1\"), got %d", c.SnapshotRetainCount)
 	}
 	return nil
 }
@@ -661,6 +687,15 @@ type Node struct {
 	noopWriteGateForTest      atomic.Bool
 	skipLaneSeparationForTest atomic.Bool
 
+	// preSnapshotBytesFillHookForTest is SL-11's determinism hook
+	// (docs/v0.6.0-plan.md §18.1): when armed, called with the index
+	// processOutput is about to ask snapMgr.Bytes for, immediately
+	// before that call — solely so a test can force the exact
+	// decision-then-fill race deterministically (synchronously prune the
+	// requested index away right there) instead of relying on hitting it
+	// by timing. Never set in production.
+	preSnapshotBytesFillHookForTest atomic.Pointer[func(index uint64)]
+
 	// clusterGeneration mirrors fsm.FSM.ClusterGeneration() but is
 	// written directly by run's own goroutine (via
 	// adoptClusterGeneration) instead of read through fsmachine's mutex
@@ -772,6 +807,12 @@ func Open(cfg Config) (*Node, error) {
 	if err != nil {
 		w.Close()
 		return nil, fmt.Errorf("node: opening snapshot directory: %w", err)
+	}
+	if cfg.SnapshotRetainCount > 0 {
+		if err := snapMgr.SetRetainCount(cfg.SnapshotRetainCount); err != nil {
+			w.Close()
+			return nil, fmt.Errorf("node: %w", err)
+		}
 	}
 
 	// Recovery steps 1-4 (docs/recovery.md §1): locate and validate the
@@ -1110,6 +1151,18 @@ func (n *Node) SetNoopAdmissionGateForTest(noop bool) { n.noopWriteGateForTest.S
 // it.
 func (n *Node) SetSkipAdmissionLaneSeparationForTest(skip bool) {
 	n.skipLaneSeparationForTest.Store(skip)
+}
+
+// SetPreSnapshotBytesFillHookForTest arms fn as
+// preSnapshotBytesFillHookForTest (SL-11, docs/v0.6.0-plan.md §18.1);
+// passing nil disarms it. Test-only; production code never calls it.
+func (n *Node) SetPreSnapshotBytesFillHookForTest(fn func(index uint64)) {
+	if fn == nil {
+		n.preSnapshotBytesFillHookForTest.Store(nil)
+		return
+	}
+	f := fn
+	n.preSnapshotBytesFillHookForTest.Store(&f)
 }
 
 // Status returns a snapshot of the node's current diagnostic state.
@@ -2052,8 +2105,12 @@ func (n *Node) processOutput(out raft.Output) {
 			// §7 step 1, raft.MsgInstallSnapshotRequest's doc comment) —
 			// fill them in from this node's own retained snapshot before
 			// the message ever reaches the wire.
+			if hook := n.preSnapshotBytesFillHookForTest.Load(); hook != nil {
+				(*hook)(uint64(m.LastIncludedIndex))
+			}
 			data, ok, err := n.snapMgr.Bytes(uint64(m.LastIncludedIndex))
 			if err != nil || !ok {
+				n.metrics.SnapshotServeMissTotal.Inc()
 				n.logf("node %s: cannot serve snapshot %d to %s (ok=%v err=%v); skipping this round, leader will retry", n.cfg.ID, m.LastIncludedIndex, m.To, ok, err)
 				continue
 			}
@@ -2485,11 +2542,24 @@ func (n *Node) maybeSnapshot() {
 		return
 	}
 	triggerFaultPoint(FaultAfterReaffirm)
-	if err := n.walog.CompactBefore(meta.LastIncludedIndex); err != nil {
+	if err := n.walog.CompactBeforeRetaining(meta.LastIncludedIndex, n.cfg.WALRetainExtraSegments); err != nil {
 		n.fail(fmt.Errorf("node: compacting log before index %d: %w", meta.LastIncludedIndex, err))
 		return
 	}
 	triggerFaultPoint(FaultAfterCompactBefore)
+	// Pruning old snapshot FILES happens here — strictly after
+	// ReclaimBoundary has actually moved to meta.LastIncludedIndex
+	// (durable, pointer-recorded, and HardState reaffirmed by the five
+	// steps above), never any earlier (see Manager.Prune's own doc
+	// comment for the crash-safety hazard this ordering fixes, found by
+	// SL-8). Deliberately non-fatal: a failure here leaves an extra
+	// snapshot file or two on disk — a disk-space hygiene concern, not a
+	// durability one, so it does not need to stop the node the way a
+	// failure in any of the six steps above does.
+	if err := n.snapMgr.Prune(meta.LastIncludedIndex); err != nil {
+		n.logf("node %s: pruning old snapshot files after index %d: %v (non-fatal; will retry on the next snapshot cycle)", n.cfg.ID, meta.LastIncludedIndex, err)
+	}
+	triggerFaultPoint(FaultAfterSnapshotPrune)
 	n.metrics.SnapshotsCreatedTotal.Inc()
 	n.logf("node %s: created snapshot at index %d, compacted log", n.cfg.ID, meta.LastIncludedIndex)
 }
@@ -2668,6 +2738,15 @@ func (n *Node) handleInstallSnapshot(msg raft.Message) {
 		// two paths that must go through it).
 		if !n.adoptClusterGeneration(snap.FSM.ClusterGeneration()) {
 			return // n.fail already recorded the error and stopped the node
+		}
+		// Pruning old snapshot FILES happens here — strictly after the
+		// durable pointer (storage.InstallSnapshot, above) has already
+		// moved to this snapshot's boundary — the same ordering fix
+		// maybeSnapshot's own Prune call applies, and for the identical
+		// reason (Manager.Prune's own doc comment, SL-8/SL-26). Non-fatal:
+		// see maybeSnapshot's matching comment.
+		if err := n.snapMgr.Prune(snap.Meta.LastIncludedIndex); err != nil {
+			n.logf("node %s: pruning old snapshot files after installing %d: %v (non-fatal; will retry on the next cycle)", n.cfg.ID, snap.Meta.LastIncludedIndex, err)
 		}
 		n.metrics.SnapshotsInstalledTotal.Inc()
 		// Any waiter for an index this install just superseded is never

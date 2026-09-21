@@ -51,7 +51,15 @@ func main() {
 		allFlag           = flag.String("cluster", "", "comma-separated id list of every cluster member, including this one")
 		dataDir           = flag.String("datadir", "", "durable log directory")
 		snapshotThreshold = flag.Uint64("snapshot-threshold", 0, "log entries since last snapshot before compacting (0 = package default); tests use a small value to force snapshot/compaction chaos quickly")
-		showVersion       = flag.Bool("version", false, "print version information and exit")
+
+		// Retention knobs (docs/v0.6.0-plan.md §17.3, §18.2). Both
+		// default to today's exact v0.5.0 behavior (retain nothing extra)
+		// and are validated below as startup errors when set to a value
+		// that would defeat their own always-at-least-one-valid-snapshot /
+		// never-negative invariant, rather than silently clamped.
+		walRetainExtraSegments = flag.Int("wal-retain-extra-segments", 0, "stop WAL segment compaction this many otherwise-eligible segments early, giving a lagging follower more time to catch up by log replication instead of a full InstallSnapshot (0 = today's exact behavior; must be >= 0)")
+		snapshotRetainCount    = flag.Int("snapshot-retain-count", 1, "how many of the newest snapshot files to retain on disk (must be >= 1; shrinks the window in which a leader can be asked to serve a snapshot index a prune already deleted)")
+		showVersion            = flag.Bool("version", false, "print version information and exit")
 
 		// Security Foundation flags (docs/enterprise-v1-plan.md §5).
 		tlsCertFile     = flag.String("tls-cert", "", "control-plane HTTP TLS certificate file (enables client TLS when set)")
@@ -241,6 +249,20 @@ func main() {
 		}
 	}
 
+	// Retention knobs (docs/v0.6.0-plan.md §33 slice 10, SL-9): a
+	// negative -wal-retain-extra-segments and a
+	// -snapshot-retain-count below 1 are both refused at startup rather
+	// than silently clamped — the latter would otherwise risk having
+	// zero valid snapshots on disk (Manager.SetRetainCount's own floor).
+	if *walRetainExtraSegments < 0 {
+		fmt.Fprintf(os.Stderr, "chronicledb-node: -wal-retain-extra-segments must be >= 0 (got %d)\n", *walRetainExtraSegments)
+		os.Exit(2)
+	}
+	if *snapshotRetainCount < 1 {
+		fmt.Fprintf(os.Stderr, "chronicledb-node: -snapshot-retain-count must be >= 1 (got %d)\n", *snapshotRetainCount)
+		os.Exit(2)
+	}
+
 	cfg := node.Config{
 		ID:                         raft.NodeID(*id),
 		Peers:                      peers,
@@ -272,6 +294,9 @@ func main() {
 		GCMinAdvanceSeqs:     *gcMinAdvanceSeqs,
 		GCMaxVersionsPerPass: uint32(*gcMaxVersionsPerPass),
 		GCMaxKeysPerPass:     uint32(*gcMaxKeysPerPass),
+
+		WALRetainExtraSegments: *walRetainExtraSegments,
+		SnapshotRetainCount:    *snapshotRetainCount,
 	}
 
 	n, err := node.Open(cfg)
