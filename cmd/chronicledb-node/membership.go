@@ -207,7 +207,9 @@ func recordMembershipAudit(s *controlServer, r *http.Request, action, result, re
 		Result:    result,
 		Detail:    reason + " " + detail,
 	}
-	if err := s.sec.auditLog.Append(entry); err != nil && s.logger != nil {
+	err := s.sec.auditLog.Append(entry)
+	s.n.NoteAuditWriteResult(err)
+	if err != nil && s.logger != nil {
 		s.logger.Printf("membership audit write failed for %s: %v", action, err)
 	}
 }

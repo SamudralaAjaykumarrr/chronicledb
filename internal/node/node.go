@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/SamudralaAjaykumarrr/chronicledb/internal/admission"
+	"github.com/SamudralaAjaykumarrr/chronicledb/internal/audit"
 	"github.com/SamudralaAjaykumarrr/chronicledb/internal/backup"
 	"github.com/SamudralaAjaykumarrr/chronicledb/internal/fsm"
 	"github.com/SamudralaAjaykumarrr/chronicledb/internal/identity"
@@ -198,6 +199,52 @@ type Config struct {
 	// zero would risk having no valid snapshot on disk at all). A
 	// negative value is refused by Open either way.
 	SnapshotRetainCount int
+
+	// --- Disk/heap pressure and fsync-failure health (docs/v0.6.0-plan.md
+	// §6, §10.1, §10.2, §19, §20) ---
+
+	// DiskPressureThreshold/DiskCriticalThreshold are the raw
+	// -disk-pressure-threshold/-disk-critical-threshold flag values
+	// (admission.ParseThreshold syntax: an absolute size like "2GiB" or
+	// a percentage like "10%"), parsed and validated by Open. "" (the
+	// default) means "off" for that threshold, exactly v0.5.0 behavior
+	// (§10.3): disk pressure never gates admission or drives the §19.1
+	// state machine past Healthy unless at least one is set.
+	DiskPressureThreshold string
+	DiskCriticalThreshold string
+	// MaxHeapBytes is -max-heap-bytes: an admission threshold (§6.3;
+	// never an allocator limit) above which Lane B writes are tightened
+	// exactly as disk LowSpace does. 0 (the default) disables it.
+	MaxHeapBytes uint64
+	// ResourcePollInterval is -resource-poll-interval: the cadence at
+	// which the disk/heap PressureMonitor goroutine samples (§6.1). 0
+	// means "use the package default" (5s) — this field has no
+	// legitimate "off" meaning of its own, unlike AdmissionQueueDepth.
+	ResourcePollInterval time.Duration
+	// FsyncFailureThreshold is -fsync-failure-threshold (§20.2):
+	// consecutive non-Raft-path (snapshot/backup/audit) fsync failures
+	// before this node marks itself storage-unhealthy. 0 is a
+	// legitimate, strict configuration ("unhealthy on the very first
+	// such failure"), not merely "unset" — mirroring
+	// AdmissionQueueDepth's own "0 has a real meaning" convention — so
+	// it is deliberately NOT defaulted in setDefaults;
+	// cmd/chronicledb-node's own flag default (3) supplies the
+	// recommended out-of-the-box value.
+	FsyncFailureThreshold int
+	// AuditLog, when non-nil, receives one audit.Entry
+	// (Action="node.health") for every §19.1/§20.2 state transition
+	// this node experiences (§20.3) — hash-chained, append-only,
+	// exactly like every other administrative audit record. nil (the
+	// default for any test or Go-API caller that does not care) simply
+	// skips auditing these transitions; it is never a correctness
+	// dependency for the state machine itself (docs/roadmap.md
+	// §Observability's "never a correctness dependency" rule, applied
+	// here as it is to Logger). cmd/chronicledb-node opens exactly one
+	// *audit.Log per process and shares it between this field and its
+	// own request-level admin-action auditing, since two independent
+	// *audit.Log instances Append-ing to the same on-disk chain would
+	// corrupt it.
+	AuditLog *audit.Log
 }
 
 // PeerTLSEnabled reports whether Config requests peer mTLS.
@@ -221,6 +268,13 @@ const (
 	defaultMaxLiveReadLeases         = 4096
 	defaultMaxAdminConcurrency       = 2
 	defaultMaxMaintenanceConcurrency = 2
+
+	// defaultResourcePollInterval is -resource-poll-interval's package
+	// default (docs/v0.6.0-plan.md §10.1): frequent enough that AC-13's
+	// "tightens before any real write failure" holds well within a
+	// human-perceptible interval, infrequent enough to cost nothing
+	// (one syscall.Statfs plus one runtime/metrics.Read per tick).
+	defaultResourcePollInterval = 5 * time.Second
 
 	// MVCC GC has no in-package defaults (docs/v0.6.0-plan.md §10.2):
 	// GCInterval, GCMinRetainSeqs, GCMinAdvanceSeqs,
@@ -271,6 +325,15 @@ func (c *Config) setDefaults() {
 	if c.MaxMaintenanceConcurrency == 0 {
 		c.MaxMaintenanceConcurrency = defaultMaxMaintenanceConcurrency
 	}
+	if c.ResourcePollInterval <= 0 {
+		c.ResourcePollInterval = defaultResourcePollInterval
+	}
+	// FsyncFailureThreshold is deliberately NOT defaulted here, for the
+	// same reason as AdmissionQueueDepth above: 0 is a fully legitimate,
+	// strict, intentional value (§20.2: "unhealthy on the very first
+	// non-Raft-path fsync failure"), not merely "unset".
+	// cmd/chronicledb-node's own flag default (3) supplies the
+	// recommended out-of-the-box CLI value instead.
 	// GCInterval, GCMinRetainSeqs, GCMinAdvanceSeqs, GCMaxVersionsPerPass
 	// and GCMaxKeysPerPass are all deliberately NOT defaulted here, for
 	// the same reason as AdmissionQueueDepth/AdmissionMaxWait above: 0
@@ -323,6 +386,22 @@ func (c Config) validate() error {
 	if c.SnapshotRetainCount < 0 {
 		return fmt.Errorf("node: Config.SnapshotRetainCount must be >= 0 (0 means \"use Manager's default of 1\"), got %d", c.SnapshotRetainCount)
 	}
+	// Syntax only here (ADMISSION FAILS CLOSED must still refuse a
+	// malformed flag value at startup): the platform-support check and
+	// the critical<pressure comparison both need DataDir to already
+	// exist (an absolute threshold needs nothing, but a percentage one
+	// needs DiskTotalBytes) and are performed by Open, after wal.Open
+	// has created DataDir (docs/v0.6.0-plan.md §6.2).
+	if c.DiskPressureThreshold != "" {
+		if _, err := admission.ParseThreshold(c.DiskPressureThreshold); err != nil {
+			return fmt.Errorf("node: Config.DiskPressureThreshold: %w", err)
+		}
+	}
+	if c.DiskCriticalThreshold != "" {
+		if _, err := admission.ParseThreshold(c.DiskCriticalThreshold); err != nil {
+			return fmt.Errorf("node: Config.DiskCriticalThreshold: %w", err)
+		}
+	}
 	return nil
 }
 
@@ -364,6 +443,20 @@ type Status struct {
 	// non-leader.
 	ChangesReady   bool
 	NotReadyReason string
+
+	// DiskPressure is this node's current diskPressure status string
+	// (docs/v0.6.0-plan.md §11.3): one of "normal", "low", "critical",
+	// "unsupported" (this platform/config never probes disk usage), or
+	// "probe_failed" (probing is configured/possible but the most
+	// recent sample errored — §6.2's fail-safe direction).
+	DiskPressure string
+	// StorageHealthy is false once §20.2's consecutive non-Raft fsync
+	// failure threshold has been reached (chronicledb_storage_health).
+	StorageHealthy bool
+	// Ready mirrors the exact /health readiness rule (§11.3): false iff
+	// DiskPressure=="critical" or !StorageHealthy. A node in "low" disk
+	// pressure is still Ready (with a warning, at the HTTP layer).
+	Ready bool
 }
 
 type waiter struct {
@@ -662,6 +755,37 @@ type Node struct {
 	gcProposalInFlight bool
 	gcProposalIndex    raft.Index
 
+	// --- Disk/heap pressure + fsync-failure health (docs/v0.6.0-plan.md
+	// §6.4, §19, §20) — see pressure.go. pressureMon always runs, even
+	// with every threshold off, purely for /status diagnostics (§6.1) —
+	// it never itself decides admission; pressureState is what does.
+	pressureMon        *admission.PressureMonitor
+	diskPressureSet    bool // -disk-pressure-threshold configured
+	diskCriticalSet    bool // -disk-critical-threshold configured
+	diskPressureThresh admission.Threshold
+	diskCriticalThresh admission.Threshold
+	resourcePollTicks  int // cfg.ResourcePollInterval expressed in TickInterval units
+	resourcePollLeft   int
+	// pressureState is written from run's own goroutine (inside
+	// checkResourcePressure, called from tick — same-package tests also
+	// call checkResourcePressure directly, from a test goroutine) while
+	// refreshStatusLocked reads it (via diskPressureStatusString) on
+	// every event-loop iteration; an atomic, not a plain PressureState
+	// field, is what makes that concurrent read/write pattern race-free.
+	pressureState atomic.Int32
+
+	// consecutiveNonRaftFsyncFailures/storageUnhealthy implement §20.2's
+	// threshold: incremented/cleared exclusively from
+	// Node.noteFsyncResult, which every non-Raft-path durable write
+	// (maybeSnapshot's four durable steps, Node.Backup, and — via
+	// NoteAuditWriteResult — every internal/audit.Log.Append this
+	// process makes) funnels through. atomic because
+	// NoteAuditWriteResult is called from cmd/chronicledb-node's HTTP
+	// request-handling goroutines, not run's event-loop goroutine.
+	consecutiveNonRaftFsyncFailures atomic.Int64
+	storageUnhealthy                atomic.Bool
+	fsyncFailuresTotal              map[FsyncPath]*metrics.Counter
+
 	// admission holds every internal/admission.Gate this node owns
 	// (docs/v0.6.0-plan.md §3.2's four lanes). Every acquisition happens
 	// on a caller's goroutine, in Propose/BeginReadIndex/Backup/
@@ -951,6 +1075,16 @@ func Open(cfg Config) (*Node, error) {
 		return nil, fmt.Errorf("node: %w", err)
 	}
 
+	// Disk/heap pressure (docs/v0.6.0-plan.md §6.2): resolved here,
+	// after wal.Open has ensured cfg.DataDir exists, since a percentage
+	// threshold needs DiskTotalBytes and the platform-support check
+	// needs a real path to probe.
+	pressureSetup, err := setupDiskPressure(cfg)
+	if err != nil {
+		w.Close()
+		return nil, err
+	}
+
 	n := &Node{
 		cfg:                  cfg,
 		core:                 core,
@@ -985,11 +1119,29 @@ func Open(cfg Config) (*Node, error) {
 		releaseNoOpCh:        make(chan chan struct{}),
 		stopCh:               make(chan struct{}),
 		doneCh:               make(chan struct{}),
+
+		pressureMon:        pressureSetup.mon,
+		diskPressureSet:    pressureSetup.pressureSet,
+		diskCriticalSet:    pressureSetup.criticalSet,
+		diskPressureThresh: pressureSetup.pressureThresh,
+		diskCriticalThresh: pressureSetup.criticalThresh,
+		fsyncFailuresTotal: newFsyncFailuresTotal(),
 	}
 	n.fsmachine.Store(fsmachine)
 	n.metrics.RaftMessageProcessSeconds = metrics.NewHistogram(metrics.DefaultLatencyBounds...)
 	n.electionArmed = true
 	n.electionTicksLeft = core.NewElectionTimeout()
+	n.pressureMon.Start()
+	// ResourcePollInterval expressed in TickInterval units, mirroring
+	// gcIntervalTicks immediately below — always > 0 (setDefaults never
+	// leaves it at 0), unlike GCInterval, so resourcePollTicks is always
+	// at least 1: pressure sampling is never itself disable-able, only
+	// what it can affect (no threshold configured) is.
+	n.resourcePollTicks = int(cfg.ResourcePollInterval / cfg.TickInterval)
+	if n.resourcePollTicks < 1 {
+		n.resourcePollTicks = 1
+	}
+	n.resourcePollLeft = n.resourcePollTicks
 	if cfg.GCInterval > 0 {
 		// GCInterval expressed in TickInterval units (docs/v0.6.0-plan.md
 		// §13.4) — 0 stays 0 (GC disabled, no evaluation ever) whenever
@@ -1206,6 +1358,9 @@ func (n *Node) refreshStatusLocked() {
 		CommittedConfigIndex:   committedConfigIndex,
 		ChangesReady:           changesReady,
 		NotReadyReason:         notReadyReason,
+		DiskPressure:           n.diskPressureStatusString(),
+		StorageHealthy:         !n.storageUnhealthy.Load(),
+		Ready:                  PressureState(n.pressureState.Load()) != PressureCritical && !n.storageUnhealthy.Load(),
 	}
 	n.statusMu.Unlock()
 }
@@ -1772,6 +1927,7 @@ func (n *Node) shutdown() {
 	n.pendingReads = nil
 	n.tr.Close()
 	n.walog.Close()
+	n.pressureMon.Stop()
 	close(n.doneCh)
 }
 
@@ -1799,6 +1955,14 @@ func (n *Node) tick() {
 			n.gcTicksLeft = n.gcIntervalTicks
 			n.maybeProposeGC()
 		}
+	}
+	// resourcePollTicks is always >= 1 (Open); disk/heap pressure is
+	// always sampled, even with every threshold off (§6.1's diagnostic
+	// sampling), unlike GC's own genuinely-disable-able ticker.
+	n.resourcePollLeft--
+	if n.resourcePollLeft <= 0 {
+		n.resourcePollLeft = n.resourcePollTicks
+		n.checkResourcePressure()
 	}
 }
 
@@ -2130,6 +2294,18 @@ func (n *Node) processOutput(out raft.Output) {
 
 	if out.PersistRequest != nil {
 		if err := raft.ApplyPersistRequest(n.storage, out.PersistRequest); err != nil {
+			// §20.1: classify, audit, and mark not-ready BEFORE the halt
+			// — an fsync failure on the consensus path is still
+			// unconditionally fatal (unchanged from v0.5.0), but the
+			// operator now learns why rather than finding a stopped
+			// process. FsyncPathRaft never participates in the
+			// consecutive-failure threshold (noteFsyncResult's own
+			// early return) — it always halts on the first failure.
+			if c, ok := n.fsyncFailuresTotal[FsyncPathRaft]; ok {
+				c.Inc()
+			}
+			n.storageUnhealthy.Store(true)
+			n.auditHealth("node.raft_fsync_failure", fmt.Sprintf("classified=%v err=%v", classifyErrKind(err), err))
 			n.fail(fmt.Errorf("node: durable persistence failed: %w", err))
 			return
 		}
@@ -2523,29 +2699,51 @@ func (n *Node) maybeSnapshot() {
 		HasConfiguration:  true,
 		Configuration:     toSnapshotConfiguration(cfgAtApplied),
 	}
+	// docs/v0.6.0-plan.md §20.2: every durable step below is a
+	// non-Raft-path write, so a failure here — including a classified
+	// ENOSPC (§19.3) — is recorded through noteFsyncResult(FsyncPathSnapshot,
+	// ...) and this attempt is simply abandoned (retried on the next
+	// snapshot cycle) rather than halting the node the way a Raft-path
+	// failure does (§20.1). This is safe at every one of these four
+	// points per §22's crash-safety table: Create's own failure leaves
+	// at most an orphan temp file; every step after it either has not
+	// yet mutated durable state the way the next step assumes, or (for
+	// Reaffirm/CompactBeforeRetaining, which run after the in-memory-only
+	// core.Compact/storage.Compact below) failing just means the old WAL
+	// segments are not reclaimed this cycle — the exact same "disk-space
+	// hygiene, not a durability concern" class Prune's own failure below
+	// already is.
 	if _, err := n.snapMgr.Create(meta, n.fsmachine.Load(), n.snapshotWriteVersion()); err != nil {
-		n.fail(fmt.Errorf("node: creating snapshot at index %d: %w", meta.LastIncludedIndex, err))
+		n.noteFsyncResult(FsyncPathSnapshot, err)
+		n.logf("node %s: creating snapshot at index %d: %v (classified=%s; non-fatal, will retry)", n.cfg.ID, meta.LastIncludedIndex, err, classifyErrKind(err))
 		return
 	}
+	n.noteFsyncResult(FsyncPathSnapshot, nil)
 	triggerFaultPoint(FaultAfterSnapshotCreate)
 	if err := n.walog.AppendMetadataSnapshot(meta.LastIncludedIndex); err != nil {
-		n.fail(fmt.Errorf("node: recording snapshot pointer at index %d: %w", meta.LastIncludedIndex, err))
+		n.noteFsyncResult(FsyncPathSnapshot, err)
+		n.logf("node %s: recording snapshot pointer at index %d: %v (classified=%s; non-fatal, will retry)", n.cfg.ID, meta.LastIncludedIndex, err, classifyErrKind(err))
 		return
 	}
+	n.noteFsyncResult(FsyncPathSnapshot, nil)
 	triggerFaultPoint(FaultAfterAppendMetadataSnapshot)
 	n.core.Compact(raft.Index(meta.LastIncludedIndex))
 	triggerFaultPoint(FaultAfterCoreCompact)
 	n.storage.Compact(raft.Index(meta.LastIncludedIndex))
 	triggerFaultPoint(FaultAfterStorageCompact)
 	if err := n.storage.Reaffirm(); err != nil {
-		n.fail(fmt.Errorf("node: reaffirming hard state before compaction: %w", err))
+		n.noteFsyncResult(FsyncPathSnapshot, err)
+		n.logf("node %s: reaffirming hard state before compaction: %v (classified=%s; non-fatal, will retry next cycle)", n.cfg.ID, err, classifyErrKind(err))
 		return
 	}
+	n.noteFsyncResult(FsyncPathSnapshot, nil)
 	triggerFaultPoint(FaultAfterReaffirm)
 	if err := n.walog.CompactBeforeRetaining(meta.LastIncludedIndex, n.cfg.WALRetainExtraSegments); err != nil {
-		n.fail(fmt.Errorf("node: compacting log before index %d: %w", meta.LastIncludedIndex, err))
+		n.noteFsyncResult(FsyncPathSnapshot, err)
+		n.logf("node %s: compacting log before index %d: %v (classified=%s; non-fatal, will retry next cycle)", n.cfg.ID, meta.LastIncludedIndex, err, classifyErrKind(err))
 		return
 	}
+	n.noteFsyncResult(FsyncPathSnapshot, nil)
 	triggerFaultPoint(FaultAfterCompactBefore)
 	// Pruning old snapshot FILES happens here — strictly after
 	// ReclaimBoundary has actually moved to meta.LastIncludedIndex
@@ -2557,7 +2755,10 @@ func (n *Node) maybeSnapshot() {
 	// durability one, so it does not need to stop the node the way a
 	// failure in any of the six steps above does.
 	if err := n.snapMgr.Prune(meta.LastIncludedIndex); err != nil {
+		n.noteFsyncResult(FsyncPathSnapshot, err)
 		n.logf("node %s: pruning old snapshot files after index %d: %v (non-fatal; will retry on the next snapshot cycle)", n.cfg.ID, meta.LastIncludedIndex, err)
+	} else {
+		n.noteFsyncResult(FsyncPathSnapshot, nil)
 	}
 	triggerFaultPoint(FaultAfterSnapshotPrune)
 	n.metrics.SnapshotsCreatedTotal.Inc()
@@ -2607,8 +2808,15 @@ func (n *Node) handleBackup(req backupReq) {
 		until = backup.UntilLatest
 	}
 	m, err := backup.Export(src, req.outDir, backup.ExportOptions{UntilIndex: until, ClusterID: req.clusterID})
+	// §20.2: backup export is one of the three named non-Raft-path
+	// durable-write operations feeding the consecutive-failure/
+	// storage-unhealthy threshold — it never halts the node either way
+	// (that was already true before v0.6.0; this only adds the
+	// counting/classification on top).
+	n.noteFsyncResult(FsyncPathBackup, err)
 	if err != nil {
 		n.metrics.BackupsFailedTotal.Inc()
+		n.logf("node %s: backup export to %s failed: %v (classified=%s)", n.cfg.ID, req.outDir, err, classifyErrKind(err))
 		req.resultCh <- backupResult{err: fmt.Errorf("node: backup: %w", err)}
 		return
 	}

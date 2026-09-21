@@ -62,6 +62,14 @@ type security struct {
 	rbac          map[string]authz.Role
 	auditLog      *audit.Log
 	logger        *log.Logger
+	// onAuditResult, when set, feeds every audit.Log.Append outcome this
+	// security wrapper makes into the owning Node's §20.2 storage-health
+	// tracking (docs/v0.6.0-plan.md §20.2 names "audit-log writes" as
+	// one of the three non-Raft-path operations counted toward the
+	// consecutive-fsync-failure/storage-unhealthy threshold). nil is a
+	// safe no-op — set by main after both the Node and the security are
+	// constructed (see main's wiring comment).
+	onAuditResult func(error)
 
 	// SecurityMetrics (docs/enterprise-v1-plan.md §5 Observability:
 	// "auth success/failure counts... audit-write-failure counter", no
@@ -125,8 +133,13 @@ func countNonEmpty(vals ...string) int {
 
 // newSecurity builds a *security from validated flags. mode ==
 // authModeNone returns (nil, nil): the caller wires routes with no
-// middleware at all, byte-for-byte the same as v0.1.0.
-func newSecurity(f securityFlags, mode authMode, logger *log.Logger) (*security, error) {
+// middleware at all, byte-for-byte the same as v0.1.0. auditLog is
+// opened once by the caller (main), unconditionally, regardless of mode
+// (docs/v0.6.0-plan.md §20.3's node-health auditing does not depend on
+// authentication being configured) — newSecurity never opens its own,
+// so there is exactly one *audit.Log Appending to this process's audit
+// chain; the caller also owns closing it.
+func newSecurity(f securityFlags, mode authMode, logger *log.Logger, auditLog *audit.Log) (*security, error) {
 	if mode == authModeNone {
 		return nil, nil
 	}
@@ -148,20 +161,7 @@ func newSecurity(f securityFlags, mode authMode, logger *log.Logger) (*security,
 		return nil, err
 	}
 
-	auditDir := f.auditLogDir
-	auditLog, err := audit.Open(auditDir)
-	if err != nil {
-		return nil, fmt.Errorf("opening audit log at %s: %w", auditDir, err)
-	}
-
 	return &security{mode: mode, authenticator: authenticator, rbac: rbac, auditLog: auditLog, logger: logger}, nil
-}
-
-func (s *security) Close() error {
-	if s == nil || s.auditLog == nil {
-		return nil
-	}
-	return s.auditLog.Close()
 }
 
 // genericUnauthenticatedMessage/genericUnauthorizedMessage are the only
@@ -226,13 +226,17 @@ func (s *security) wrap(endpoint string, next http.HandlerFunc) http.HandlerFunc
 			Result:    result,
 			Detail:    r.URL.RawQuery,
 		}
-		if err := s.auditLog.Append(entry); err != nil {
+		auditErr := s.auditLog.Append(entry)
+		if s.onAuditResult != nil {
+			s.onAuditResult(auditErr)
+		}
+		if auditErr != nil {
 			// AUDIT COMPLETENESS: a write failure blocks the action —
 			// even one that authn/authz would have allowed — rather
 			// than silently proceeding without a record.
 			s.auditWriteFailuresTotal.Add(1)
 			if s.logger != nil {
-				s.logger.Printf("audit log write failed, rejecting action on endpoint %s: %v", endpoint, err)
+				s.logger.Printf("audit log write failed, rejecting action on endpoint %s: %v", endpoint, auditErr)
 			}
 			http.Error(w, "internal error", http.StatusInternalServerError)
 			return

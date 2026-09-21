@@ -129,6 +129,11 @@ type Metrics struct {
 	// explicitly constructed by Open (metrics.Histogram's zero value is
 	// not valid — see its own doc comment).
 	RaftMessageProcessSeconds *metrics.Histogram
+
+	// DiskProbeFailuresTotal counts every PressureMonitor sample whose
+	// DiskUsage call itself errored (docs/v0.6.0-plan.md §6.2's
+	// fail-safe direction) — chronicledb_disk_probe_failures_total.
+	DiskProbeFailuresTotal metrics.Counter
 }
 
 // MetricsSnapshot is a point-in-time, safe-to-read-anywhere copy of a
@@ -165,6 +170,8 @@ type MetricsSnapshot struct {
 	GCProposalsFailedTotal uint64
 
 	RaftMessageProcessSeconds metrics.HistogramSnapshot
+
+	DiskProbeFailuresTotal uint64
 }
 
 // Metrics returns a snapshot of this node's current diagnostic
@@ -203,5 +210,18 @@ func (n *Node) Metrics() MetricsSnapshot {
 		GCProposalsFailedTotal: m.GCProposalsFailedTotal.Value(),
 
 		RaftMessageProcessSeconds: m.RaftMessageProcessSeconds.Snapshot(),
+
+		DiskProbeFailuresTotal: m.DiskProbeFailuresTotal.Value(),
 	}
+}
+
+// FsyncFailuresTotal returns a point-in-time snapshot of
+// chronicledb_fsync_failures_total, keyed by FsyncPath
+// (docs/v0.6.0-plan.md §20, §25). Safe to call from any goroutine.
+func (n *Node) FsyncFailuresTotal() map[FsyncPath]uint64 {
+	out := make(map[FsyncPath]uint64, len(n.fsyncFailuresTotal))
+	for p, c := range n.fsyncFailuresTotal {
+		out[p] = c.Value()
+	}
+	return out
 }

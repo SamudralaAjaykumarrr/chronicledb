@@ -113,4 +113,70 @@ func TestControlServerHealthNeverClaimsQuorumForFollower(t *testing.T) {
 	if resp.Role != "Leader" {
 		t.Errorf("Role = %q, want Leader (this test's solo node always wins its own election)", resp.Role)
 	}
+	if !resp.Ready {
+		t.Errorf("Ready = false on a healthy node, want true")
+	}
+	if resp.DiskPressure != "unsupported" && resp.DiskPressure != "normal" {
+		t.Errorf("DiskPressure = %q on a healthy node with no thresholds configured, want \"unsupported\" or \"normal\"", resp.DiskPressure)
+	}
+	if !resp.StorageHealthy {
+		t.Errorf("StorageHealthy = false on a healthy node, want true")
+	}
+}
+
+// TestControlServerHealthReports503WhenStorageUnhealthy is §11.3's
+// readiness rule: a node that is storage-unhealthy (§20.2) reports 503
+// from /health while remaining alive — the Kubernetes-shaped
+// live-but-not-ready distinction — and clears back to 200/ready the
+// moment storage-unhealthy itself clears, with no restart.
+func TestControlServerHealthReports503WhenStorageUnhealthy(t *testing.T) {
+	n := openSingleNodeForControlTest(t)
+	srv := newControlServer(n, nil, nil, nil, false, "test-cluster")
+
+	getHealth := func() (int, healthResponse) {
+		rec := httptest.NewRecorder()
+		srv.ServeHTTP(rec, httptest.NewRequest("GET", "/health", nil))
+		var resp healthResponse
+		if err := json.NewDecoder(rec.Body).Decode(&resp); err != nil {
+			t.Fatalf("decoding /health response: %v", err)
+		}
+		return rec.Code, resp
+	}
+
+	n.SetStorageUnhealthyForTest(true)
+	deadline := time.Now().Add(2 * time.Second)
+	var code int
+	var resp healthResponse
+	for time.Now().Before(deadline) {
+		code, resp = getHealth()
+		if !resp.Ready {
+			break
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	if resp.Ready {
+		t.Fatalf("Ready never became false after SetStorageUnhealthyForTest(true)")
+	}
+	if code != 503 {
+		t.Errorf("status = %d while not-ready, want 503", code)
+	}
+	if resp.StorageHealthy {
+		t.Errorf("StorageHealthy = true while not-ready, want false")
+	}
+	if resp.Alive != true || resp.NodeStarted != true {
+		t.Errorf("health = %+v: a not-ready node must still report Alive/NodeStarted true (live but not ready, never dead)", resp)
+	}
+
+	n.SetStorageUnhealthyForTest(false)
+	deadline = time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		code, resp = getHealth()
+		if resp.Ready {
+			break
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	if !resp.Ready || code != 200 {
+		t.Fatalf("after clearing storage-unhealthy: code=%d ready=%v, want 200/true (recovery requires no restart)", code, resp.Ready)
+	}
 }

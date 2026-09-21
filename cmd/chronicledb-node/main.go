@@ -118,6 +118,18 @@ func main() {
 		// unsafe) is tracked as remaining work rather than declared
 		// here as a flag with no effect.
 
+		// Disk/heap pressure + fsync-failure health (docs/v0.6.0-plan.md
+		// §10.1, §10.2, §19, §20). Both threshold flags default to ""
+		// (off, exactly v0.5.0 behavior); -fsync-failure-threshold's
+		// default (3) is the recommended out-of-the-box value, not a
+		// safety floor — 0 (an operator's own explicit, stricter choice)
+		// is refused nowhere.
+		diskPressureThreshold = flag.String("disk-pressure-threshold", "", `free-space floor (absolute "2GiB" or percentage "10%") below which admission tightens (§6.4); "" disables disk-pressure admission entirely`)
+		diskCriticalThreshold = flag.String("disk-critical-threshold", "", "free-space floor below which client writes are refused outright; must be strictly less than -disk-pressure-threshold, and requires it to also be set")
+		maxHeapBytes          = flag.Uint64("max-heap-bytes", 0, "heap ceiling above which admission tightens exactly as disk LowSpace does (§6.3); an admission threshold, never an allocator limit — set GOMEMLIMIT for that; 0 disables it")
+		resourcePollInterval  = flag.Duration("resource-poll-interval", 5*time.Second, "disk/heap pressure sampling cadence (§6.1)")
+		fsyncFailureThreshold = flag.Int("fsync-failure-threshold", 3, "consecutive non-Raft-path (snapshot/backup/audit) fsync failures before this node marks itself storage-unhealthy (§20.2)")
+
 		// HTTP server hardening (docs/v0.6.0-plan.md §10.1, §10.4 — the
 		// one v0.6.0 default-behavior change: on by default, since "no
 		// timeouts at all" was never a behavior worth preserving).
@@ -249,6 +261,21 @@ func main() {
 		}
 	}
 
+	// The administrative audit log is opened exactly once per process,
+	// unconditionally — regardless of -auth-mode (docs/v0.6.0-plan.md
+	// §20.3: every §19.1/§20.2 node-health transition is an audit
+	// record, and that obligation does not depend on client
+	// authentication being configured at all). It is shared between
+	// this node's own health-transition auditing (Config.AuditLog) and
+	// newSecurity's request-level admin-action auditing below — two
+	// independent *audit.Log instances Appending to the same on-disk
+	// hash chain would corrupt it, so there must be exactly one.
+	auditLog, err := audit.Open(secFlags.auditLogDir)
+	if err != nil {
+		logger.Fatalf("opening audit log at %s: %v", secFlags.auditLogDir, err)
+	}
+	defer auditLog.Close()
+
 	// Retention knobs (docs/v0.6.0-plan.md §33 slice 10, SL-9): a
 	// negative -wal-retain-extra-segments and a
 	// -snapshot-retain-count below 1 are both refused at startup rather
@@ -297,6 +324,13 @@ func main() {
 
 		WALRetainExtraSegments: *walRetainExtraSegments,
 		SnapshotRetainCount:    *snapshotRetainCount,
+
+		DiskPressureThreshold: *diskPressureThreshold,
+		DiskCriticalThreshold: *diskCriticalThreshold,
+		MaxHeapBytes:          *maxHeapBytes,
+		ResourcePollInterval:  *resourcePollInterval,
+		FsyncFailureThreshold: *fsyncFailureThreshold,
+		AuditLog:              auditLog,
 	}
 
 	n, err := node.Open(cfg)
@@ -304,12 +338,19 @@ func main() {
 		logger.Fatalf("opening node: %v", err)
 	}
 
-	sec, err := newSecurity(secFlags, authModeValue, logger)
+	sec, err := newSecurity(secFlags, authModeValue, logger, auditLog)
 	if err != nil {
 		n.Stop()
 		logger.Fatalf("initializing security (auth/RBAC/audit): %v", err)
 	}
-	defer sec.Close()
+	if sec != nil {
+		// §20.2: every request-level audit write this process makes
+		// (sec.wrap's per-call allow/deny record) feeds the same
+		// storage-health tracking as this node's own health-transition
+		// audit writes (Config.AuditLog above) — both Append to the one
+		// shared audit chain.
+		sec.onAuditResult = n.NoteAuditWriteResult
+	}
 
 	var clientTLSHolder *identity.Holder
 	insecure := secFlags.tlsCertFile == "" || authModeValue == authModeNone
@@ -510,6 +551,20 @@ func (s *controlServer) handleMetrics(w http.ResponseWriter, r *http.Request) {
 	line("chronicledb_snapshots_created_total", "local snapshots this node has created", "counter", float64(m.SnapshotsCreatedTotal))
 	line("chronicledb_snapshots_installed_total", "peer snapshots this node has installed", "counter", float64(m.SnapshotsInstalledTotal))
 
+	// Disk/heap pressure + fsync-failure health (docs/v0.6.0-plan.md
+	// §19, §20, §25).
+	storageHealthValue := 0.0
+	if !st.StorageHealthy {
+		storageHealthValue = 1.0
+	}
+	line("chronicledb_storage_health", "0 = healthy, 1 = unhealthy (§20.2's consecutive non-Raft fsync-failure threshold reached)", "gauge", storageHealthValue)
+	line("chronicledb_disk_probe_failures_total", "PressureMonitor samples whose disk-usage probe itself errored", "counter", float64(m.DiskProbeFailuresTotal))
+	fsyncFailures := s.n.FsyncFailuresTotal()
+	fmt.Fprintf(w, "# HELP %s %s\n# TYPE %s %s\n", "chronicledb_fsync_failures_total", "durable-write failures by path", "chronicledb_fsync_failures_total", "counter")
+	for _, p := range []node.FsyncPath{node.FsyncPathRaft, node.FsyncPathSnapshot, node.FsyncPathBackup, node.FsyncPathAudit} {
+		fmt.Fprintf(w, "chronicledb_fsync_failures_total{path=%q} %d\n", string(p), fsyncFailures[p])
+	}
+
 	// Compatibility / Rolling Upgrades metrics (docs/enterprise-v1-plan.md
 	// §7 Observability: "cluster version gauge, per-node reported-version
 	// gauge... precheck pass/fail history, finalize event... as a
@@ -563,7 +618,15 @@ type healthResponse struct {
 	Role            string `json:"role"`
 	LeaderKnown     bool   `json:"leaderKnown"`
 	Leader          string `json:"leader,omitempty"`
-	Note            string `json:"note"`
+	// Ready is docs/v0.6.0-plan.md §11.3's readiness rule: false iff
+	// this node is in disk-pressure Critical or storage-unhealthy
+	// (§20.2) — the Kubernetes-shaped live-but-not-ready distinction. A
+	// node in disk LowSpace is still Ready (Warning is set instead).
+	Ready          bool   `json:"ready"`
+	DiskPressure   string `json:"diskPressure"`
+	StorageHealthy bool   `json:"storageHealthy"`
+	Warning        string `json:"warning,omitempty"`
+	Note           string `json:"note"`
 }
 
 func (s *controlServer) handleHealth(w http.ResponseWriter, r *http.Request) {
@@ -576,9 +639,19 @@ func (s *controlServer) handleHealth(w http.ResponseWriter, r *http.Request) {
 		Role:            st.Role.String(),
 		LeaderKnown:     st.Leader != "",
 		Leader:          string(st.Leader),
+		Ready:           st.Ready,
+		DiskPressure:    st.DiskPressure,
+		StorageHealthy:  st.StorageHealthy,
 		Note:            "quorum availability is not reported: a Follower/Candidate cannot reliably know it, and a Leader only knows it as of its last successful heartbeat round",
 	}
-	writeJSON(w, http.StatusOK, resp)
+	if st.DiskPressure == "low" {
+		resp.Warning = "disk headroom is below -disk-pressure-threshold: client writes are tightened (still ready)"
+	}
+	code := http.StatusOK
+	if !resp.Ready {
+		code = http.StatusServiceUnavailable
+	}
+	writeJSON(w, code, resp)
 }
 
 // handleFault is Phase 7's minimal real-process fault-injection hook

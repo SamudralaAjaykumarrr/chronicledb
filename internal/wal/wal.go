@@ -104,7 +104,7 @@ func Open(dir string, opts Options) (*WAL, *RecoveryReport, error) {
 		segmentMaxSize = DefaultSegmentMaxSize
 	}
 	if err := storage.EnsureDir(dir); err != nil {
-		return nil, nil, err
+		return nil, nil, classifyStorageErr(err)
 	}
 
 	ids, err := storage.ListSegmentIDs(dir)
@@ -118,7 +118,7 @@ func Open(dir string, opts Options) (*WAL, *RecoveryReport, error) {
 	if len(ids) == 0 {
 		seg, err := storage.CreateSegment(dir, 1)
 		if err != nil {
-			return nil, nil, err
+			return nil, nil, classifyStorageErr(err)
 		}
 		w.current = seg
 		meta := Metadata{NodeID: newNodeID(), FormatVersion: FormatVersion}
@@ -128,7 +128,7 @@ func Open(dir string, opts Options) (*WAL, *RecoveryReport, error) {
 		}
 		if err := w.current.Sync(); err != nil {
 			seg.Close()
-			return nil, nil, err
+			return nil, nil, classifyStorageErr(err)
 		}
 		w.metadata = meta
 		w.firstLogIndex = 1
@@ -518,7 +518,7 @@ func (w *WAL) AppendMetadataSnapshot(uptoIndex uint64) error {
 		return err
 	}
 	if err := w.current.Sync(); err != nil {
-		return err
+		return classifyStorageErr(err)
 	}
 	w.metadata = meta
 	w.firstLogIndex = uptoIndex + 1
@@ -591,7 +591,7 @@ func (w *WAL) SetClusterGeneration(generation uint32) error {
 		return err
 	}
 	if err := w.current.Sync(); err != nil {
-		return err
+		return classifyStorageErr(err)
 	}
 	w.metadata = meta
 	return nil
@@ -738,7 +738,7 @@ func (w *WAL) appendLocked(rt RecordType, payload []byte) error {
 		return err
 	}
 	if _, err := w.current.Append(frame); err != nil {
-		return err
+		return classifyStorageErr(err)
 	}
 	return nil
 }
@@ -764,11 +764,11 @@ func (w *WAL) maybeRotateLocked(nextFrameSize int64) error {
 	}
 	newSeg, err := storage.CreateSegment(w.dir, newID)
 	if err != nil {
-		return err
+		return classifyStorageErr(err)
 	}
 	if err := newSeg.Sync(); err != nil {
 		newSeg.Close()
-		return err
+		return classifyStorageErr(err)
 	}
 	old := w.current
 	w.current = newSeg
@@ -784,7 +784,7 @@ func (w *WAL) Sync() error {
 	if w.closed {
 		return ErrClosed
 	}
-	return w.current.Sync()
+	return classifyStorageErr(w.current.Sync())
 }
 
 // Close closes the WAL's open segment. After Close, all other WAL methods

@@ -44,16 +44,16 @@ func WriteFileDurable(tmpDir, finalPath string, data []byte) error {
 	}()
 
 	if _, err := tmp.Write(data); err != nil {
-		return fmt.Errorf("storage: write temp file %s: %w", tmpPath, err)
+		return classifyWriteErr(fmt.Errorf("storage: write temp file %s: %w", tmpPath, err))
 	}
 	if err := tmp.Sync(); err != nil {
-		return fmt.Errorf("storage: sync temp file %s: %w", tmpPath, err)
+		return classifyWriteErr(fmt.Errorf("storage: sync temp file %s: %w", tmpPath, err))
 	}
 	if err := tmp.Close(); err != nil {
 		return fmt.Errorf("storage: close temp file %s: %w", tmpPath, err)
 	}
 	if err := os.Rename(tmpPath, finalPath); err != nil {
-		return fmt.Errorf("storage: rename %s to %s: %w", tmpPath, finalPath, err)
+		return classifyWriteErr(fmt.Errorf("storage: rename %s to %s: %w", tmpPath, finalPath, err))
 	}
 	succeeded = true
 	if err := syncDir(filepath.Dir(finalPath)); err != nil {
