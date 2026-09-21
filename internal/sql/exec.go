@@ -76,18 +76,48 @@ func (s *Session) InTransaction() bool { return s.txn != nil }
 // BEGIN itself); the caller is not required to synthesize a
 // placeholder for those cases specifically because it is never
 // consulted for them, but passing one unconditionally is always safe.
+//
+// Acquires the engine's statement-admission gate first, before parsing
+// or any planner/scan work (docs/v0.6.0-plan.md §9.2 — "bounds parser/
+// planner/scan work"), released when this call returns — per
+// statement, not per transaction: a BEGIN and each statement inside an
+// explicit transaction are each their own, independently gated call,
+// exactly mirroring BeginReadIndex's own "released when the call
+// returns, not when the transaction ends" rule (§5.4).
 func (s *Session) Execute(ctx context.Context, sqlText string, requestID string) (Result, error) {
+	release, err := s.engine.sqlGate().Acquire(ctx)
+	if err != nil {
+		return Result{}, err
+	}
+	defer release()
+
 	stmt, err := Parse(sqlText)
 	if err != nil {
 		return Result{}, err
 	}
-	return s.ExecuteStatement(ctx, stmt, requestID)
+	return s.dispatch(ctx, stmt, requestID)
 }
 
 // ExecuteStatement executes an already-parsed Statement — the entry
 // point for a caller that parsed once and wants to execute (or
-// re-execute, e.g. for a retry) without re-parsing.
+// re-execute, e.g. for a retry) without re-parsing. Gated exactly like
+// Execute (see its doc comment); the two acquire the gate
+// independently (never nested — this is not called from Execute)
+// since parsing already happened for this path.
 func (s *Session) ExecuteStatement(ctx context.Context, stmt Statement, requestID string) (Result, error) {
+	release, err := s.engine.sqlGate().Acquire(ctx)
+	if err != nil {
+		return Result{}, err
+	}
+	defer release()
+
+	return s.dispatch(ctx, stmt, requestID)
+}
+
+// dispatch is Execute/ExecuteStatement's shared, ungated dispatch —
+// factored out so neither path acquires the statement gate twice for
+// one logical statement.
+func (s *Session) dispatch(ctx context.Context, stmt Statement, requestID string) (Result, error) {
 	switch stmt.(type) {
 	case *BeginStmt:
 		return s.execBegin(ctx)
