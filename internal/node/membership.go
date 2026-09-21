@@ -215,6 +215,19 @@ func (n *Node) RemoveServer(ctx context.Context, requestID fsm.RequestID, nodeID
 }
 
 func (n *Node) membershipRequest(ctx context.Context, req membershipReq) (fsm.Outcome, error) {
+	// Lane A1 (docs/v0.6.0-plan.md §3.2, §5.4): the single dispatch
+	// point AddLearner/PromoteToVoter/RemoveServer all share, so every
+	// mutating membership call is gated exactly once, in exactly one
+	// place. A saturated client workload must never delay or fail a
+	// membership change (A-14/AC-12) — Lane A1's capacity is disjoint
+	// from Lane B's (writeGate/readGate) by construction, never a
+	// shared structure.
+	release, err := n.admission.control.Acquire(ctx)
+	if err != nil {
+		return fsm.Outcome{}, err
+	}
+	defer release()
+
 	req.resultCh = make(chan proposeResult, 1)
 	select {
 	case n.membershipCh <- req:

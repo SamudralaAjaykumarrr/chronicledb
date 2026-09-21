@@ -102,6 +102,13 @@ func newSingleLeaderNodeForTest(t *testing.T) *Node {
 		core:   core,
 		tr:     tr,
 		ackSeq: make(map[raft.NodeID]uint64, len(peers)),
+		// maxPendingReads: this helper bypasses Open (which otherwise
+		// always sets it); required because this file drives
+		// handleReadIndex directly, which now gates on it (§9.1a). This
+		// helper never calls the exported BeginReadIndex, so admission
+		// itself is not needed.
+		maxPendingReads: defaultMaxConcurrentReads,
+		metrics:         testMetrics(),
 	}
 }
 

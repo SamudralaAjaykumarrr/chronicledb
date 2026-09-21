@@ -92,6 +92,13 @@ func newDeterministicLeaderForDM17(t *testing.T, voters []raft.NodeID) *Node {
 		clusterGeneration: 2, // membership changes require generation >= 2 (§8.2); DM-18 covers that gate itself
 		readIndexCh:       make(chan readIndexReq),
 		doneCh:            make(chan struct{}),
+		// admission/maxPendingReads: this helper bypasses Open, which
+		// otherwise always constructs these (see testAdmissionGates'
+		// doc comment) — required because this test drives the real
+		// BeginReadIndex, which now gates on both.
+		admission:       testAdmissionGates(t),
+		maxPendingReads: defaultMaxConcurrentReads,
+		metrics:         testMetrics(),
 	}
 	n.fsmachine.Store(fsm.New(mvcc.NewStore()))
 	return n

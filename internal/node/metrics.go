@@ -75,6 +75,37 @@ type Metrics struct {
 	UpgradePrecheckTotal       metrics.Counter
 	UpgradeFinalizeTotal       metrics.Counter
 	UpgradeFinalizeFailedTotal metrics.Counter
+
+	// AdmissionDefenseRejectionsWaitersTotal/
+	// AdmissionDefenseRejectionsPendingReadsTotal count every rejection
+	// from the two event-loop ceilings docs/v0.6.0-plan.md §5.3/§9.1a
+	// add — chronicledb_admission_defense_rejections_total{ceiling=
+	// "waiters"|"pending_reads"}. Nonzero is a **normal operating
+	// signal under client cancellation**, not a bug signal (§5.3): a
+	// caller that cancels its context frees its admission.Gate slot
+	// while its waiter/pendingRead entry survives until it resolves,
+	// so a new caller is admitted through the gate while the ceiling
+	// is what actually bounds BOUNDED ADMITTED WORK.
+	AdmissionDefenseRejectionsWaitersTotal      metrics.Counter
+	AdmissionDefenseRejectionsPendingReadsTotal metrics.Counter
+
+	// WaitersGauge/PendingReadsGauge mirror len(n.waiters)/
+	// len(n.pendingReads) (docs/v0.6.0-plan.md §5.3/§9.1a's authoritative
+	// BOUNDED ADMITTED WORK ceilings), updated on run()'s own goroutine
+	// at every mutation site so a concurrent reader never races the map/
+	// slice itself — chronicledb_node_waiters / chronicledb_node_pending_reads.
+	WaitersGauge      metrics.Gauge
+	PendingReadsGauge metrics.Gauge
+
+	// RaftMessageProcessSeconds is Lane K's own service-time histogram
+	// (docs/v0.6.0-plan.md §4.3, §11.2's chronicledb_raft_message_
+	// process_seconds — the A-8 CONTROL-PLANE NON-STARVATION proof
+	// metric): one observation per inbound raft.Message processed by
+	// step(), regardless of client admission-queue depth, concurrency,
+	// or rejection rate. Not a Counter/Gauge, so it is a pointer,
+	// explicitly constructed by Open (metrics.Histogram's zero value is
+	// not valid — see its own doc comment).
+	RaftMessageProcessSeconds *metrics.Histogram
 }
 
 // MetricsSnapshot is a point-in-time, safe-to-read-anywhere copy of a
@@ -97,6 +128,14 @@ type MetricsSnapshot struct {
 	UpgradePrecheckTotal       uint64
 	UpgradeFinalizeTotal       uint64
 	UpgradeFinalizeFailedTotal uint64
+
+	AdmissionDefenseRejectionsWaitersTotal      uint64
+	AdmissionDefenseRejectionsPendingReadsTotal uint64
+
+	WaitersGauge      int64
+	PendingReadsGauge int64
+
+	RaftMessageProcessSeconds metrics.HistogramSnapshot
 }
 
 // Metrics returns a snapshot of this node's current diagnostic
@@ -121,5 +160,13 @@ func (n *Node) Metrics() MetricsSnapshot {
 		UpgradePrecheckTotal:       m.UpgradePrecheckTotal.Value(),
 		UpgradeFinalizeTotal:       m.UpgradeFinalizeTotal.Value(),
 		UpgradeFinalizeFailedTotal: m.UpgradeFinalizeFailedTotal.Value(),
+
+		AdmissionDefenseRejectionsWaitersTotal:      m.AdmissionDefenseRejectionsWaitersTotal.Value(),
+		AdmissionDefenseRejectionsPendingReadsTotal: m.AdmissionDefenseRejectionsPendingReadsTotal.Value(),
+
+		WaitersGauge:      m.WaitersGauge.Value(),
+		PendingReadsGauge: m.PendingReadsGauge.Value(),
+
+		RaftMessageProcessSeconds: m.RaftMessageProcessSeconds.Snapshot(),
 	}
 }

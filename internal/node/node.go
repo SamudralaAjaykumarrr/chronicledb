@@ -10,9 +10,11 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/SamudralaAjaykumarrr/chronicledb/internal/admission"
 	"github.com/SamudralaAjaykumarrr/chronicledb/internal/backup"
 	"github.com/SamudralaAjaykumarrr/chronicledb/internal/fsm"
 	"github.com/SamudralaAjaykumarrr/chronicledb/internal/identity"
+	"github.com/SamudralaAjaykumarrr/chronicledb/internal/metrics"
 	"github.com/SamudralaAjaykumarrr/chronicledb/internal/mvcc"
 	"github.com/SamudralaAjaykumarrr/chronicledb/internal/raft"
 	"github.com/SamudralaAjaykumarrr/chronicledb/internal/snapshot"
@@ -97,6 +99,48 @@ type Config struct {
 	// This is an operational threshold, never a safety rule (§2.6
 	// enforces every safety property regardless of its value).
 	PromotionMaxLagEntries uint64
+
+	// --- Admission control (docs/v0.6.0-plan.md Part A, §10.1) ---
+	//
+	// Every "MaxConcurrent"-shaped field below follows
+	// SnapshotThreshold's existing "0 means use the package default"
+	// convention for direct Go-API construction (setDefaults below),
+	// exactly like every other Config field — this is what keeps
+	// Config{}-constructed nodes in every pre-v0.6.0 test working with
+	// no admission-specific changes (release gate 10: no regression in
+	// any existing scenario). §10.1's "0 is a startup error" rule binds
+	// the *CLI flag* an operator can type (enforced in
+	// cmd/chronicledb-node, where the flag's own default is already the
+	// production value, so parsing 0 can only mean an explicit,
+	// deliberate override) — a different, narrower boundary than this
+	// Go struct's own zero value.
+
+	// MaxInflightProposals is Lane B write concurrency (-max-inflight-
+	// proposals), and separately the len(n.waiters) event-loop ceiling
+	// (§5.3) — the authoritative BOUNDED ADMITTED WORK mechanism, not
+	// merely a copy of the gate's own bound (see fact 8d: a canceled
+	// caller frees its gate slot while its waiter survives).
+	MaxInflightProposals int
+	// MaxConcurrentReads is Lane B BeginReadIndex concurrency
+	// (-max-concurrent-reads), and separately the len(n.pendingReads)
+	// event-loop ceiling (§9.1a).
+	MaxConcurrentReads int
+	// AdmissionQueueDepth is the waiting-room capacity behind Lane B's
+	// write/read gates (-admission-queue-depth). 0 = reject
+	// immediately, never wait — a legitimate, permanent configuration,
+	// not merely "use the default."
+	AdmissionQueueDepth int
+	// AdmissionMaxWait bounds how long a queued Lane B caller waits
+	// before ReasonQueueTimeout (-admission-max-wait). 0 = bounded only
+	// by the caller's own ctx.
+	AdmissionMaxWait time.Duration
+	// MaxAdminConcurrency is Lane A1 (control: membership, upgrade
+	// precheck/finalize, TLS reload) concurrency (-max-admin-concurrency).
+	MaxAdminConcurrency int
+	// MaxMaintenanceConcurrency is Lane A2 (maintenance: backup, scrub)
+	// concurrency (-max-maintenance-concurrency); each kind is
+	// additionally single-slot (§3.2a).
+	MaxMaintenanceConcurrency int
 }
 
 // PeerTLSEnabled reports whether Config requests peer mTLS.
@@ -110,6 +154,15 @@ const (
 	defaultHeartbeatTimeoutTicks      = 2
 	defaultTickInterval               = 20 * time.Millisecond
 	defaultSnapshotThreshold          = 4096
+
+	// Admission control defaults (docs/v0.6.0-plan.md §10.1). Only the
+	// fields where 0 has no legitimate meaning of its own are defaulted
+	// here — see setDefaults' AdmissionQueueDepth/AdmissionMaxWait
+	// comment for why those two are not.
+	defaultMaxInflightProposals      = 256
+	defaultMaxConcurrentReads        = 512
+	defaultMaxAdminConcurrency       = 2
+	defaultMaxMaintenanceConcurrency = 2
 )
 
 func (c *Config) setDefaults() {
@@ -127,6 +180,26 @@ func (c *Config) setDefaults() {
 	}
 	if c.SnapshotThreshold == 0 {
 		c.SnapshotThreshold = defaultSnapshotThreshold
+	}
+	if c.MaxInflightProposals == 0 {
+		c.MaxInflightProposals = defaultMaxInflightProposals
+	}
+	if c.MaxConcurrentReads == 0 {
+		c.MaxConcurrentReads = defaultMaxConcurrentReads
+	}
+	// AdmissionQueueDepth and AdmissionMaxWait are deliberately NOT
+	// defaulted here, unlike every field above: 0 is a fully legitimate,
+	// intentional value for both (§10.1: "0 = reject immediately, never
+	// wait" / "0 = bounded only by the caller's own ctx"), not merely
+	// "unset" — silently substituting a nonzero default would make it
+	// impossible for a direct Go-API caller to actually request either
+	// behavior. cmd/chronicledb-node's own flag defaults (256, 500ms)
+	// supply the recommended out-of-the-box CLI values instead.
+	if c.MaxAdminConcurrency == 0 {
+		c.MaxAdminConcurrency = defaultMaxAdminConcurrency
+	}
+	if c.MaxMaintenanceConcurrency == 0 {
+		c.MaxMaintenanceConcurrency = defaultMaxMaintenanceConcurrency
 	}
 }
 
@@ -441,6 +514,31 @@ type Node struct {
 	waiters      map[raft.Index]waiter
 	pendingReads []pendingRead
 
+	// admission holds every internal/admission.Gate this node owns
+	// (docs/v0.6.0-plan.md §3.2's four lanes). Every acquisition happens
+	// on a caller's goroutine, in Propose/BeginReadIndex/Backup/
+	// membershipRequest/UpgradePrecheck/FinalizeUpgrade — never here in
+	// a field read by run()'s own goroutine, which is Rule CP-1/CP-2
+	// (§4.2), asserted structurally by
+	// TestAdmissionNeverReachableFromEventLoop.
+	admission *admissionGates
+	// maxClientWaiters/maxPendingReads are the two event-loop ceilings
+	// (§5.3, §9.1a) — the *authoritative* BOUNDED ADMITTED WORK
+	// mechanism, checked on run()'s own goroutine in handlePropose/
+	// handleReadIndex, independently of admission.Gate's own bound (see
+	// fact 8d/8c: a caller that cancels its context frees its gate slot
+	// while its waiter/pendingRead entry survives).
+	maxClientWaiters int
+	maxPendingReads  int
+
+	// noopWriteGateForTest/skipLaneSeparationForTest are AC-5/AC-7's
+	// negative-control hooks (docs/v0.6.0-plan.md §29:
+	// node.SetNoopAdmissionGateForTest,
+	// node.SetSkipAdmissionLaneSeparationForTest). Never set in
+	// production. See each Set*ForTest method's doc comment.
+	noopWriteGateForTest      atomic.Bool
+	skipLaneSeparationForTest atomic.Bool
+
 	// clusterGeneration mirrors fsm.FSM.ClusterGeneration() but is
 	// written directly by run's own goroutine (via
 	// adoptClusterGeneration) instead of read through fsmachine's mutex
@@ -682,6 +780,12 @@ func Open(cfg Config) (*Node, error) {
 		return nil, err
 	}
 
+	admissionGates, err := newAdmissionGates(cfg)
+	if err != nil {
+		w.Close()
+		return nil, fmt.Errorf("node: %w", err)
+	}
+
 	n := &Node{
 		cfg:                cfg,
 		core:               core,
@@ -696,6 +800,9 @@ func Open(cfg Config) (*Node, error) {
 		waiters:            make(map[raft.Index]waiter),
 		ackSeq:             make(map[raft.NodeID]uint64, len(cfg.Peers)),
 		peerGenerations:    make(map[raft.NodeID]uint32, len(cfg.Peers)),
+		admission:          admissionGates,
+		maxClientWaiters:   cfg.MaxInflightProposals,
+		maxPendingReads:    cfg.MaxConcurrentReads,
 		proposeCh:          make(chan proposeReq),
 		controlCh:          make(chan controlProposeReq),
 		readIndexCh:        make(chan readIndexReq),
@@ -708,6 +815,7 @@ func Open(cfg Config) (*Node, error) {
 		doneCh:             make(chan struct{}),
 	}
 	n.fsmachine.Store(fsmachine)
+	n.metrics.RaftMessageProcessSeconds = metrics.NewHistogram(metrics.DefaultLatencyBounds...)
 	n.electionArmed = true
 	n.electionTicksLeft = core.NewElectionTimeout()
 	n.refreshStatusLocked()
@@ -814,6 +922,24 @@ func (n *Node) ReleaseElectionNoOpForTest() {
 	}
 }
 
+// SetNoopAdmissionGateForTest is AC-5's negative-control hook
+// (docs/v0.6.0-plan.md §29, §27.4 ADMISSION FAILS CLOSED): when noop is
+// true, Propose skips admission.write entirely (as if the gate
+// mechanism were absent or broken). Proves the event-loop len(n.waiters)
+// ceiling (§5.3) still holds the bound independently — the gate and the
+// ceiling are two independent mechanisms, not one relying on the
+// other. Test-only; production code never calls it.
+func (n *Node) SetNoopAdmissionGateForTest(noop bool) { n.noopWriteGateForTest.Store(noop) }
+
+// SetSkipAdmissionLaneSeparationForTest is AC-7's negative control for
+// CONTROL-PLANE NON-STARVATION (docs/v0.6.0-plan.md §29.3): see
+// handlePropose's own comment on skipLaneSeparationForTest for exactly
+// what it reintroduces and why. Test-only; production code never calls
+// it.
+func (n *Node) SetSkipAdmissionLaneSeparationForTest(skip bool) {
+	n.skipLaneSeparationForTest.Store(skip)
+}
+
 // Status returns a snapshot of the node's current diagnostic state.
 // Safe to call from any goroutine.
 func (n *Node) Status() Status {
@@ -826,6 +952,15 @@ func (n *Node) refreshStatusLocked() {
 	cfg := n.core.ActiveConfig()
 	_, committedConfigIndex := n.core.ConfigAt(n.core.CommitIndex())
 	changesReady, notReadyReason := n.core.ConfigChangeReady()
+
+	// The two BOUNDED ADMITTED WORK ceiling gauges (docs/v0.6.0-plan.md
+	// §5.3/§9.1a) — refreshed here, once, on the single event-loop
+	// goroutine that owns both n.waiters and n.pendingReads, exactly
+	// mirroring how every other Status field is centrally refreshed
+	// after every select case, rather than at each individual mutation
+	// site (less surface to miss one).
+	n.metrics.WaitersGauge.Set(int64(len(n.waiters)))
+	n.metrics.PendingReadsGauge.Set(int64(len(n.pendingReads)))
 
 	n.statusMu.Lock()
 	n.status = Status{
@@ -957,6 +1092,16 @@ func (n *Node) computePrecheck() PrecheckResult {
 // leader (docs/upgrades.md's runbook does) for the authoritative
 // picture.
 func (n *Node) UpgradePrecheck(ctx context.Context) (PrecheckResult, error) {
+	// Lane A1 (docs/v0.6.0-plan.md §3.2, §5.4): the exported wrapper
+	// only — the unexported upgradePrecheck below, which FinalizeUpgrade
+	// also calls internally, never itself acquires (it would self-
+	// deadlock a goroutine that already holds this call's own slot).
+	release, err := n.admission.control.Acquire(ctx)
+	if err != nil {
+		return PrecheckResult{}, err
+	}
+	defer release()
+
 	res, err := n.upgradePrecheck(ctx)
 	if err != nil {
 		return PrecheckResult{}, err
@@ -1079,6 +1224,15 @@ var ErrAlreadyFinalized = errors.New("node: cluster is already finalized at this
 // reflects this node's just-changed role. A single live read inside
 // upgradePrecheck's own dispatch has no such gap.
 func (n *Node) FinalizeUpgrade(ctx context.Context) (fsm.Outcome, uint32, error) {
+	// Lane A1 (docs/v0.6.0-plan.md §3.2, §5.4). Acquired once, here;
+	// the internal upgradePrecheck call below does not re-acquire (see
+	// UpgradePrecheck's own comment on why nesting would self-deadlock).
+	release, err := n.admission.control.Acquire(ctx)
+	if err != nil {
+		return fsm.Outcome{}, 0, err
+	}
+	defer release()
+
 	// unexported upgradePrecheck, not the exported UpgradePrecheck: this
 	// internal re-check must not inflate UpgradePrecheckTotal, a metric
 	// meant to reflect explicit operator/CLI polling — see
@@ -1153,6 +1307,25 @@ func (n *Node) FinalizeUpgrade(ctx context.Context) (fsm.Outcome, uint32, error)
 // never resolved (not leader, leadership lost, superseded, canceled, or
 // stopped).
 func (n *Node) Propose(ctx context.Context, cmd fsm.CommitTxnCommand) (fsm.Outcome, error) {
+	// Admission gate first, before Precheck (docs/v0.6.0-plan.md §5.7):
+	// Precheck's fingerprintOf hashes the command's full mutation set on
+	// every call, which is unbounded client-caused CPU work, and
+	// admitting before doing any per-request work is this release's
+	// general rule. Consequence, by design: under overload, a retry of
+	// an already-decided RequestID can be rejected with 503 rather than
+	// returning its recorded outcome — safe (503 records nothing), and
+	// the deliberately-ungated GET /outcome remains the correct way to
+	// resolve a known RequestID under load (§3.3, §5.4a).
+	release := func() {}
+	if !n.noopWriteGateForTest.Load() {
+		var err error
+		release, err = n.admission.write.Acquire(ctx)
+		if err != nil {
+			return fsm.Outcome{}, err
+		}
+	}
+	defer release()
+
 	if outcome, err := n.fsmachine.Load().Precheck(cmd); err == nil {
 		n.metrics.RequestIDDuplicatesTotal.Inc()
 		return outcome, nil
@@ -1187,6 +1360,18 @@ func (n *Node) Propose(ctx context.Context, cmd fsm.CommitTxnCommand) (fsm.Outco
 // NotLeaderError if this node is not leader, or ErrLeadershipLost if it
 // steps down before the check completes.
 func (n *Node) BeginReadIndex(ctx context.Context) (uint64, error) {
+	// The readGate slot is released when THIS CALL returns, not when
+	// the eventual transaction ends (docs/v0.6.0-plan.md §5.4, §9.1):
+	// holding it for a whole transaction would let a long-running,
+	// well-behaved reader consume admission capacity indefinitely. A
+	// read lease bounding transaction lifetime lands in a later slice
+	// (§15.3); this gate's job ends here.
+	release, err := n.admission.read.Acquire(ctx)
+	if err != nil {
+		return 0, err
+	}
+	defer release()
+
 	req := readIndexReq{resultCh: make(chan readResult, 1)}
 	select {
 	case n.readIndexCh <- req:
@@ -1236,6 +1421,23 @@ func (n *Node) BeginReadIndex(ctx context.Context) (uint64, error) {
 // maybeSnapshot's identical characteristic); docs/backup.md documents
 // this operationally.
 func (n *Node) Backup(ctx context.Context, outDir string, continuous bool, clusterID string) (backup.Manifest, error) {
+	// Lane A2 (docs/v0.6.0-plan.md §3.2a): the shared maintenance gate
+	// plus a dedicated single slot for this kind, so a running backup
+	// and a running scrub may overlap each other but a second concurrent
+	// backup is refused outright (admin_operation_in_progress) rather
+	// than queued — two concurrent exports both run on the event loop
+	// anyway, so queueing only hides the cost.
+	release, err := n.admission.maintenance.Acquire(ctx)
+	if err != nil {
+		return backup.Manifest{}, err
+	}
+	defer release()
+	releaseSlot, err := acquireSingleSlot(ctx, n.admission.backupSlot)
+	if err != nil {
+		return backup.Manifest{}, err
+	}
+	defer releaseSlot()
+
 	req := backupReq{outDir: outDir, continuous: continuous, clusterID: clusterID, resultCh: make(chan backupResult, 1)}
 	select {
 	case n.backupCh <- req:
@@ -1344,6 +1546,16 @@ func (n *Node) tick() {
 // step delivers one Input to Core and processes the resulting Output.
 // Call only from run's goroutine.
 func (n *Node) step(in raft.Input) {
+	// CONTROL-PLANE NON-STARVATION's own proof metric
+	// (docs/v0.6.0-plan.md §4.3, §11.2): one observation per inbound
+	// raft.Message this node's event loop processes, covering the whole
+	// call (Core.Step plus processOutput's side effects) — the exact
+	// quantity the invariant claims is independent of client admission-
+	// queue depth, concurrency, or rejection rate.
+	if in.Kind == raft.InputMessage {
+		start := time.Now()
+		defer func() { n.metrics.RaftMessageProcessSeconds.Observe(time.Since(start).Seconds()) }()
+	}
 	// Recognize a legitimate, current-term Success AppendEntriesResponse
 	// BEFORE handing it to Core, using exactly the same precondition
 	// (Role==Leader, msg.Term==CurrentTerm) Core itself uses to decide
@@ -1385,6 +1597,46 @@ func (n *Node) step(in raft.Input) {
 // mutation (docs replication.md §1.2 step 1: "the leader accepted the
 // client's request, validated it is current leader").
 func (n *Node) handlePropose(req proposeReq) {
+	// AC-7's negative control (docs/v0.6.0-plan.md §29.3): reintroduces,
+	// on demand, the exact shape of hazard Rule CP-1/CP-2 forbids —
+	// client-admitted work costing the event loop time — WITHOUT
+	// literally re-acquiring a gate from inside the loop (which risks a
+	// genuine, unrecoverable deadlock if every external caller is
+	// itself blocked waiting on this same goroutine). A fixed per-call
+	// delay, comfortably larger than this test tier's own election
+	// timeout budget (configFor's electionTicks x TickInterval), is a
+	// safe, deterministic stand-in that still faithfully demonstrates
+	// the consequence: sustained client load blocks the loop long
+	// enough that followers stop hearing from the leader in time and
+	// call an election, which the positive test (with this hook left
+	// off) proves does not happen.
+	if n.skipLaneSeparationForTest.Load() {
+		time.Sleep(150 * time.Millisecond)
+	}
+	// The authoritative BOUNDED ADMITTED WORK ceiling (docs/v0.6.0-
+	// plan.md §5.3): len(n.waiters) is the true proposed-but-unapplied
+	// set, and admission.write's own gate does NOT bound it — a caller
+	// that cancels its context frees its gate slot (deferred release())
+	// while its waiter here survives until the entry applies, the node
+	// steps down, or it shuts down (fact 8d). This check is what makes
+	// that survive-past-cancellation case fail-safe rather than
+	// unbounded, and it fires in NORMAL operation under a cancel-heavy
+	// workload (AC-20) — chronicledb_admission_defense_rejections_total
+	// is a cancellation signal, not a bug signal.
+	//
+	// Applies to CLIENT proposals only (§5.3): handleControlPropose
+	// (upgrade finalize), handleMembership, and proposeElectionNoOp
+	// never consult it — a saturated client workload must not be able
+	// to block a membership change or a new leader's own no-op. This is
+	// Lane A/Lane K priority expressed as an absence of a check, the
+	// only form of priority that cannot be misconfigured.
+	if len(n.waiters) >= n.maxClientWaiters {
+		n.metrics.AdmissionDefenseRejectionsWaitersTotal.Inc()
+		req.resultCh <- proposeResult{err: &admission.RejectedError{
+			Reason: admission.ReasonConcurrencyLimit, RetryAfter: admission.ReasonConcurrencyLimit.DefaultRetryAfter(),
+		}}
+		return
+	}
 	n.proposeAndAwait(req.payload, req.cmd.RequestID, req.resultCh,
 		func() { n.metrics.ProposalsRejectedTotal.Inc() },
 		func() { n.metrics.ProposalsTotal.Inc() })
@@ -1458,6 +1710,27 @@ func (n *Node) handleReadIndex(req readIndexReq) {
 	}
 	if n.core.Role() != raft.Leader {
 		req.resultCh <- readResult{err: &NotLeaderError{Leader: n.core.LeaderID()}}
+		return
+	}
+	// The read-side twin of handlePropose's waiters ceiling
+	// (docs/v0.6.0-plan.md §9.1a): admission.read's own gate slot is
+	// released when BeginReadIndex *returns*, but a pendingRead entry
+	// here can outlive that — a caller that times out and abandons the
+	// call frees its gate slot while this entry survives until the read
+	// resolves or leadership is lost. checkPendingReads scans the whole
+	// slice after every processOutput, so its cost is on Lane K's
+	// critical path; this ceiling is what bounds that cost by a
+	// configured constant rather than by client read concurrency.
+	//
+	// (The companion live-read-lease ceiling §9.1a also specifies lands
+	// with the read-lease registry itself in a later slice — see
+	// docs/v0.6.0-plan.md §15.3/§33 slice 9 — since there is no lease to
+	// bound yet.)
+	if len(n.pendingReads) >= n.maxPendingReads {
+		n.metrics.AdmissionDefenseRejectionsPendingReadsTotal.Inc()
+		req.resultCh <- readResult{err: &admission.RejectedError{
+			Reason: admission.ReasonConcurrencyLimit, RetryAfter: admission.ReasonConcurrencyLimit.DefaultRetryAfter(),
+		}}
 		return
 	}
 	term0 := n.core.CurrentTerm()

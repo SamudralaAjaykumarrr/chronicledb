@@ -87,6 +87,13 @@ type testCluster struct {
 	// with peer mTLS (docs/enterprise-v1-plan.md §5 layer 2) instead of
 	// plaintext transport — see tls_test.go.
 	peerTLS map[raft.NodeID]peerTLSFiles
+
+	// admissionOverride, when non-nil, lets a test tune this cluster's
+	// admission-control Config fields (docs/v0.6.0-plan.md Part A)
+	// beyond configFor's own production-shaped defaults — e.g. a small
+	// MaxInflightProposals so a handful of goroutines can saturate it
+	// deterministically.
+	admissionOverride func(*Config)
 }
 
 // peerTLSFiles names one node's peer-TLS certificate/key/CA file paths
@@ -107,6 +114,38 @@ func newTestClusterWithSnapshotThreshold(t *testing.T, n int, snapshotThreshold 
 		dirs:              make(map[raft.NodeID]string, n),
 		nodes:             make(map[raft.NodeID]*Node, n),
 		snapshotThreshold: snapshotThreshold,
+	}
+	addrs := freeAddrs(t, n)
+	for i := 0; i < n; i++ {
+		id := raft.NodeID(fmt.Sprintf("n%d", i+1))
+		tc.ids = append(tc.ids, id)
+		tc.addrs[id] = addrs[i]
+		tc.dirs[id] = t.TempDir()
+	}
+	for _, id := range tc.ids {
+		tc.nodes[id] = tc.mustOpen(id)
+	}
+	t.Cleanup(func() {
+		for _, n := range tc.nodes {
+			n.Stop()
+		}
+	})
+	return tc
+}
+
+// newTestClusterWithAdmissionOverride is newTestCluster plus a hook to
+// tune every node's admission-control Config fields
+// (docs/v0.6.0-plan.md Part A) before Open — e.g. a small
+// MaxInflightProposals so AC-1/AC-3/AC-5…AC-9/AC-20-style tests can
+// saturate a gate with a handful of goroutines instead of hundreds.
+func newTestClusterWithAdmissionOverride(t *testing.T, n int, override func(*Config)) *testCluster {
+	t.Helper()
+	tc := &testCluster{
+		t:                 t,
+		addrs:             make(map[raft.NodeID]string, n),
+		dirs:              make(map[raft.NodeID]string, n),
+		nodes:             make(map[raft.NodeID]*Node, n),
+		admissionOverride: override,
 	}
 	addrs := freeAddrs(t, n)
 	for i := 0; i < n; i++ {
@@ -168,6 +207,9 @@ func (tc *testCluster) configFor(id raft.NodeID) Config {
 		cfg.PeerTLSCertFile = files.CertFile
 		cfg.PeerTLSKeyFile = files.KeyFile
 		cfg.PeerTLSCAFile = files.CAFile
+	}
+	if tc.admissionOverride != nil {
+		tc.admissionOverride(&cfg)
 	}
 	return cfg
 }
