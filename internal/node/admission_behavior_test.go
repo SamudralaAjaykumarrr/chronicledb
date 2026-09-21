@@ -509,7 +509,7 @@ func TestAC21Partial_PendingReadsCeilingUnderMinorityPartitionFlood(t *testing.T
 				default:
 				}
 				ctx, cancel := context.WithTimeout(context.Background(), 15*time.Millisecond)
-				_, _ = leader.BeginReadIndex(ctx)
+				_, _, _ = leader.BeginReadIndex(ctx)
 				cancel()
 			}
 		}()

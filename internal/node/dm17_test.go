@@ -96,9 +96,12 @@ func newDeterministicLeaderForDM17(t *testing.T, voters []raft.NodeID) *Node {
 		// otherwise always constructs these (see testAdmissionGates'
 		// doc comment) — required because this test drives the real
 		// BeginReadIndex, which now gates on both.
-		admission:       testAdmissionGates(t),
-		maxPendingReads: defaultMaxConcurrentReads,
-		metrics:         testMetrics(),
+		admission:         testAdmissionGates(t),
+		maxPendingReads:   defaultMaxConcurrentReads,
+		metrics:           testMetrics(),
+		leases:            newLeaseRegistry(),
+		maxLiveReadLeases: defaultMaxLiveReadLeases,
+		releaseLeaseCh:    make(chan uint64, 8),
 	}
 	n.fsmachine.Store(fsm.New(mvcc.NewStore()))
 	return n
@@ -290,7 +293,7 @@ func TestDM17SelfRemoval_TwoPhasesAgainstOneReadPlusPositive(t *testing.T) {
 		err error
 	}, 1)
 	go func() {
-		seq, err := n.BeginReadIndex(ctx)
+		seq, _, err := n.BeginReadIndex(ctx)
 		beginDone <- struct {
 			seq uint64
 			err error

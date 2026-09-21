@@ -97,6 +97,19 @@ type Metrics struct {
 	WaitersGauge      metrics.Gauge
 	PendingReadsGauge metrics.Gauge
 
+	// ReadLeasesActiveGauge mirrors n.leases.Len() (docs/v0.6.0-plan.md
+	// §9.1a/§15.3/§25's chronicledb_read_leases_active), refreshed
+	// alongside WaitersGauge/PendingReadsGauge.
+	ReadLeasesActiveGauge metrics.Gauge
+
+	// GCProposalsTotal/GCProposalsFailedTotal count every leader-side
+	// AdvanceGCWatermark proposal attempt (docs/v0.6.0-plan.md §25's
+	// chronicledb_mvcc_gc_proposals_total/_failed_total): Total on
+	// InputPropose acceptance, FailedTotal when Core rejected it
+	// outright (e.g. a leadership change raced the proposal).
+	GCProposalsTotal       metrics.Counter
+	GCProposalsFailedTotal metrics.Counter
+
 	// RaftMessageProcessSeconds is Lane K's own service-time histogram
 	// (docs/v0.6.0-plan.md §4.3, §11.2's chronicledb_raft_message_
 	// process_seconds — the A-8 CONTROL-PLANE NON-STARVATION proof
@@ -135,6 +148,11 @@ type MetricsSnapshot struct {
 	WaitersGauge      int64
 	PendingReadsGauge int64
 
+	ReadLeasesActiveGauge int64
+
+	GCProposalsTotal       uint64
+	GCProposalsFailedTotal uint64
+
 	RaftMessageProcessSeconds metrics.HistogramSnapshot
 }
 
@@ -166,6 +184,11 @@ func (n *Node) Metrics() MetricsSnapshot {
 
 		WaitersGauge:      m.WaitersGauge.Value(),
 		PendingReadsGauge: m.PendingReadsGauge.Value(),
+
+		ReadLeasesActiveGauge: m.ReadLeasesActiveGauge.Value(),
+
+		GCProposalsTotal:       m.GCProposalsTotal.Value(),
+		GCProposalsFailedTotal: m.GCProposalsFailedTotal.Value(),
 
 		RaftMessageProcessSeconds: m.RaftMessageProcessSeconds.Snapshot(),
 	}

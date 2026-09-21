@@ -165,6 +165,41 @@ func newTestClusterWithAdmissionOverride(t *testing.T, n int, override func(*Con
 	return tc
 }
 
+// newTestClusterWithSnapshotThresholdAndAdmissionOverride combines
+// newTestClusterWithSnapshotThreshold's real snapshot-creation trigger
+// with newTestClusterWithAdmissionOverride's Config-tuning hook, for
+// tests that need both at once (e.g. SL-13: forcing a real
+// InstallSnapshot catch-up path while also driving the leader-GC-
+// proposer fast enough to produce continuation passes within the test's
+// own budget).
+func newTestClusterWithSnapshotThresholdAndAdmissionOverride(t *testing.T, n int, snapshotThreshold uint64, override func(*Config)) *testCluster {
+	t.Helper()
+	tc := &testCluster{
+		t:                 t,
+		addrs:             make(map[raft.NodeID]string, n),
+		dirs:              make(map[raft.NodeID]string, n),
+		nodes:             make(map[raft.NodeID]*Node, n),
+		snapshotThreshold: snapshotThreshold,
+		admissionOverride: override,
+	}
+	addrs := freeAddrs(t, n)
+	for i := 0; i < n; i++ {
+		id := raft.NodeID(fmt.Sprintf("n%d", i+1))
+		tc.ids = append(tc.ids, id)
+		tc.addrs[id] = addrs[i]
+		tc.dirs[id] = t.TempDir()
+	}
+	for _, id := range tc.ids {
+		tc.nodes[id] = tc.mustOpen(id)
+	}
+	t.Cleanup(func() {
+		for _, n := range tc.nodes {
+			n.Stop()
+		}
+	})
+	return tc
+}
+
 func (tc *testCluster) configFor(id raft.NodeID) Config {
 	peerAddrs := make(map[raft.NodeID]string)
 	for _, p := range tc.ids {
@@ -809,10 +844,11 @@ func TestBeginReadIndexOnLeaderSucceedsAfterCommit(t *testing.T) {
 
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
-	startSeq, err := leader.BeginReadIndex(ctx)
+	startSeq, lease, err := leader.BeginReadIndex(ctx)
 	if err != nil {
 		t.Fatalf("BeginReadIndex: %v", err)
 	}
+	defer lease.Release()
 	if startSeq < outcome.CommitSeq {
 		t.Fatalf("StartSeq = %d, want >= CommitSeq %d", startSeq, outcome.CommitSeq)
 	}
@@ -834,7 +870,7 @@ func TestBeginReadIndexRejectedOnFollower(t *testing.T) {
 
 	ctx, cancel := context.WithTimeout(context.Background(), 1*time.Second)
 	defer cancel()
-	_, err := tc.node(followerID).BeginReadIndex(ctx)
+	_, _, err := tc.node(followerID).BeginReadIndex(ctx)
 	var nle *NotLeaderError
 	if !errors.As(err, &nle) {
 		t.Fatalf("BeginReadIndex on follower: err = %v, want *NotLeaderError", err)
@@ -866,7 +902,7 @@ func TestBeginReadIndexBlockedAfterIsolationEvenWithStaleReplicatedLog(t *testin
 
 	ctx, cancel := context.WithTimeout(context.Background(), 1*time.Second)
 	defer cancel()
-	if _, err := leader.BeginReadIndex(ctx); err == nil {
+	if _, _, err := leader.BeginReadIndex(ctx); err == nil {
 		t.Fatal("isolated leader completed ReadIndex using stale pre-isolation replication facts alone")
 	}
 }
@@ -883,7 +919,7 @@ func TestBeginReadIndexBlockedDuringMinorityPartition(t *testing.T) {
 
 	ctx, cancel := context.WithTimeout(context.Background(), 1*time.Second)
 	defer cancel()
-	_, err := leader.BeginReadIndex(ctx)
+	_, _, err := leader.BeginReadIndex(ctx)
 	if err == nil {
 		t.Fatal("isolated leader completed a ReadIndex check during a minority partition; QUORUM-SAFETY/read-consistency violated")
 	}

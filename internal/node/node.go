@@ -125,6 +125,12 @@ type Config struct {
 	// (-max-concurrent-reads), and separately the len(n.pendingReads)
 	// event-loop ceiling (§9.1a).
 	MaxConcurrentReads int
+	// MaxLiveReadLeases bounds the live-read-lease registry
+	// (-max-live-read-leases, §9.1a/§15.3) — unlike MaxInflightProposals/
+	// MaxConcurrentReads, this ceiling has no caller-side gate
+	// counterpart at all, so it is the primary limiter for this
+	// resource, not a backstop.
+	MaxLiveReadLeases int
 	// AdmissionQueueDepth is the waiting-room capacity behind Lane B's
 	// write/read gates (-admission-queue-depth). 0 = reject
 	// immediately, never wait — a legitimate, permanent configuration,
@@ -149,6 +155,29 @@ type Config struct {
 	// connection (-peer-idle-timeout). 0 means no deadline — v0.5.0
 	// behavior exactly.
 	PeerIdleTimeout time.Duration
+
+	// --- MVCC GC (docs/v0.6.0-plan.md §10.2, §13.4) ---
+
+	// GCInterval is how often the leader evaluates and, if warranted,
+	// proposes a GC watermark advance (-gc-interval). 0 (the default)
+	// disables GC entirely (S-12) — deliberately NOT defaulted to a
+	// nonzero value in setDefaults, exactly like AdmissionQueueDepth:
+	// 0 is GC's own meaningful, intentional "off" state, not merely
+	// "unset". A v0.6.0 node started with no new flags must propose
+	// zero AdvanceGCWatermark commands (release gate 9).
+	GCInterval time.Duration
+	// GCMinRetainSeqs is the lag floor (-gc-min-retain-seqs, §14.2):
+	// the proposed watermark never exceeds appliedCommitSeq minus this.
+	GCMinRetainSeqs uint64
+	// GCMinAdvanceSeqs gates watermark ADVANCES, not continuation
+	// passes (-gc-min-advance-seqs, §13.4a).
+	GCMinAdvanceSeqs uint64
+	// GCMaxVersionsPerPass/GCMaxKeysPerPass bound one Apply's removed/
+	// examined work (-gc-max-versions-per-pass, -gc-max-keys-per-pass,
+	// §14.4) — carried in the proposed command itself, so every replica
+	// performs byte-identical work regardless of its own flags.
+	GCMaxVersionsPerPass uint32
+	GCMaxKeysPerPass     uint32
 }
 
 // PeerTLSEnabled reports whether Config requests peer mTLS.
@@ -169,8 +198,18 @@ const (
 	// comment for why those two are not.
 	defaultMaxInflightProposals      = 256
 	defaultMaxConcurrentReads        = 512
+	defaultMaxLiveReadLeases         = 4096
 	defaultMaxAdminConcurrency       = 2
 	defaultMaxMaintenanceConcurrency = 2
+
+	// MVCC GC has no in-package defaults (docs/v0.6.0-plan.md §10.2):
+	// GCInterval, GCMinRetainSeqs, GCMinAdvanceSeqs,
+	// GCMaxVersionsPerPass and GCMaxKeysPerPass are all left at their
+	// Go zero value by setDefaults (see its own comment) — every one of
+	// them has a legitimate explicit meaning at 0, not just GCInterval.
+	// cmd/chronicledb-node's flag defaults (0, 1024, 256, 4096, 16384)
+	// are the single source of truth for the recommended production
+	// values.
 )
 
 func (c *Config) setDefaults() {
@@ -195,6 +234,9 @@ func (c *Config) setDefaults() {
 	if c.MaxConcurrentReads == 0 {
 		c.MaxConcurrentReads = defaultMaxConcurrentReads
 	}
+	if c.MaxLiveReadLeases == 0 {
+		c.MaxLiveReadLeases = defaultMaxLiveReadLeases
+	}
 	// AdmissionQueueDepth and AdmissionMaxWait are deliberately NOT
 	// defaulted here, unlike every field above: 0 is a fully legitimate,
 	// intentional value for both (§10.1: "0 = reject immediately, never
@@ -209,6 +251,21 @@ func (c *Config) setDefaults() {
 	if c.MaxMaintenanceConcurrency == 0 {
 		c.MaxMaintenanceConcurrency = defaultMaxMaintenanceConcurrency
 	}
+	// GCInterval, GCMinRetainSeqs, GCMinAdvanceSeqs, GCMaxVersionsPerPass
+	// and GCMaxKeysPerPass are all deliberately NOT defaulted here, for
+	// the same reason as AdmissionQueueDepth/AdmissionMaxWait above: 0
+	// is a fully legitimate, intentional value for each of them, not
+	// merely "unset" — GCInterval's 0 disables GC entirely (S-12);
+	// GCMinRetainSeqs/GCMinAdvanceSeqs's 0 requests no safety slack
+	// (still bounded by minLease/appliedIndex, never unsafe, just less
+	// conservative); GCMaxVersionsPerPass/GCMaxKeysPerPass's 0 requests
+	// "advance/record the watermark but reclaim nothing this pass"
+	// (internal/fsm/gc.go's ApplyAdvanceGCWatermark: `if cmd.MaxKeys > 0`
+	// guards the whole reclaim walk). Silently substituting a nonzero
+	// default here would make every one of those explicit choices
+	// unreachable for a direct Go-API caller. cmd/chronicledb-node's own
+	// flag defaults (0, 1024, 256, 4096, 16384) supply the recommended
+	// out-of-the-box CLI values instead.
 }
 
 func (c Config) validate() error {
@@ -301,10 +358,15 @@ type proposeReq struct {
 
 type readResult struct {
 	startSeq uint64
+	lease    *ReadLease
 	err      error
 }
 
 type readIndexReq struct {
+	// leaseID is pre-allocated by BeginReadIndex, on the caller's own
+	// goroutine, before this request is even sent — see
+	// Node.nextLeaseID's doc comment.
+	leaseID  uint64
 	resultCh chan readResult
 }
 
@@ -424,7 +486,13 @@ type pendingRead struct {
 	// directly, or against a purely local processing-order counter, is
 	// not sufficient).
 	requiredSeq uint64
-	resultCh    chan readResult
+	// leaseID is the read lease registered at capture time, alongside
+	// target (docs/v0.6.0-plan.md §15.3): kept here so a resolution-
+	// failure path (leadership lost) can release it — a successful
+	// resolution instead hands the live *ReadLease to the caller via
+	// readResult, who now owns releasing it.
+	leaseID  uint64
+	resultCh chan readResult
 }
 
 // Node is ChronicleDB's process-level runtime (docs/architecture.md §5
@@ -521,6 +589,52 @@ type Node struct {
 	appliedIndex uint64
 	waiters      map[raft.Index]waiter
 	pendingReads []pendingRead
+
+	// leases is the live-read-lease registry (docs/v0.6.0-plan.md
+	// §9.1a/§15.3): read and written exclusively on run()'s own
+	// goroutine, exactly like waiters/pendingReads.
+	leases *leaseRegistry
+	// maxLiveReadLeases is the -max-live-read-leases event-loop
+	// ceiling (§9.1a): unlike maxClientWaiters/maxPendingReads, this
+	// ceiling has no caller-side gate counterpart at all, so it is the
+	// PRIMARY limiter for this resource, not a backstop.
+	maxLiveReadLeases int
+	// releaseLeaseCh carries a released/abandoned lease's id onto
+	// run()'s goroutine, the only one permitted to mutate leases — used
+	// by both ReadLease.Release (a caller done with its transaction)
+	// and BeginReadIndex's own ctx-cancellation path (§15.3's lifecycle
+	// table).
+	releaseLeaseCh chan uint64
+	// nextLeaseID allocates read-lease ids from any caller goroutine
+	// (atomic, unlike the rest of the event-loop-owned state above):
+	// BeginReadIndex allocates one before ever sending its request, so
+	// its own cancellation path can name the lease without having
+	// received a result. handleReadIndex uses the caller-supplied id
+	// rather than generating its own.
+	nextLeaseID atomic.Uint64
+
+	// --- MVCC GC leader proposer (docs/v0.6.0-plan.md §13.4) ---
+	//
+	// gcIntervalTicks is cfg.GCInterval expressed in TickInterval units
+	// (0 means GC is disabled — no ticker, no evaluation, ever: the
+	// exact v0.5.0-behavior guarantee release gate 9 requires). gcTicksLeft
+	// counts down exactly like electionTicksLeft/heartbeatTicksLeft.
+	gcIntervalTicks      int
+	gcTicksLeft          int
+	gcMinRetainSeqs      uint64
+	gcMinAdvanceSeqs     uint64
+	gcMaxVersionsPerPass uint32
+	gcMaxKeysPerPass     uint32
+	// gcProposalInFlight/gcProposalIndex track "no GC proposal already
+	// in flight" (§13.4): set when maybeProposeGC's own InputPropose is
+	// accepted, cleared either when that exact index actually applies
+	// (applyAdvanceGCWatermarkEntry) or on stepping down as leader —
+	// never on any other condition, since §13.4a's RequestID is a pure
+	// function of replicated state, so the next leader (possibly this
+	// same node re-elected) needs no cross-term memory of an
+	// unresolved attempt.
+	gcProposalInFlight bool
+	gcProposalIndex    raft.Index
 
 	// admission holds every internal/admission.Gate this node owns
 	// (docs/v0.6.0-plan.md §3.2's four lanes). Every acquisition happens
@@ -797,37 +911,54 @@ func Open(cfg Config) (*Node, error) {
 	}
 
 	n := &Node{
-		cfg:                cfg,
-		core:               core,
-		walog:              w,
-		storage:            st,
-		snapMgr:            snapMgr,
-		tr:                 tr,
-		identityHolder:     identityHolder,
-		logger:             cfg.Logger,
-		appliedIndex:       baseIndex,
-		clusterGeneration:  fsmachine.ClusterGeneration(),
-		waiters:            make(map[raft.Index]waiter),
-		ackSeq:             make(map[raft.NodeID]uint64, len(cfg.Peers)),
-		peerGenerations:    make(map[raft.NodeID]uint32, len(cfg.Peers)),
-		admission:          admissionGates,
-		maxClientWaiters:   cfg.MaxInflightProposals,
-		maxPendingReads:    cfg.MaxConcurrentReads,
-		proposeCh:          make(chan proposeReq),
-		controlCh:          make(chan controlProposeReq),
-		readIndexCh:        make(chan readIndexReq),
-		backupCh:           make(chan backupReq),
-		precheckCh:         make(chan precheckReq),
-		membershipCh:       make(chan membershipReq),
-		membershipStatusCh: make(chan membershipStatusReq),
-		releaseNoOpCh:      make(chan chan struct{}),
-		stopCh:             make(chan struct{}),
-		doneCh:             make(chan struct{}),
+		cfg:                  cfg,
+		core:                 core,
+		walog:                w,
+		storage:              st,
+		snapMgr:              snapMgr,
+		tr:                   tr,
+		identityHolder:       identityHolder,
+		logger:               cfg.Logger,
+		appliedIndex:         baseIndex,
+		clusterGeneration:    fsmachine.ClusterGeneration(),
+		waiters:              make(map[raft.Index]waiter),
+		ackSeq:               make(map[raft.NodeID]uint64, len(cfg.Peers)),
+		peerGenerations:      make(map[raft.NodeID]uint32, len(cfg.Peers)),
+		admission:            admissionGates,
+		maxClientWaiters:     cfg.MaxInflightProposals,
+		maxPendingReads:      cfg.MaxConcurrentReads,
+		leases:               newLeaseRegistry(),
+		maxLiveReadLeases:    cfg.MaxLiveReadLeases,
+		releaseLeaseCh:       make(chan uint64),
+		gcMinRetainSeqs:      cfg.GCMinRetainSeqs,
+		gcMinAdvanceSeqs:     cfg.GCMinAdvanceSeqs,
+		gcMaxVersionsPerPass: cfg.GCMaxVersionsPerPass,
+		gcMaxKeysPerPass:     cfg.GCMaxKeysPerPass,
+		proposeCh:            make(chan proposeReq),
+		controlCh:            make(chan controlProposeReq),
+		readIndexCh:          make(chan readIndexReq),
+		backupCh:             make(chan backupReq),
+		precheckCh:           make(chan precheckReq),
+		membershipCh:         make(chan membershipReq),
+		membershipStatusCh:   make(chan membershipStatusReq),
+		releaseNoOpCh:        make(chan chan struct{}),
+		stopCh:               make(chan struct{}),
+		doneCh:               make(chan struct{}),
 	}
 	n.fsmachine.Store(fsmachine)
 	n.metrics.RaftMessageProcessSeconds = metrics.NewHistogram(metrics.DefaultLatencyBounds...)
 	n.electionArmed = true
 	n.electionTicksLeft = core.NewElectionTimeout()
+	if cfg.GCInterval > 0 {
+		// GCInterval expressed in TickInterval units (docs/v0.6.0-plan.md
+		// §13.4) — 0 stays 0 (GC disabled, no evaluation ever) whenever
+		// cfg.GCInterval itself is 0, the default.
+		n.gcIntervalTicks = int(cfg.GCInterval / cfg.TickInterval)
+		if n.gcIntervalTicks < 1 {
+			n.gcIntervalTicks = 1
+		}
+		n.gcTicksLeft = n.gcIntervalTicks
+	}
 	n.refreshStatusLocked()
 
 	go n.run()
@@ -984,6 +1115,7 @@ func (n *Node) refreshStatusLocked() {
 	// site (less surface to miss one).
 	n.metrics.WaitersGauge.Set(int64(len(n.waiters)))
 	n.metrics.PendingReadsGauge.Set(int64(len(n.pendingReads)))
+	n.metrics.ReadLeasesActiveGauge.Set(int64(n.leases.Len()))
 
 	n.statusMu.Lock()
 	n.status = Status{
@@ -1382,34 +1514,54 @@ func (n *Node) Propose(ctx context.Context, cmd fsm.CommitTxnCommand) (fsm.Outco
 // read index, before returning it as a safe StartSeq watermark. Returns
 // NotLeaderError if this node is not leader, or ErrLeadershipLost if it
 // steps down before the check completes.
-func (n *Node) BeginReadIndex(ctx context.Context) (uint64, error) {
+//
+// On success, the returned *ReadLease must be released (Release is
+// idempotent) once the transaction it backs is done — Commit, Abort,
+// or the owning Session closing, on every exit path (docs/v0.6.0-
+// plan.md §15.3). It bounds the leader's proposed GC watermark
+// (§13.4/§14.2) for as long as it is held; a leaked lease stalls GC but
+// never makes it unsafe (the fail-safe direction), and
+// -read-lease-max-age force-expires an abandoned one.
+func (n *Node) BeginReadIndex(ctx context.Context) (uint64, *ReadLease, error) {
 	// The readGate slot is released when THIS CALL returns, not when
 	// the eventual transaction ends (docs/v0.6.0-plan.md §5.4, §9.1):
 	// holding it for a whole transaction would let a long-running,
-	// well-behaved reader consume admission capacity indefinitely. A
-	// read lease bounding transaction lifetime lands in a later slice
-	// (§15.3); this gate's job ends here.
+	// well-behaved reader consume admission capacity indefinitely. The
+	// read LEASE returned below is the mechanism with transaction
+	// lifetime; this gate's job ends here.
 	release, err := n.admission.read.Acquire(ctx)
 	if err != nil {
-		return 0, err
+		return 0, nil, err
 	}
 	defer release()
 
-	req := readIndexReq{resultCh: make(chan readResult, 1)}
+	// Pre-allocated here, before the request is even sent, so the
+	// cancellation path below can name this lease without having
+	// received a result (§15.3's lifecycle table) — handleReadIndex
+	// uses this id rather than generating its own.
+	leaseID := n.nextLeaseID.Add(1)
+
+	req := readIndexReq{leaseID: leaseID, resultCh: make(chan readResult, 1)}
 	select {
 	case n.readIndexCh <- req:
 	case <-ctx.Done():
-		return 0, ctx.Err()
+		return 0, nil, ctx.Err()
 	case <-n.doneCh:
-		return 0, ErrNodeStopped
+		return 0, nil, ErrNodeStopped
 	}
 	select {
 	case res := <-req.resultCh:
-		return res.startSeq, res.err
+		return res.startSeq, res.lease, res.err
 	case <-ctx.Done():
-		return 0, ctx.Err()
+		// The request may already have been dispatched and the lease
+		// already registered by the time ctx fired — release
+		// unconditionally; it is a harmless no-op if registration never
+		// happened.
+		releaseLease(n, leaseID)
+		return 0, nil, ctx.Err()
 	case <-n.doneCh:
-		return 0, ErrNodeStopped
+		releaseLease(n, leaseID)
+		return 0, nil, ErrNodeStopped
 	}
 }
 
@@ -1515,6 +1667,8 @@ func (n *Node) run() {
 			n.handleMembership(req)
 		case req := <-n.membershipStatusCh:
 			req.resultCh <- n.computeMembershipStatus()
+		case id := <-n.releaseLeaseCh:
+			n.leases.Release(id)
 		case ack := <-n.releaseNoOpCh:
 			// Test-only (ReleaseElectionNoOpForTest). Clearing the hold
 			// alone would leave a leader that already won its election
@@ -1541,6 +1695,7 @@ func (n *Node) shutdown() {
 		delete(n.waiters, idx)
 	}
 	for _, pr := range n.pendingReads {
+		n.leases.Release(pr.leaseID)
 		pr.resultCh <- readResult{err: ErrNodeStopped}
 	}
 	n.pendingReads = nil
@@ -1562,6 +1717,16 @@ func (n *Node) tick() {
 		if n.heartbeatTicksLeft <= 0 {
 			n.heartbeatArmed = false
 			n.step(raft.Input{Kind: raft.InputHeartbeatTimeout})
+		}
+	}
+	// gcIntervalTicks == 0 means GC is disabled (docs/v0.6.0-plan.md
+	// §10.2/§13.4/S-12): no ticker, no evaluation, ever — the exact
+	// v0.5.0-behavior guarantee release gate 9 requires.
+	if n.gcIntervalTicks > 0 {
+		n.gcTicksLeft--
+		if n.gcTicksLeft <= 0 {
+			n.gcTicksLeft = n.gcIntervalTicks
+			n.maybeProposeGC()
 		}
 	}
 }
@@ -1744,11 +1909,6 @@ func (n *Node) handleReadIndex(req readIndexReq) {
 	// slice after every processOutput, so its cost is on Lane K's
 	// critical path; this ceiling is what bounds that cost by a
 	// configured constant rather than by client read concurrency.
-	//
-	// (The companion live-read-lease ceiling §9.1a also specifies lands
-	// with the read-lease registry itself in a later slice — see
-	// docs/v0.6.0-plan.md §15.3/§33 slice 9 — since there is no lease to
-	// bound yet.)
 	if len(n.pendingReads) >= n.maxPendingReads {
 		n.metrics.AdmissionDefenseRejectionsPendingReadsTotal.Inc()
 		req.resultCh <- readResult{err: &admission.RejectedError{
@@ -1756,8 +1916,29 @@ func (n *Node) handleReadIndex(req readIndexReq) {
 		}}
 		return
 	}
+	// The live-read-lease ceiling (§9.1a): unlike the pendingReads
+	// ceiling above, this has no caller-side gate counterpart at all —
+	// it is the primary limiter for the lease registry, which outlives
+	// pendingReads (a lease is held for the whole transaction, §15.3).
+	if n.leases.Len() >= n.maxLiveReadLeases {
+		req.resultCh <- readResult{err: &admission.RejectedError{
+			Reason: admission.ReasonReadLeaseLimit, RetryAfter: admission.ReasonReadLeaseLimit.DefaultRetryAfter(),
+		}}
+		return
+	}
 	term0 := n.core.CurrentTerm()
 	target := n.core.LastIndex()
+	// Registered at CAPTURE, in the same statement sequence that
+	// captures target, before the pendingRead is appended
+	// (docs/v0.6.0-plan.md §15.3, resolved: registering at resolution
+	// instead would let the watermark overtake an already-captured
+	// boundary). Both the registry and the leader's own GC-watermark
+	// computation are mutated/read exclusively on this goroutine, so
+	// there is no window at all in which a read this leader has
+	// captured could receive a spurious ErrSnapshotTooOld. The id
+	// itself was allocated by the caller (BeginReadIndex), before this
+	// request was even sent.
+	n.leases.Register(req.leaseID, uint64(target))
 	// Every peer's ack must echo a request Seq strictly greater than
 	// sentSeqCounter's value right now — see Node.ackSeq's doc comment
 	// for why this must be a wire-carried, request-specific token
@@ -1772,7 +1953,7 @@ func (n *Node) handleReadIndex(req readIndexReq) {
 	// this node was still the legitimate leader after target was
 	// captured (docs/replication.md §4.1 steps 1-2).
 	out := n.core.Step(raft.Input{Kind: raft.InputHeartbeatTimeout})
-	n.pendingReads = append(n.pendingReads, pendingRead{term: term0, target: target, requiredSeq: requiredSeq, resultCh: req.resultCh})
+	n.pendingReads = append(n.pendingReads, pendingRead{term: term0, target: target, requiredSeq: requiredSeq, leaseID: req.leaseID, resultCh: req.resultCh})
 	n.processOutput(out)
 }
 
@@ -1792,6 +1973,11 @@ func (n *Node) checkPendingReads() {
 	remaining := n.pendingReads[:0]
 	for _, pr := range n.pendingReads {
 		if n.core.Role() != raft.Leader || n.core.CurrentTerm() != pr.term {
+			// Resolution failure (§15.3's lifecycle table): released
+			// immediately, here, at the same point the error is
+			// delivered — the caller never sees a lease, so it owes
+			// nothing.
+			n.leases.Release(pr.leaseID)
 			pr.resultCh <- readResult{err: ErrLeadershipLost}
 			continue
 		}
@@ -1817,7 +2003,11 @@ func (n *Node) checkPendingReads() {
 			remaining = append(remaining, pr)
 			continue
 		}
-		pr.resultCh <- readResult{startSeq: uint64(pr.target)}
+		// Successful resolution: the lease is already live (registered
+		// at capture) and is now handed to the caller, who owns
+		// releasing it (§15.3's lifecycle table).
+		lease := &ReadLease{n: n, id: pr.leaseID, startSeq: uint64(pr.target)}
+		pr.resultCh <- readResult{startSeq: uint64(pr.target), lease: lease}
 	}
 	n.pendingReads = remaining
 }
@@ -1880,6 +2070,12 @@ func (n *Node) processOutput(out raft.Output) {
 			w.resultCh <- proposeResult{err: ErrLeadershipLost}
 			delete(n.waiters, idx)
 		}
+		// §13.4a: no cross-term coordination is needed for an unresolved
+		// GC proposal — the next leader (possibly this same node,
+		// re-elected) simply reads its own applied gcPassSeq and
+		// proceeds, so this is a plain reset, not a resolution.
+		n.gcProposalInFlight = false
+		n.gcProposalIndex = 0
 	}
 	if out.BecameLeader {
 		n.metrics.LeaderChangesTotal.Inc()
@@ -1934,6 +2130,81 @@ func (n *Node) proposeElectionNoOp() {
 	if out.ProposalRejected {
 		return
 	}
+	n.processOutput(out)
+}
+
+// maybeProposeGC is the leader-only MVCC GC watermark proposer
+// (docs/v0.6.0-plan.md §13.4), called from tick() on every gcIntervalTicks
+// countdown (never at all when GC is disabled, gcIntervalTicks == 0).
+// Runs entirely on the event-loop goroutine — this IS the goroutine
+// InputPropose needs, so unlike Propose/BeginReadIndex there is no
+// channel hop into it, mirroring proposeElectionNoOp's identical shape.
+//
+// Never proposes on a follower, and never during a leadership
+// transition (simply finds Role != Leader and does nothing next tick).
+// Enforces the generation-3 floor independently on this, the leader
+// side (§23.4's two-sided gate — applyAdvanceGCWatermarkEntry is the
+// independent follower/apply-side half, already in place since slice 8).
+func (n *Node) maybeProposeGC() {
+	if n.core.Role() != raft.Leader || n.selfRemoved() {
+		return
+	}
+	if n.clusterGeneration < 3 {
+		return
+	}
+	if n.gcProposalInFlight {
+		return
+	}
+
+	f := n.fsmachine.Load()
+
+	// W = min(minLease, applied, floor) — docs/v0.6.0-plan.md §13.4.
+	// minLease is +inf (i.e. simply excluded) when no lease is live.
+	w := n.appliedIndex
+	if minLease, ok := n.leases.Min(); ok && minLease < w {
+		w = minLease
+	}
+	var floor uint64
+	if n.appliedIndex > n.gcMinRetainSeqs {
+		floor = n.appliedIndex - n.gcMinRetainSeqs
+	}
+	if floor < w {
+		w = floor
+	}
+
+	current := f.GCWatermark()
+	advance := w > current+n.gcMinAdvanceSeqs
+	cont := f.GCCursor() != "" // an unfinished pass at the current watermark
+	if !advance && !cont {
+		return
+	}
+
+	watermark := w
+	if current > watermark {
+		watermark = current // never propose a decrease
+	}
+	// Deterministic RequestID, a pure function of replicated state
+	// (§13.4a): distinct across continuation passes via gcPassSeq, but
+	// idempotent through controlOutcomes for a genuine retry of the
+	// identical pass (a leader crash mid-propose, or a replayed entry).
+	reqID := fsm.RequestID(fmt.Sprintf("\x00chronicledb-gc\x00w=%d\x00p=%d", watermark, f.GCPassSeq()))
+	payload := fsm.EncodeAdvanceGCWatermark(fsm.AdvanceGCWatermarkCommand{
+		RequestID: reqID, Watermark: watermark,
+		MaxVersions: n.gcMaxVersionsPerPass, MaxKeys: n.gcMaxKeysPerPass,
+	})
+
+	out := n.core.Step(raft.Input{Kind: raft.InputPropose, ProposeData: payload})
+	if out.ProposalRejected {
+		n.metrics.GCProposalsFailedTotal.Inc()
+		return
+	}
+	if out.PersistRequest == nil || len(out.PersistRequest.Entries) != 1 {
+		n.fail(fmt.Errorf("node: unexpected GC-propose output shape: %+v", out))
+		return
+	}
+	n.gcProposalInFlight = true
+	n.gcProposalIndex = out.PersistRequest.Entries[0].Index
+	n.metrics.GCProposalsTotal.Inc()
 	n.processOutput(out)
 }
 
@@ -2133,6 +2404,10 @@ func (n *Node) applyAdvanceGCWatermarkEntry(e raft.Entry) bool {
 	}
 	n.appliedIndex = uint64(e.Index)
 	n.core.SetApplied(e.Index)
+	if n.gcProposalInFlight && e.Index == n.gcProposalIndex {
+		n.gcProposalInFlight = false
+		n.gcProposalIndex = 0
+	}
 	n.resolveWaiter(e.Index, cmd.RequestID, outcome, nil)
 	return true
 }

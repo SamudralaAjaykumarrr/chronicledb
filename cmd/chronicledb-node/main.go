@@ -87,12 +87,28 @@ func main() {
 		// below (ADMISSION FAILS CLOSED: there is no "unlimited").
 		maxInflightProposals      = flag.Int("max-inflight-proposals", 256, "Lane B write concurrency, and the event-loop len(waiters) ceiling (BOUNDED ADMITTED WORK); 0 is a startup error, not \"unlimited\"")
 		maxConcurrentReads        = flag.Int("max-concurrent-reads", 512, "Lane B BeginReadIndex concurrency, and the event-loop len(pendingReads) ceiling; 0 is a startup error")
+		maxLiveReadLeases         = flag.Int("max-live-read-leases", 4096, "ceiling on simultaneously live read leases (§9.1a, §15.3); 0 is a startup error")
 		admissionQueueDepth       = flag.Int("admission-queue-depth", 256, "Lane B waiting-room capacity beyond the concurrency limits above (0 = reject immediately, never wait — a legitimate permanent configuration)")
 		admissionMaxWait          = flag.Duration("admission-max-wait", 500*time.Millisecond, "upper bound on queued wait before queue_timeout (0 = bounded only by the caller's own context)")
 		maxAdminConcurrency       = flag.Int("max-admin-concurrency", 2, "Lane A1 (control: membership, upgrade precheck/finalize, TLS reload) concurrency; 0 is a startup error")
 		maxMaintenanceConcurrency = flag.Int("max-maintenance-concurrency", 2, "Lane A2 (maintenance: backup, scrub) concurrency; each kind is additionally single-slot; 0 is a startup error")
 		maxPeerConnections        = flag.Int("max-peer-connections", 64, "bounded accept on the Raft peer listener (0 = unlimited, v0.5.0 behavior)")
 		peerIdleTimeout           = flag.Duration("peer-idle-timeout", 60*time.Second, "read deadline on an inbound peer connection, re-armed per frame (0 = no deadline, v0.5.0 behavior)")
+
+		// MVCC GC (docs/v0.6.0-plan.md §10.2). gcInterval's default (0)
+		// is GC's own "disabled" state (S-12) — not validated as a
+		// startup error, unlike the admission flags above, since 0 is
+		// exactly the intended out-of-the-box value for this release.
+		gcInterval           = flag.Duration("gc-interval", 0, "how often the leader evaluates and, if warranted, proposes a GC watermark advance (0 disables GC entirely)")
+		gcMinRetainSeqs      = flag.Uint64("gc-min-retain-seqs", 1024, "lag floor: the proposed watermark never exceeds appliedCommitSeq minus this")
+		gcMaxVersionsPerPass = flag.Uint64("gc-max-versions-per-pass", 4096, "bound on versions removed by one AdvanceGCWatermark Apply")
+		gcMaxKeysPerPass     = flag.Uint64("gc-max-keys-per-pass", 16384, "bound on keys examined by one AdvanceGCWatermark Apply")
+		gcMinAdvanceSeqs     = flag.Uint64("gc-min-advance-seqs", 256, "do not propose a watermark ADVANCE unless it would advance by at least this much (does not gate a continuation pass at an unchanged watermark)")
+		// -read-lease-max-age is NOT yet wired: the expiry sweep it
+		// requires (docs/v0.6.0-plan.md §15.3, a liveness-only
+		// mechanism — a leaked lease stalls GC but never makes it
+		// unsafe) is tracked as remaining work rather than declared
+		// here as a flag with no effect.
 
 		// HTTP server hardening (docs/v0.6.0-plan.md §10.1, §10.4 — the
 		// one v0.6.0 default-behavior change: on by default, since "no
@@ -215,6 +231,7 @@ func main() {
 	}{
 		{"max-inflight-proposals", *maxInflightProposals},
 		{"max-concurrent-reads", *maxConcurrentReads},
+		{"max-live-read-leases", *maxLiveReadLeases},
 		{"max-admin-concurrency", *maxAdminConcurrency},
 		{"max-maintenance-concurrency", *maxMaintenanceConcurrency},
 	} {
@@ -242,12 +259,19 @@ func main() {
 
 		MaxInflightProposals:      *maxInflightProposals,
 		MaxConcurrentReads:        *maxConcurrentReads,
+		MaxLiveReadLeases:         *maxLiveReadLeases,
 		AdmissionQueueDepth:       *admissionQueueDepth,
 		AdmissionMaxWait:          *admissionMaxWait,
 		MaxAdminConcurrency:       *maxAdminConcurrency,
 		MaxMaintenanceConcurrency: *maxMaintenanceConcurrency,
 		MaxPeerConnections:        *maxPeerConnections,
 		PeerIdleTimeout:           *peerIdleTimeout,
+
+		GCInterval:           *gcInterval,
+		GCMinRetainSeqs:      *gcMinRetainSeqs,
+		GCMinAdvanceSeqs:     *gcMinAdvanceSeqs,
+		GCMaxVersionsPerPass: uint32(*gcMaxVersionsPerPass),
+		GCMaxKeysPerPass:     uint32(*gcMaxKeysPerPass),
 	}
 
 	n, err := node.Open(cfg)

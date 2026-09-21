@@ -107,8 +107,11 @@ func newSingleLeaderNodeForTest(t *testing.T) *Node {
 		// handleReadIndex directly, which now gates on it (§9.1a). This
 		// helper never calls the exported BeginReadIndex, so admission
 		// itself is not needed.
-		maxPendingReads: defaultMaxConcurrentReads,
-		metrics:         testMetrics(),
+		maxPendingReads:   defaultMaxConcurrentReads,
+		metrics:           testMetrics(),
+		leases:            newLeaseRegistry(),
+		maxLiveReadLeases: defaultMaxLiveReadLeases,
+		releaseLeaseCh:    make(chan uint64, 8),
 	}
 }
 

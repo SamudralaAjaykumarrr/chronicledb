@@ -242,11 +242,11 @@ func NewReplicatedEngine(n *node.Node) Engine { return &replicatedEngine{n: n, g
 func (e *replicatedEngine) sqlGate() *admission.Gate { return e.gate }
 
 func (e *replicatedEngine) Begin(ctx context.Context) (Txn, error) {
-	startSeq, err := e.n.BeginReadIndex(ctx)
+	startSeq, lease, err := e.n.BeginReadIndex(ctx)
 	if err != nil {
 		return nil, err
 	}
-	return &replicatedTxn{ctx: ctx, node: e.n, startSeq: startSeq, writes: make(map[string]mvcc.Mutation)}, nil
+	return &replicatedTxn{ctx: ctx, node: e.n, startSeq: startSeq, lease: lease, writes: make(map[string]mvcc.Mutation)}, nil
 }
 
 func (e *replicatedEngine) LookupOutcome(requestID string) (RequestOutcome, bool) {
@@ -272,6 +272,11 @@ type replicatedTxn struct {
 	ctx      context.Context
 	node     *node.Node
 	startSeq uint64
+	// lease bounds the leader's proposed GC watermark for as long as
+	// this transaction is open (docs/v0.6.0-plan.md §15.3): released on
+	// every exit path (Commit, Abort) below. Release is idempotent, so
+	// it is safe to defer unconditionally regardless of outcome.
+	lease *node.ReadLease
 
 	writes map[string]mvcc.Mutation
 	order  []string
@@ -340,6 +345,7 @@ func txnIDFromRequestID(requestID string) uint64 {
 }
 
 func (r *replicatedTxn) Commit(requestID string) (uint64, error) {
+	defer r.lease.Release()
 	mutations := make([]mvcc.Mutation, 0, len(r.order))
 	for _, k := range r.order {
 		mutations = append(mutations, r.writes[k])
@@ -367,6 +373,7 @@ func (r *replicatedTxn) Commit(requestID string) (uint64, error) {
 }
 
 func (r *replicatedTxn) Abort() error {
+	defer r.lease.Release()
 	r.writes = nil
 	r.order = nil
 	return nil
