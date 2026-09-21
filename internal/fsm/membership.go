@@ -115,8 +115,8 @@ func (f *FSM) RecordMembershipOutcome(id RequestID, kind MembershipKind, nodeID,
 // reject the request outright without touching the original
 // RequestID's recorded outcome).
 func (f *FSM) GetMembershipOutcome(id RequestID, kind MembershipKind, nodeID, address string) (Outcome, error) {
-	f.mu.Lock()
-	defer f.mu.Unlock()
+	f.rLock()
+	defer f.rUnlock()
 	e, ok := f.membershipOutcomes[id]
 	if !ok {
 		return Outcome{}, ErrRequestIDUnknown

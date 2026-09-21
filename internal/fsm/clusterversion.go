@@ -203,7 +203,7 @@ func (f *FSM) ApplySetClusterVersion(index uint64, cmd SetClusterVersionCommand)
 // after restoring generation-0 state — docs/upgrades.md). Safe for
 // concurrent use.
 func (f *FSM) ClusterGeneration() uint32 {
-	f.mu.Lock()
-	defer f.mu.Unlock()
+	f.rLock()
+	defer f.rUnlock()
 	return f.clusterGeneration
 }

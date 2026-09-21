@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"sync"
+	"sync/atomic"
 
 	"github.com/SamudralaAjaykumarrr/chronicledb/internal/mvcc"
 )
@@ -45,8 +46,22 @@ type outcomeEntry struct {
 // §9), so FSM's own lock is mostly a second, independent safety net
 // (also what makes read-only accessors like GetOutcome safe to call
 // from any goroutine without additional coordination).
+//
+// mu is a sync.RWMutex, not a plain sync.Mutex (docs/v0.6.0-plan.md
+// §5.4a): Apply and every mutating control-command apply
+// (ApplySetClusterVersion, RecordMembershipOutcome,
+// ApplyAdvanceGCWatermark) take Lock(); every read-only accessor
+// (Precheck, GetOutcome, ClusterGeneration, GetMembershipOutcome,
+// EncodeState) takes RLock(). This is a pure concurrency change with no
+// effect on Apply's serialization (the event loop remains the only
+// writer) and no determinism/format implication — it is what makes
+// leaving /outcome, /status and similar read-only endpoints
+// deliberately ungated under client admission overload (§3.3) sound
+// rather than a lock-contention hazard on the event loop's own Apply
+// calls: Go's RWMutex blocks new readers once a writer is waiting, so a
+// stream of concurrent read-only calls cannot starve Apply.
 type FSM struct {
-	mu       sync.Mutex
+	mu       sync.RWMutex
 	store    *mvcc.Store
 	outcomes map[RequestID]outcomeEntry
 
@@ -68,6 +83,43 @@ type FSM struct {
 	// address}, deliberately excluding confirmVoterCount) differ from
 	// CommitTxn's.
 	membershipOutcomes map[RequestID]membershipOutcomeEntry
+
+	// exclusiveOutcomeLockForTest, when set via
+	// SetExclusiveOutcomeLockForTest, reverts every read-only accessor
+	// below back to f.mu.Lock() instead of f.mu.RLock() — AC-19's
+	// negative control (docs/v0.6.0-plan.md §5.4a, §29): with it set, a
+	// concurrent /outcome flood must be observed to move
+	// chronicledb_raft_message_process_seconds p99 outside baseline,
+	// proving the positive test would actually have caught the
+	// regression this field reverts. Never set in production.
+	exclusiveOutcomeLockForTest atomic.Bool
+}
+
+// SetExclusiveOutcomeLockForTest is AC-19's negative-control hook (see
+// exclusiveOutcomeLockForTest's doc comment). Test-only; production
+// code never calls it.
+func (f *FSM) SetExclusiveOutcomeLockForTest(exclusive bool) {
+	f.exclusiveOutcomeLockForTest.Store(exclusive)
+}
+
+// rLock/rUnlock are what every read-only FSM accessor below uses
+// instead of calling f.mu.RLock/RUnlock directly, so
+// SetExclusiveOutcomeLockForTest can revert all of them to exclusive
+// locking in one place.
+func (f *FSM) rLock() {
+	if f.exclusiveOutcomeLockForTest.Load() {
+		f.mu.Lock()
+	} else {
+		f.mu.RLock()
+	}
+}
+
+func (f *FSM) rUnlock() {
+	if f.exclusiveOutcomeLockForTest.Load() {
+		f.mu.Unlock()
+	} else {
+		f.mu.RUnlock()
+	}
 }
 
 // New returns an FSM that applies commands against store. store may
@@ -109,8 +161,8 @@ func (f *FSM) Store() *mvcc.Store { return f.store }
 //     §6) without touching the log or the original RequestID's
 //     recorded outcome.
 func (f *FSM) Precheck(cmd CommitTxnCommand) (Outcome, error) {
-	f.mu.Lock()
-	defer f.mu.Unlock()
+	f.rLock()
+	defer f.rUnlock()
 	return f.lookupLocked(cmd)
 }
 
@@ -131,8 +183,8 @@ func (f *FSM) lookupLocked(cmd CommitTxnCommand) (Outcome, error) {
 // "unknown" (docs/transactions.md §7.1), never guessed into success or
 // failure.
 func (f *FSM) GetOutcome(id RequestID) (outcome Outcome, ok bool) {
-	f.mu.Lock()
-	defer f.mu.Unlock()
+	f.rLock()
+	defer f.rUnlock()
 	entry, ok := f.outcomes[id]
 	return entry.outcome, ok
 }

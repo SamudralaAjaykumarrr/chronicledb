@@ -32,8 +32,8 @@ const fsmStateVersion uint8 = 1
 // that applied the identical command history produce byte-identical
 // EncodeState output (mirrored by TestEncodeStateDeterministic).
 func (f *FSM) EncodeState() []byte {
-	f.mu.Lock()
-	defer f.mu.Unlock()
+	f.mu.RLock()
+	defer f.mu.RUnlock()
 	return encodeState(f.store, f.outcomes, f.clusterGeneration, f.controlOutcomes, f.membershipOutcomes)
 }
 
