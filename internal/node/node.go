@@ -2037,19 +2037,36 @@ func (n *Node) adoptClusterGeneration(generation uint32) bool {
 }
 
 // applyControlEntry applies one committed FSM control-command entry
-// (fsm.ControlCommandMarker — currently only SetClusterVersionCommand),
-// resolving any waiter registered for its index exactly as
-// applyCommitted does for an ordinary CommitTxn entry. Returns false if
-// it called n.fail (an unrecoverable decode/capability/apply error),
-// mirroring applyCommitted's own early-return-on-failure control flow
-// — the caller must stop processing further entries in that case.
+// (fsm.ControlCommandMarker), dispatching on the control-kind byte
+// (docs/v0.6.0-plan.md §16.1: "must switch on the kind byte rather than
+// assume SetClusterVersion" — true starting this release, now that a
+// second control-command kind exists). Returns false if it called
+// n.fail (an unrecoverable decode/capability/apply error), mirroring
+// applyCommitted's own early-return-on-failure control flow — the
+// caller must stop processing further entries in that case.
 func (n *Node) applyControlEntry(e raft.Entry) bool {
+	kind, ok := fsm.ControlKind(e.Data)
+	if !ok {
+		n.fail(fmt.Errorf("node: committed control entry %d: %w: payload too short for a control-kind byte", e.Index, fsm.ErrMalformedCommand))
+		return false
+	}
+	switch kind {
+	case fsm.ControlKindSetClusterVersion:
+		return n.applySetClusterVersionEntry(e)
+	case fsm.ControlKindAdvanceGCWatermark:
+		return n.applyAdvanceGCWatermarkEntry(e)
+	default:
+		// NO SILENT FORMAT MISINTERPRETATION: an unrecognized control
+		// command kind fails closed here exactly like an unrecognized
+		// CommitTxn command version does below — never guessed at.
+		n.fail(fmt.Errorf("node: committed control entry %d: %w: kind %d", e.Index, fsm.ErrUnknownControlCommand, kind))
+		return false
+	}
+}
+
+func (n *Node) applySetClusterVersionEntry(e raft.Entry) bool {
 	cmd, err := fsm.DecodeSetClusterVersion(e.Data)
 	if err != nil {
-		// NO SILENT FORMAT MISINTERPRETATION: an unrecognized control
-		// command kind (fsm.ErrUnknownControlCommand) or a malformed
-		// payload both fail closed here exactly like an unrecognized
-		// CommitTxn command version does below.
 		n.fail(fmt.Errorf("node: decoding committed control entry %d: %w", e.Index, err))
 		return false
 	}
@@ -2086,6 +2103,36 @@ func (n *Node) applyControlEntry(e raft.Entry) bool {
 		n.logf("node %s: cluster generation finalized to %d at index %d", n.cfg.ID, cmd.TargetGeneration, e.Index)
 	}
 
+	n.resolveWaiter(e.Index, cmd.RequestID, outcome, nil)
+	return true
+}
+
+// applyAdvanceGCWatermarkEntry applies one committed AdvanceGCWatermark
+// entry (docs/v0.6.0-plan.md §14.4). The generation-3 gate is enforced
+// two-sided (§23.4): the leader-side proposer (a later slice) refuses
+// to propose below generation 3, and this is the independent follower-
+// side half — a committed entry of this kind at a generation below 3
+// should be structurally unreachable given a correct leader, so any
+// occurrence here is treated as an unrecoverable local inconsistency
+// (fail-closed), exactly like applySetClusterVersionEntry's own
+// capability check above.
+func (n *Node) applyAdvanceGCWatermarkEntry(e raft.Entry) bool {
+	if n.clusterGeneration < 3 {
+		n.fail(fmt.Errorf("node: committed entry %d is an AdvanceGCWatermark command, but this node's cluster generation is only %d (requires >= 3)", e.Index, n.clusterGeneration))
+		return false
+	}
+	cmd, err := fsm.DecodeAdvanceGCWatermark(e.Data)
+	if err != nil {
+		n.fail(fmt.Errorf("node: decoding committed control entry %d: %w", e.Index, err))
+		return false
+	}
+	outcome, err := n.fsmachine.Load().ApplyAdvanceGCWatermark(uint64(e.Index), cmd)
+	if err != nil {
+		n.fail(fmt.Errorf("node: applying committed control entry %d: %w", e.Index, err))
+		return false
+	}
+	n.appliedIndex = uint64(e.Index)
+	n.core.SetApplied(e.Index)
 	n.resolveWaiter(e.Index, cmd.RequestID, outcome, nil)
 	return true
 }

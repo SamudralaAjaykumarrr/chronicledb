@@ -12,7 +12,7 @@ func TestControlKindRangesNeverCollide(t *testing.T) {
 		byte(membershipKindAddLearnerMirror), byte(membershipKindPromoteVoterMirror),
 		byte(membershipKindRemoveServerMirror), byte(membershipKindVoidedMirror),
 	}
-	fsmRange := []byte{controlKindSetClusterVersion}
+	fsmRange := []byte{controlKindSetClusterVersion, controlKindAdvanceGCWatermark}
 	for _, r := range raftRange {
 		for _, f := range fsmRange {
 			if r == f {

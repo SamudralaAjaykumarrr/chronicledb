@@ -65,7 +65,14 @@ var Date = "unknown"
 // including its HasConfiguration bit (§7.1). No membership change may
 // be proposed (§8.2's leader-side gate) or applied (§8.2's follower-
 // side gate) below this generation.
-const MaxSupportedGeneration uint32 = 2
+//
+// Generation 3 (v0.6.0, docs/v0.6.0-plan.md §24.1) is defined as: this
+// binary understands the AdvanceGCWatermark FSM control command
+// (control kind 2), the fsm.StatusAbortedStale outcome status, and the
+// generation-3 snapshot-state trailing block carrying gcWatermark,
+// gcPasses, gcPassSeq, and gcCursor. No GC watermark advance may be
+// proposed or applied below this generation.
+const MaxSupportedGeneration uint32 = 3
 
 // String returns a single human-readable line combining Version,
 // Commit, and Date, suitable for a --version flag.

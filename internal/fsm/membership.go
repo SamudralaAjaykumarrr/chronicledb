@@ -29,14 +29,19 @@ const (
 // init structurally guarantees this package's control-kind range never
 // collides with internal/raft's reserved membership-change-kind range,
 // mirroring ControlCommandMarker's own existing non-collision guard
-// (clusterversion.go).
+// (clusterversion.go). Extended for docs/v0.6.0-plan.md §16.1's second
+// control-kind byte, controlKindAdvanceGCWatermark (gc.go) — every
+// control-kind byte this package ever defines must be checked here, not
+// only the first.
 func init() {
-	for _, k := range []membershipChangeKindMirror{
-		membershipKindAddLearnerMirror, membershipKindPromoteVoterMirror,
-		membershipKindRemoveServerMirror, membershipKindVoidedMirror,
-	} {
-		if byte(k) == controlKindSetClusterVersion {
-			panic(fmt.Sprintf("fsm: membership control-kind mirror (%d) collides with controlKindSetClusterVersion (%d)", k, controlKindSetClusterVersion))
+	for _, controlKind := range []byte{controlKindSetClusterVersion, controlKindAdvanceGCWatermark} {
+		for _, k := range []membershipChangeKindMirror{
+			membershipKindAddLearnerMirror, membershipKindPromoteVoterMirror,
+			membershipKindRemoveServerMirror, membershipKindVoidedMirror,
+		} {
+			if byte(k) == controlKind {
+				panic(fmt.Sprintf("fsm: membership control-kind mirror (%d) collides with control-kind byte (%d)", k, controlKind))
+			}
 		}
 	}
 }

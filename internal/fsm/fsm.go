@@ -84,6 +84,26 @@ type FSM struct {
 	// CommitTxn's.
 	membershipOutcomes map[RequestID]membershipOutcomeEntry
 
+	// gcWatermark/gcCursor/gcPasses/gcPassSeq are MVCC GC's replicated
+	// state (gc.go, docs/v0.6.0-plan.md §13.2/§13.4a/§14.4), encoded in
+	// the generation-3 snapshot trailing block (snapshot.go §16.2).
+	// Mutated only inside ApplyAdvanceGCWatermark, deterministically, as
+	// a pure function of the committed command and this prior state —
+	// never by any background goroutine (DETERMINISM BOUNDARY, §13.2).
+	gcWatermark uint64
+	// gcCursor is the resume point for the bounded, resumable keyspace
+	// walk (§14.4): "" means either "not started" or "a full pass just
+	// completed" (gcPasses distinguishes the two only diagnostically —
+	// both are valid resume-from-the-beginning states).
+	gcCursor string
+	// gcPasses counts completed full-keyspace walks.
+	gcPasses uint64
+	// gcPassSeq counts applied AdvanceGCWatermark commands — the
+	// leader's deterministic RequestID is a function of it (§13.4a), so
+	// a node that caught up by InstallSnapshot must arrive at the same
+	// value as one that replayed the log.
+	gcPassSeq uint64
+
 	// exclusiveOutcomeLockForTest, when set via
 	// SetExclusiveOutcomeLockForTest, reverts every read-only accessor
 	// below back to f.mu.Lock() instead of f.mu.RLock() — AC-19's
@@ -200,7 +220,8 @@ func (f *FSM) GetOutcome(id RequestID) (outcome Outcome, ok bool) {
 // (internal/txn.Manager.recover calls Apply for each record, in log
 // order, from a freshly constructed FSM).
 //
-// Apply's steps, exactly as specified by docs/transactions.md §4:
+// Apply's steps, exactly as specified by docs/transactions.md §4 and
+// extended by docs/v0.6.0-plan.md §15.4 for the GC horizon:
 //
 //  1. Idempotency check first: if cmd.RequestID already has a recorded
 //     outcome, return it (or ErrRequestIDPayloadMismatch on a
@@ -210,28 +231,37 @@ func (f *FSM) GetOutcome(id RequestID) (outcome Outcome, ok bool) {
 //     internal/txn.Manager's own single-writer path today, since it
 //     pre-checks Precheck before appending, but a future Raft-driven
 //     proposal path could in principle re-propose an already-committed
-//     RequestID — see docs/raft.md).
-//  2. Conflict check (docs/mvcc.md §4): for each mutated key, if its
+//     RequestID — see docs/raft.md). Deliberately first, so a retry of
+//     an already-decided RequestID still returns its recorded outcome
+//     even if it is now below the GC horizon (REQUEST OUTCOME STABILITY
+//     preserved exactly).
+//  2. Horizon check (docs/v0.6.0-plan.md §15.4, new in v0.6.0): if
+//     cmd.StartSeq < f.gcWatermark, the command deterministically
+//     aborts as StatusAbortedStale — the version(s) this transaction's
+//     snapshot needed may already have been reclaimed. This ordering
+//     (1-before-2) is load-bearing: idempotency always wins over a
+//     horizon that has since advanced past an already-decided command.
+//  3. Conflict check (docs/mvcc.md §4): for each mutated key, if its
 //     latest committed CommitSeq exceeds cmd.StartSeq, the whole
 //     command aborts; no mutation is applied. This is deterministic
 //     and reproducible on replay: replaying the identical prior command
 //     sequence into a fresh FSM reconstructs the identical committed
 //     state at every prior index, so the same command evaluated at the
 //     same index always reaches the same conflict decision.
-//  3. If no conflict: index becomes this command's CommitSeq, and every
+//  4. If no conflict: index becomes this command's CommitSeq, and every
 //     mutation is applied atomically at that CommitSeq.
-//  4. The terminal outcome (COMMITTED or ABORTED) is recorded for
-//     cmd.RequestID as part of this same call, before returning — so a
-//     crash between "Apply returned" and "outcome recorded" is not
-//     possible; there is no such gap (docs/invariants.md IDEMPOTENCY:
-//     "recording the outcome outside the atomic apply step" is exactly
-//     the threat this closes).
+//  5. The terminal outcome (COMMITTED or one of the two ABORTED
+//     variants) is recorded for cmd.RequestID as part of this same
+//     call, before returning — so a crash between "Apply returned" and
+//     "outcome recorded" is not possible; there is no such gap
+//     (docs/invariants.md IDEMPOTENCY: "recording the outcome outside
+//     the atomic apply step" is exactly the threat this closes).
 //
 // A non-nil error is returned only for an internal-consistency failure
 // (e.g. store.ApplyCommit's monotonicity check, which should be
 // unreachable given a correctly ordered index sequence) — never for a
-// legitimate ABORTED business outcome, which is a normal Outcome value,
-// not a Go error.
+// legitimate ABORTED/ABORTED_STALE business outcome, which is a normal
+// Outcome value, not a Go error.
 func (f *FSM) Apply(index uint64, cmd CommitTxnCommand) (Outcome, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -243,18 +273,23 @@ func (f *FSM) Apply(index uint64, cmd CommitTxnCommand) (Outcome, error) {
 	}
 
 	var outcome Outcome
-	if key, latest, conflict := f.store.CheckConflicts(cmd.StartSeq, cmd.Mutations); conflict {
-		outcome = Outcome{
-			RequestID:         cmd.RequestID,
-			Status:            StatusAborted,
-			ConflictKey:       key,
-			ConflictLatestSeq: latest,
+	switch {
+	case cmd.StartSeq < f.gcWatermark:
+		outcome = Outcome{RequestID: cmd.RequestID, Status: StatusAbortedStale}
+	default:
+		if key, latest, conflict := f.store.CheckConflicts(cmd.StartSeq, cmd.Mutations); conflict {
+			outcome = Outcome{
+				RequestID:         cmd.RequestID,
+				Status:            StatusAborted,
+				ConflictKey:       key,
+				ConflictLatestSeq: latest,
+			}
+		} else {
+			if err := f.store.ApplyCommit(index, cmd.Mutations); err != nil {
+				return Outcome{}, fmt.Errorf("fsm: applying command at index %d: %w", index, err)
+			}
+			outcome = Outcome{RequestID: cmd.RequestID, Status: StatusCommitted, CommitSeq: index}
 		}
-	} else {
-		if err := f.store.ApplyCommit(index, cmd.Mutations); err != nil {
-			return Outcome{}, fmt.Errorf("fsm: applying command at index %d: %w", index, err)
-		}
-		outcome = Outcome{RequestID: cmd.RequestID, Status: StatusCommitted, CommitSeq: index}
 	}
 
 	f.outcomes[cmd.RequestID] = outcomeEntry{outcome: outcome, fingerprint: fingerprintOf(cmd)}

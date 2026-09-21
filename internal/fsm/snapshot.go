@@ -34,7 +34,8 @@ const fsmStateVersion uint8 = 1
 func (f *FSM) EncodeState() []byte {
 	f.mu.RLock()
 	defer f.mu.RUnlock()
-	return encodeState(f.store, f.outcomes, f.clusterGeneration, f.controlOutcomes, f.membershipOutcomes)
+	return encodeState(f.store, f.outcomes, f.clusterGeneration, f.controlOutcomes, f.membershipOutcomes,
+		f.gcWatermark, f.gcCursor, f.gcPasses, f.gcPassSeq)
 }
 
 // encodeState serializes store/outcomes/clusterGeneration/controlOutcomes.
@@ -69,7 +70,8 @@ func (f *FSM) EncodeState() []byte {
 // StatusCommitted outcome — and that case is exactly when
 // clusterGeneration is already nonzero (the commit that recorded the
 // outcome is the same Apply call that advanced clusterGeneration).
-func encodeState(store *mvcc.Store, outcomes map[RequestID]outcomeEntry, clusterGeneration uint32, controlOutcomes map[RequestID]Outcome, membershipOutcomes map[RequestID]membershipOutcomeEntry) []byte {
+func encodeState(store *mvcc.Store, outcomes map[RequestID]outcomeEntry, clusterGeneration uint32, controlOutcomes map[RequestID]Outcome, membershipOutcomes map[RequestID]membershipOutcomeEntry,
+	gcWatermark uint64, gcCursor string, gcPasses, gcPassSeq uint64) []byte {
 	chains := store.Export() // already sorted by key
 
 	ids := make([]RequestID, 0, len(outcomes))
@@ -137,6 +139,11 @@ func encodeState(store *mvcc.Store, outcomes map[RequestID]outcomeEntry, cluster
 				size += 1 // status
 				size += 8 // CommitSeq
 			}
+		}
+		if clusterGeneration >= 3 {
+			// gcWatermark + gcPasses + gcPassSeq + gcCursorLen + gcCursor
+			// (docs/v0.6.0-plan.md §16.2).
+			size += 8 + 8 + 8 + 4 + len(gcCursor)
 		}
 	}
 
@@ -215,6 +222,17 @@ func encodeState(store *mvcc.Store, outcomes map[RequestID]outcomeEntry, cluster
 				binary.BigEndian.PutUint64(buf[off:], e.outcome.CommitSeq)
 				off += 8
 			}
+		}
+		if clusterGeneration >= 3 {
+			binary.BigEndian.PutUint64(buf[off:], gcWatermark)
+			off += 8
+			binary.BigEndian.PutUint64(buf[off:], gcPasses)
+			off += 8
+			binary.BigEndian.PutUint64(buf[off:], gcPassSeq)
+			off += 8
+			binary.BigEndian.PutUint32(buf[off:], uint32(len(gcCursor)))
+			off += 4
+			off += copy(buf[off:], gcCursor)
 		}
 	}
 	return buf[:off]
@@ -342,6 +360,9 @@ func DecodeState(data []byte) (*FSM, uint64, error) {
 		copy(fp[:], data[off:off+fingerprintSize])
 		off += fingerprintSize
 		status := Status(data[off])
+		if !validStatus(status) {
+			return nil, 0, fmt.Errorf("%w: outcome %d has unrecognized status byte %d", ErrMalformedCommand, i, status)
+		}
 		off++
 		commitSeq := binary.BigEndian.Uint64(data[off:])
 		off += 8
@@ -379,6 +400,8 @@ func DecodeState(data []byte) (*FSM, uint64, error) {
 	controlOutcomes := make(map[RequestID]Outcome)
 	membershipOutcomes := make(map[RequestID]membershipOutcomeEntry)
 	var clusterGeneration uint32
+	var gcWatermark, gcPasses, gcPassSeq uint64
+	var gcCursor string
 	if len(data)-off > 0 {
 		if len(data)-off < 8 {
 			return nil, 0, fmt.Errorf("%w: truncated cluster-generation trailing block", ErrMalformedCommand)
@@ -406,6 +429,9 @@ func DecodeState(data []byte) (*FSM, uint64, error) {
 				return nil, 0, fmt.Errorf("%w: truncated control outcome %d body", ErrMalformedCommand, i)
 			}
 			status := Status(data[off])
+			if !validStatus(status) {
+				return nil, 0, fmt.Errorf("%w: control outcome %d has unrecognized status byte %d", ErrMalformedCommand, i, status)
+			}
 			off++
 			commitSeq := binary.BigEndian.Uint64(data[off:])
 			off += 8
@@ -445,6 +471,9 @@ func DecodeState(data []byte) (*FSM, uint64, error) {
 				copy(fp[:], data[off:off+fingerprintSize])
 				off += fingerprintSize
 				status := Status(data[off])
+				if !validStatus(status) {
+					return nil, 0, fmt.Errorf("%w: membership outcome %d has unrecognized status byte %d", ErrMalformedCommand, i, status)
+				}
 				off++
 				commitSeq := binary.BigEndian.Uint64(data[off:])
 				off += 8
@@ -456,23 +485,65 @@ func DecodeState(data []byte) (*FSM, uint64, error) {
 				membershipOutcomes[id] = membershipOutcomeEntry{outcome: outcome, fingerprint: fp}
 			}
 		}
+		// Generation-3 trailing block (docs/v0.6.0-plan.md §16.2): MVCC
+		// GC's replicated state, gated on clusterGeneration >= 3 for the
+		// identical rollback-safety reason the membership block is gated
+		// on >= 2 — no AdvanceGCWatermark command can exist below
+		// generation 3 (§23.4's two-sided gate), so this block's absence
+		// below that generation is a fact, not a limitation.
+		if clusterGeneration >= 3 {
+			if len(data)-off < 8+8+8+4 {
+				return nil, 0, fmt.Errorf("%w: truncated GC trailing block", ErrMalformedCommand)
+			}
+			gcWatermark = binary.BigEndian.Uint64(data[off:])
+			off += 8
+			gcPasses = binary.BigEndian.Uint64(data[off:])
+			off += 8
+			gcPassSeq = binary.BigEndian.Uint64(data[off:])
+			off += 8
+			gcCursorLen := binary.BigEndian.Uint32(data[off:])
+			off += 4
+			if int64(gcCursorLen) > int64(len(data)-off) {
+				return nil, 0, fmt.Errorf("%w: truncated GC trailing block (cursor: declared %d, %d remain)", ErrMalformedCommand, gcCursorLen, len(data)-off)
+			}
+			gcCursor = string(data[off : off+int(gcCursorLen)])
+			off += int(gcCursorLen)
+		}
 		if off != len(data) {
 			return nil, 0, fmt.Errorf("%w: %d trailing bytes after decoding cluster-generation block", ErrMalformedCommand, len(data)-off)
 		}
 	}
 
-	// gcWatermark is always 0 through v0.6.0 slice 7: the generation-3
-	// trailing block that carries a real decoded value lands in slice 8
-	// (docs/v0.6.0-plan.md §16.2, §15.2b) — this call site is exactly
-	// where that decoded value will be threaded through once it exists.
-	// Passing it explicitly now (rather than overloading a zero-value
-	// struct field) is what RestoreStore's required parameter enforces.
-	const gcWatermark = 0
+	// RestoreStore requires the watermark as a parameter (§15.2b): it is
+	// impossible to construct a restored Store without one, so the
+	// read-side guard is live from the very first read on a restored
+	// node, never silently sitting at 0 while gcWatermark (below)
+	// already reflects the source's real value.
 	return &FSM{
 		store:              mvcc.RestoreStore(chains, gcWatermark),
 		outcomes:           outcomes,
 		controlOutcomes:    controlOutcomes,
 		membershipOutcomes: membershipOutcomes,
 		clusterGeneration:  clusterGeneration,
+		gcWatermark:        gcWatermark,
+		gcCursor:           gcCursor,
+		gcPasses:           gcPasses,
+		gcPassSeq:          gcPassSeq,
 	}, maxSeq, nil
+}
+
+// validStatus rejects any status byte outside the known set
+// (docs/v0.6.0-plan.md §15.6, extending NO SILENT FORMAT
+// MISINTERPRETATION): a v0.5.0 decoder read the status byte with no
+// validation at all, tolerable only because StatusAbortedStale can
+// never appear below generation 3, which the trailing-bytes check above
+// already fails closed on. v0.6.0 closes the gap independently of that
+// chain of reasoning, for every status byte this decoder ever reads.
+func validStatus(s Status) bool {
+	switch s {
+	case StatusCommitted, StatusAborted, StatusAbortedStale:
+		return true
+	default:
+		return false
+	}
 }
