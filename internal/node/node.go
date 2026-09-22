@@ -1160,6 +1160,7 @@ func Open(cfg Config) (*Node, error) {
 	n.pressureMon.Store(pressureSetup.mon)
 	n.fsmachine.Store(fsmachine)
 	n.metrics.RaftMessageProcessSeconds = metrics.NewHistogram(metrics.DefaultLatencyBounds...)
+	n.metrics.GCApplySeconds = metrics.NewHistogram(metrics.DefaultLatencyBounds...)
 	n.electionArmed = true
 	n.electionTicksLeft = core.NewElectionTimeout()
 	n.pressureMon.Load().Start()
@@ -2679,7 +2680,9 @@ func (n *Node) applyAdvanceGCWatermarkEntry(e raft.Entry) bool {
 		n.fail(fmt.Errorf("node: decoding committed control entry %d: %w", e.Index, err))
 		return false
 	}
+	applyStart := time.Now()
 	outcome, err := n.fsmachine.Load().ApplyAdvanceGCWatermark(uint64(e.Index), cmd)
+	n.metrics.GCApplySeconds.Observe(time.Since(applyStart).Seconds())
 	if err != nil {
 		n.fail(fmt.Errorf("node: applying committed control entry %d: %w", e.Index, err))
 		return false

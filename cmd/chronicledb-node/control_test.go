@@ -88,6 +88,7 @@ func TestControlServerMetricsExposesExpectedNames(t *testing.T) {
 		"chronicledb_read_leases_active",
 		"chronicledb_raft_message_process_seconds",
 		"chronicledb_mvcc_gc_watermark",
+		"chronicledb_mvcc_gc_apply_seconds",
 		"chronicledb_storage_health",
 	} {
 		if !strings.Contains(body, want) {

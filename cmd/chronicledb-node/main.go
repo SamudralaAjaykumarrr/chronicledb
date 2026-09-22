@@ -586,6 +586,7 @@ func (s *controlServer) handleMetrics(w http.ResponseWriter, r *http.Request) {
 	line("chronicledb_mvcc_versions", "total versions across all chains — the number GC is supposed to bound", "gauge", float64(versions))
 	line("chronicledb_mvcc_gc_watermark", "applied GC watermark", "gauge", float64(fsmState.GCWatermark()))
 	line("chronicledb_mvcc_gc_passes_total", "completed full-keyspace GC walks", "counter", float64(fsmState.GCPasses()))
+	m.GCApplySeconds.WriteProm(w, "chronicledb_mvcc_gc_apply_seconds", "§14.4's live service-time histogram for one committed AdvanceGCWatermark apply — the running counterpart to SL-2b's benchmark-backed flat-in-key-count proof")
 	line("chronicledb_requestid_outcomes", "distinct CommitTxn RequestIDs ever recorded — unbounded by design (§28.2), measured honestly rather than claimed stable", "gauge", float64(fsmState.OutcomesCount()))
 
 	// Admission control (docs/v0.6.0-plan.md §11.2). §5.3/§9.1a's two

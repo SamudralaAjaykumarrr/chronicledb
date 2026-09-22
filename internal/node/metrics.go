@@ -130,6 +130,16 @@ type Metrics struct {
 	// not valid — see its own doc comment).
 	RaftMessageProcessSeconds *metrics.Histogram
 
+	// GCApplySeconds is §14.4's own service-time histogram
+	// (chronicledb_mvcc_gc_apply_seconds, docs/v0.6.0-plan.md §30.3 step
+	// 4): one observation per committed AdvanceGCWatermark entry this
+	// node applies, covering the whole ApplyAdvanceGCWatermark call —
+	// the live counterpart to SL-2b's benchmark-backed flatness proof,
+	// letting an operator (or a real-process test) confirm the same
+	// "flat in total key count" property holds on an actual running
+	// node, not only in a microbenchmark.
+	GCApplySeconds *metrics.Histogram
+
 	// DiskProbeFailuresTotal counts every PressureMonitor sample whose
 	// DiskUsage call itself errored (docs/v0.6.0-plan.md §6.2's
 	// fail-safe direction) — chronicledb_disk_probe_failures_total.
@@ -182,6 +192,7 @@ type MetricsSnapshot struct {
 	GCProposalsFailedTotal uint64
 
 	RaftMessageProcessSeconds metrics.HistogramSnapshot
+	GCApplySeconds            metrics.HistogramSnapshot
 
 	DiskProbeFailuresTotal uint64
 
@@ -226,6 +237,7 @@ func (n *Node) Metrics() MetricsSnapshot {
 		GCProposalsFailedTotal: m.GCProposalsFailedTotal.Value(),
 
 		RaftMessageProcessSeconds: m.RaftMessageProcessSeconds.Snapshot(),
+		GCApplySeconds:            m.GCApplySeconds.Snapshot(),
 
 		DiskProbeFailuresTotal: m.DiskProbeFailuresTotal.Value(),
 
