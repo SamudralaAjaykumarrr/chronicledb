@@ -67,6 +67,17 @@ invented committed state.
     unconditional; recovery does not attempt to route around it.
  9. Restore Raft persistent metadata (currentTerm, votedFor) from the
     most recent HardState record (docs/raft.md §5).
+ 4a. (`v0.6.0`+, replicated mode) A snapshot restored at step 4 that
+    carries a generation-3+ trailing block (docs/snapshots.md §12)
+    additionally restores the replicated GC watermark, cursor, and
+    pass sequence into both `internal/fsm.FSM` and, via
+    `Store.SetGCWatermark`, `internal/mvcc.Store` itself —
+    `DecodeState` performs this as part of step 4, not as a separate
+    later step, so `Store.GCWatermark() == FSM.gcWatermark` holds
+    before this node's *first* read, never only "eventually" once some
+    later GC pass happens to run. This is what makes `GC SAFETY`
+    (docs/invariants.md) unconditional across a restart rather than
+    merely "usually true."
  9a. (`v0.5.0`+) Reconstruct the active cluster `Configuration` — the
     single, sole mechanism for this, on every restart with no
     exception: `ConfigAt(lastIndex())`, evaluated in one fixed priority
@@ -185,6 +196,19 @@ it to the cluster as if it were a brand-new node (full snapshot
 install + log catch-up, see [`docs/snapshots.md`](snapshots.md)).
 Automating this procedure is a plausible future enhancement, not a
 V1 correctness requirement — see [`docs/roadmap.md`](roadmap.md).
+
+**Detecting which case applies (`v0.6.0`).** `POST /admin/storage/scrub`
+(`internal/node.Scrub`, [`docs/storage-lifecycle.md`](storage-lifecycle.md))
+is the operator-facing tool for finding out *whether* a data directory
+is in one of the states this table describes, before an operator
+commits to the procedure above: it reads every retained WAL segment
+and snapshot file read-only (`storage.OpenSegmentReadOnly` —
+`SCRUB NON-DESTRUCTIVE`, [`docs/invariants.md`](invariants.md)) and
+reports framing/checksum/version/index-ordering findings. Consistent
+with `RECOVERY-NON-INVENTION`, scrub only ever reports — it never
+repairs, quarantines, or truncates anything itself
+(`docs/v0.6.0-plan.md` §21.5); the operator still performs the
+documented procedure above once a finding confirms corruption.
 
 ## 5. Recovery and idempotency (implemented, Phase 3)
 

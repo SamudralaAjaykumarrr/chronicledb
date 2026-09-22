@@ -422,6 +422,33 @@ surface, ADR-0013):
   not a silent zero-rows-affected success (§2.5); every `INSERT` column
   must be given a value, with no `NULL`/default fallback (§1.6).
 
+### 8a. Admission control and MVCC GC (`v0.6.0`)
+
+Every SQL statement — replicated or standalone — passes through a
+dedicated statement-admission gate (`internal/sql/engine.go`'s
+`newSQLGate`, an `internal/admission.Gate`) before execution, rejecting
+with the same `503`/`Reason` contract `docs/admission-control.md` §8
+documents for `/propose`. This is in addition to, not instead of, the
+node-level Lane B write/read gates a *replicated* statement also passes
+through — a standalone statement passes through the SQL gate only,
+since there is no `Node` underneath it to gate.
+
+**Standalone mode has no node-level admission protection and no MVCC
+GC.** `docs/admission-control.md`'s four-lane model, disk/heap
+pressure, and fsync-failure health are all `internal/node` mechanisms;
+a standalone `Engine` (`internal/sql.NewStandaloneEngine`, built
+directly on `internal/txn.Manager`) never constructs a `Node` at all,
+so none of that applies. Likewise, MVCC GC (`docs/storage-lifecycle.md`)
+is implemented and enabled only for replicated mode — deliberately: GC
+is decided by the *leader* and mutated only inside the *replicated*
+`Apply` path (`docs/mvcc.md` §9, `ADR-0020`), a concept with no meaning
+absent a Raft group. A standalone engine's version chains grow without
+bound for the lifetime of the process, exactly as they always have.
+Neither gap is a regression this release introduces — standalone mode
+never had either protection — but `v0.6.0` is the first release where
+replicated mode has both and standalone mode has neither, making the
+difference worth stating plainly here rather than leaving it implicit.
+
 ## 9. Testing and fuzzing
 
 `internal/sql`'s test suite (see `docs/testing-strategy.md` and

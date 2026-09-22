@@ -837,3 +837,180 @@ else that section specifies — background `/propose` writes, the
 post-election window, snapshot-in-flight, both restore steps, the
 mixed-binary variant — against genuine OS processes; only the SQL
 reader moves to this package's tier, for the structural reason above.
+
+## 13. `v0.6.0`: negative controls
+
+Applying §11's discipline to every new safety-critical gate Admission
+Control / Storage Lifecycle adds:
+
+- **Lane separation** (`docs/admission-control.md` §4):
+  `internal/node.Node.SetSkipAdmissionLaneSeparationForTest` disables
+  Rule CP-1/CP-2's structural lane separation. AC-7
+  (`internal/node/admission_behavior_test.go`,
+  `TestAC7_NegativeControl_LaneSeparationDisabledProducesElections`)
+  re-runs AC-6's identical saturation scenario with it set and asserts
+  elections *do* now occur — proving AC-6's own "zero elections"
+  result is actually evidence of the mechanism working, not an
+  artifact of a scenario too gentle to ever produce one.
+- **Horizon guard** (`docs/storage-lifecycle.md` §15.2):
+  `internal/mvcc.Store.SetSkipHorizonGuardForTest` disables the
+  `startSeq < gcWatermark` check inside `Visible`/`ScanVisible`. SL-3
+  drives GC SAFETY's positive property (SL-1) with it set and asserts
+  the harness's oracle detects the resulting silent stale read.
+- **`FSM.mu` exclusivity** (`docs/admission-control.md` §5.4a):
+  `internal/fsm.FSM.SetExclusiveOutcomeLockForTest` reverts every
+  read-only accessor from `f.mu.RLock()` back to `f.mu.Lock()`. AC-19's
+  negative control
+  (`internal/fsm/rwlock_test.go`'s
+  `TestExclusiveOutcomeLockForTestSerializesReads`, and the
+  `internal/node`/real-process tier built on top of it) proves a
+  concurrent-read regression is actually detected, not merely that the
+  `RWMutex` change compiles.
+- **Scrub calibration**: not a disable-hook on production code, but the
+  same "prove the detector can be wrong in both directions" idea
+  applied to `internal/wal.Scrub`/`internal/snapshot.Scrub`/
+  `internal/audit.Scrub`: a corruption-injection fixture must produce a
+  finding (the positive case, SL-10), and a **freshly torn tail in the
+  current, still-open segment** — legal per `docs/wal.md` §6, not
+  corruption — must produce **zero** findings (`internal/wal/
+  scrub_test.go`'s `TestScrub_TornTailInCurrentSegmentIsNotAFinding`,
+  paired with `TestScrub_CleanTreeZeroFindings`). A scrub that flagged
+  a legal torn tail would train operators to ignore its own output
+  (`docs/v0.6.0-plan.md` §21.3) — exactly as real a failure mode as
+  missing a genuine corruption.
+- **Snapshot-serve miss** (`docs/snapshots.md` §12): a leader can prune
+  a snapshot index between deciding a follower needs it and actually
+  filling the `InstallSnapshotRequest` bytes. SL-11 forces exactly this
+  race and asserts `chronicledb_snapshot_serve_miss_total` increments
+  and the follower still converges via retry — proving the self-healing
+  path, not merely that the miss is silently absorbed.
+- **Full-sort GC Apply**: `internal/fsm/gc_test.go`'s
+  `TestApplyAdvanceGCWatermark_SL2b_ApplyCostFlatInTotalKeyCount` grows
+  the total key count 10x with `MaxKeys`/`MaxVersions` fixed and asserts
+  `ApplyAdvanceGCWatermark`'s wall-clock cost and allocation count stay
+  flat — a per-`Apply` full sort of the keyspace (an easy, tempting
+  implementation mistake for the bounded keyspace walk `docs/
+  storage-lifecycle.md` §14.4 requires) fails this test immediately,
+  where a purely functional correctness test would not catch it at all.
+
+## 14. `v0.6.0`: AST-based structural tests as a reusable pattern
+
+`docs/dynamic-membership-plan.md` already introduced this pattern
+(`TestControlKindRangesNeverCollide`); `v0.6.0` establishes it as a
+named, repeatable technique rather than a one-off: parse the relevant
+package's own source with `go/parser`/`go/ast` (standard library only —
+`docs/dependencies.md`'s zero-external-dependency policy untouched),
+walk the AST for a specific forbidden call or identifier, and fail the
+test if it is reachable — a property a future refactor cannot silently
+regress past, checked by tooling rather than review discipline. Every
+instance is paired with a **negative control** proving the AST walk
+itself actually detects a violation (a deliberately-broken fixture, or
+a hook that reintroduces the forbidden pattern) — an AST test with no
+negative control can pass vacuously if the walk itself has a bug, the
+identical concern §11 raises for a disabled-mechanism negative control.
+
+Three `v0.6.0` instances, all following CP-2's original shape
+(`internal/node/admission_ast_test.go`):
+
+- **CP-2/CP-3** (`docs/admission-control.md` §4.2):
+  `TestAdmissionNeverReachableFromEventLoop` asserts no identifier from
+  `internal/admission` is reachable from `run()`'s own call graph (Rule
+  CP-2), and that Lane A1 and Lane A2 gates are mutually unreachable
+  from each other's entry points (Rule CP-3) — paired with
+  `TestAdmissionNeverReachableFromEventLoop_NegativeControl`.
+- **`Export` restriction** (SL-6b, `docs/storage-lifecycle.md` §15.2a):
+  `TestExportOnlyCalledFromSnapshotEncoding` asserts no package but
+  `internal/fsm` references `mvcc.Store.Export`.
+- **Read-only scrub** (SL-22, `docs/storage-lifecycle.md` §21.2,
+  `docs/invariants.md`'s `SCRUB NON-DESTRUCTIVE`):
+  `internal/node/scrub_ast_test.go`'s `TestScrubOnlyOpensReadOnly`
+  parses every file that implements a `Scrub` function
+  (`internal/wal`, `internal/snapshot`, `internal/audit`,
+  `internal/node` itself) and asserts none of them ever calls
+  `storage.OpenSegment` (the read-write constructor) or
+  `.Append`/`.Sync`/`.Truncate` — paired with
+  `TestScrubOnlyOpensReadOnly_NegativeControl`, a throwaway fixture
+  containing exactly the forbidden pattern.
+
+## 15. `v0.6.0`: the injected-`PressureSource` pattern
+
+`docs/admission-control.md` §6.1 requires that nothing on a request
+path or the event loop ever makes a syscall or calls `runtime/metrics`
+directly to sample disk/heap pressure — `internal/admission.
+PressureSource` is the seam that makes this both true in production
+(the concrete `internal/node.nodePressureSource`, combining
+`internal/storage.DiskUsage` and a `runtime/metrics` heap read) and
+independently testable without ever touching a real filesystem or
+sleeping for a real interval: `internal/node.Node.
+SetPressureSourceForTest` swaps in a `fakePressureSource` reporting
+caller-chosen `admission.Pressure` values, letting
+`internal/node/pressure_test.go` drive the full `Healthy -> LowSpace ->
+Critical -> LowSpace -> Healthy` hysteresis state machine
+deterministically, including the 10% de-escalation margin's exact
+boundary, with no real disk-filling step at all. AC-13's own "real
+filesystem" tier (`internal/node/ac13_test.go`) additionally proves the
+same state machine against a genuinely full small filesystem — the
+injected-source tests and the real-filesystem test are deliberately
+complementary, not redundant: the former proves the state machine's
+logic exhaustively and fast, the latter proves the real
+`internal/storage.DiskUsage` wiring underneath it is correct at all.
+
+## 16. `v0.6.0`: `internal/fault`'s Core-only limitation, all four substitutions
+
+`docs/v0.6.0-plan.md` §29.3 (deviation D10) documents that
+`internal/fault` imports only `internal/raft`: it has no `internal/fsm`,
+no `Node`, no event loop, no `internal/wal`, no `internal/snapshot`, and
+no `internal/storage`. Admission gates, the event loop, GC, and
+`maybeSnapshot`'s ordering all live entirely outside what its
+deterministic simulator can model. Continuing §12's precedent (moving a
+proof to the tier the codebase can actually support, rather than
+declaring it out of scope), four proof obligations retier from
+`internal/fault` to `internal/node`'s real-disk/real-TCP `testCluster`:
+
+1. **AC-6/AC-7** (lane separation / control-plane non-starvation under
+   saturation): `docs/admission-control.md` §9's own priority-lane test
+   originally specified `internal/fault`'s simulator; it runs instead
+   against a real three-node `testCluster`
+   (`internal/node/admission_behavior_test.go`), with §14 above's
+   negative control substituting for what a simulator-level fault
+   injection would have proven.
+2. **SL-2/SL-12** (GC chaos): `docs/storage-lifecycle.md`'s combined
+   chaos schedules, with "GC active" as a dimension, run at the same
+   `testCluster` tier (`internal/node/sl12_gc_chaos_test.go`) rather
+   than inside `internal/fault`, since GC does not exist at that layer
+   at all.
+3. **SL-8** (reclamation-boundary crash injection): needs a way to halt
+   the process at one of `maybeSnapshot`'s six ordering points or
+   `handleInstallSnapshot`'s three, deterministically, by index rather
+   than by timing — see §17 below for the facility this required
+   building, since neither `internal/fault` nor anything pre-existing
+   in `internal/node` could do this.
+
+Each substitution is a declared deviation with its own evidence, not a
+silent retiering — see `docs/v0.6.0-plan.md` §26 (D10) for the complete
+argument.
+
+## 17. `v0.6.0`: the `internal/node` crash-injection facility
+
+SL-8 and SL-26 needed a way to simulate an ungraceful process crash at
+one of nine specific points inside `maybeSnapshot` (six ordering
+points, `docs/v0.6.0-plan.md` §17.2) and `handleInstallSnapshot` (three
+points, §22) — selected deterministically by index, never by timing —
+which nothing pre-existing could provide. `internal/node/faultpoint.go`
+defines the `FaultPoint` enum and `triggerFaultPoint`, called
+unconditionally from each of those nine points in production code: in
+every ordinary build it is one atomic load of a nil hook pointer (a
+permanent, cheap no-op), and only a binary built with the `faulttest`
+build tag (`internal/node/faultpoint_hook.go`) can ever populate that
+hook via `SetFaultPointForTest` — no production binary, including every
+one `cmd/chronicledb-node` ships, links that file. When armed, the hook
+panics with a `faultPointCrash` sentinel, recovered exactly once in the
+same goroutine wrapper `run()` already starts from, letting `run()`'s
+own defer chain (ticker stop, shutdown) unwind normally first — the
+identical "ungraceful kill" fidelity `testCluster.crash`'s real
+`Node.Stop()` call already provides, so a faultpoint-crashed node
+recovers through exactly the same restart path a real `SIGKILL`-tested
+node does. This is the tier `internal/node/faultpoint_crash_test.go`
+and `internal/node/faultpoint_test.go` build SL-8/SL-26's actual crash-
+safety proofs on top of, and the tier §16 point 3 above names as
+`internal/fault`'s replacement for ordering-point crashes specifically.

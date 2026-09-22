@@ -123,6 +123,21 @@ terminology every other document depends on.
   authentication, RBAC, audit logging, certificate rotation.
 - [`backup.md`](backup.md) — `v0.3.0` Backup / Disaster Recovery / PITR:
   format, RPO/RTO model, restore runbook.
+- [`upgrades.md`](upgrades.md) — `v0.4.0` Compatibility / Rolling
+  Upgrades: the five versioned surfaces, cluster-generation finalize,
+  the runbook, and the honest rollback boundary.
+- [`membership.md`](membership.md) — `v0.5.0` Dynamic Membership:
+  adding/promoting/removing a node, the post-election "not ready"
+  window, decommissioning, and the full HTTP status/`reason`
+  vocabulary.
+- [`admission-control.md`](admission-control.md) — `v0.6.0` Admission
+  Control / Resource Protection: the four-lane model, every flag and
+  its default's justification, the `503` contract, and sizing/tuning
+  guidance.
+- [`storage-lifecycle.md`](storage-lifecycle.md) — `v0.6.0` Storage
+  Lifecycle: the replicated MVCC GC model, read leases, the disk-full
+  state machine, fsync-failure health, retention knobs, and the scrub
+  runbook.
 
 ### Packaging and releases (Phase 11)
 

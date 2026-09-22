@@ -121,6 +121,19 @@ before ever asking `internal/wal`/`internal/snapshot` to parse it.
   unless the caller explicitly forces it
   (`RestoreOptions.Force`/`-force-overwrite`) — this never silently
   overwrites a live cluster's data.
+- **Generation-3 content, older binary** (`v0.6.0`): a backup taken
+  from a cluster finalized to generation 3 (`docs/upgrades.md` §8b)
+  carries `internal/fsm`'s generation-3 trailing block
+  (`gcWatermark`/`gcCursor`/`gcPassSeq`) inside its snapshot component.
+  A `v0.5.0` binary attempting `-restore-from` against such a backup
+  fails closed — `internal/snapshot.Decode`'s own version check refuses
+  it before a single byte reaches the target directory, the identical
+  "never guess at a format newer than understood" posture every other
+  format boundary in this document already takes. Proven with a real
+  `v0.5.0` binary by
+  `cmd/chronicledb-node/sl17_mixed_binary_test.go`'s
+  `TestSL17_OldBinaryFailsClosedRestoringGeneration3Backup`; see
+  `docs/upgrades.md` §8b.
 
 ## 5. Restore
 
@@ -144,6 +157,26 @@ before ever asking `internal/wal`/`internal/snapshot` to parse it.
    the backup's own WAL copy and re-appends every entry up to and
    including the resolved boundary into a freshly-rebased WAL.
 6. Atomically promotes staging into `dataDir` (§4).
+
+**MVCC GC state (`v0.6.0`)**: when the source is at generation 3, step
+5's snapshot install carries the replicated GC watermark, cursor, and
+pass-sequence exactly as they stood at backup time — `Restore` invents
+nothing here either, the same "recovery from a portable source" posture
+as everything else in this section. `internal/fsm.DecodeState`
+re-establishes `internal/mvcc.Store.GCWatermark() ==
+FSM.gcWatermark` as a decode postcondition on the restored node before
+its first read (`docs/storage-lifecycle.md` §15.2b), so a transaction
+reading a `StartSeq` at or below the restored watermark is refused
+(`StatusAbortedStale`) immediately after restart, with no warm-up
+period during which a stale read could slip through. This holds both
+for a full restore and for one bounded by `-restore-until`: whichever
+generation-3 `AdvanceGCWatermark` entries fall within the resolved PITR
+boundary are replayed like any other committed entry, so an earlier
+`-restore-until` naturally yields a watermark no higher than a later
+one's. Proven end-to-end (both restore modes, plus a fresh write
+committing normally and a stale one refused) by
+`cmd/chronicledb-node/sl18_test.go`'s
+`TestSL18_BackupRestoreCarriesGCStateAndHorizonHoldsImmediately`.
 
 The result is, byte-for-byte, what `internal/node.Open` already expects:
 WAL segments at `dataDir`'s root, `dataDir/snapshot/` alongside. Restore

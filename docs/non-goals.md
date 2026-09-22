@@ -154,26 +154,90 @@ what would trigger revisiting it.
 
 ## MVCC version garbage collection (implementation, not the rule)
 
-- **Deferred**: the *implementation* of MVCC version GC. The *rule* is
-  already defined in [`docs/mvcc.md`](mvcc.md) §6 (`GCWatermark`) so
-  the data model does not need to change shape when GC is implemented.
-- **Why**: GC is a space/performance concern, not a correctness
-  requirement for the phases leading up to a working replicated
-  engine; implementing it prematurely, without the `GCWatermark`
-  bookkeeping proven correct, risks reclaiming a version an active
-  snapshot still needs.
-- **Revisit when**: measured memory growth from unbounded version
-  retention becomes a concrete problem (see
-  [`docs/roadmap.md`](roadmap.md) Phase 9+).
+- **Resolved, for replicated mode, as of `v0.6.0`**: the rule defined
+  in [`docs/mvcc.md`](mvcc.md) §6 (`GCWatermark`) is now implemented —
+  a replicated, leader-proposed, bounded-and-resumable watermark
+  advance (`docs/storage-lifecycle.md`, [`ADR-0020`](adr/0020-mvcc-gc-replicated-watermark.md)).
+  Ships disabled by default (`-gc-interval=0`) — see
+  [`docs/roadmap.md`](roadmap.md)'s `v0.6.0` entry for the named
+  `v1.0.0`-gate item this creates (GC-on-by-default).
+- **Still deferred**: GC for **standalone** (non-replicated) mode —
+  deliberately excluded, since the decision to propose a watermark
+  advance is leader-local and the mutation itself only ever happens
+  inside the replicated `Apply` path (`docs/mvcc.md` §9); there is no
+  equivalent concept without a Raft group. See
+  [`docs/sql.md`](sql.md) §8a.
+- **Why originally deferred through `v0.5.0`**: GC is a space/
+  performance concern, not a correctness requirement for the phases
+  leading up to a working replicated engine; implementing it
+  prematurely, without the `GCWatermark` bookkeeping proven correct,
+  risked reclaiming a version an active snapshot still needed.
+- **Revisit when** (standalone mode): a concrete, evidenced need for
+  bounded memory in long-running standalone/library use is scoped with
+  its own ADR.
 
 ## `RequestID` outcome garbage collection
 
 - **Deferred**: V1 retains `RequestID` outcomes indefinitely (see
   [`docs/transactions.md`](transactions.md) §6) rather than
-  implementing a GC/expiry policy now.
+  implementing a GC/expiry policy now. **Named, `v0.6.0`**: unlike MVCC
+  version data (now bounded — see the entry above), this table is
+  measured, not bounded: `chronicledb_requestid_outcomes`
+  (`docs/observability.md` §2.1a) grows with every distinct `RequestID`
+  a client ever sends, GC or no GC (`docs/storage-lifecycle.md` §28.2/
+  D6). This is a named `v1.0.0`-blocker with its own owner-release
+  entry — see [`docs/roadmap.md`](roadmap.md)'s `v0.6.0` row for the
+  exact framing (retention policy *or* a formal rescoping of the
+  "stable disk usage" claim). This entry alone does not satisfy that
+  gate; the roadmap entry, naming an owner release, is what does.
 - **Why**: unbounded retention is the safe default; a premature expiry
   policy risks expiring an outcome a legitimate, slow client retry
   still needs, silently reintroducing a duplicate-apply risk.
 - **Revisit when**: a safe expiry policy (e.g. client-acknowledged
   receipt, or a generous, explicitly justified fixed TTL) is designed
-  and given its own ADR.
+  and given its own ADR — no later than the `v1.0.0` gate named above.
+
+## Per-credential rate limiting
+
+- **Deferred**: rate limiting keyed to an authenticated principal/
+  credential (as opposed to `docs/admission-control.md`'s node-wide
+  resource-based admission, which has no notion of *who* is asking).
+- **Why**: `v0.6.0`'s admission control protects the node from
+  resource exhaustion regardless of source; per-credential fairness is
+  a separate, multi-tenancy-adjacent concern this project's V1 scope
+  (a single trusted operator per cluster, `docs/security.md` §2's
+  threat model) does not yet need.
+- **Revisit when**: a concrete multi-tenant or shared-credential
+  deployment scenario is scoped, with its own fairness model and ADR.
+
+## Adaptive admission
+
+- **Deferred**: admission ceilings that adjust themselves at runtime
+  from observed latency/throughput (e.g. a control-loop-tuned
+  concurrency limit), as opposed to `docs/admission-control.md`'s
+  fixed, operator-configured ceilings plus the one pressure-driven
+  exception (disk/heap tightening, itself a fixed two-threshold state
+  machine, not a continuously-adaptive one).
+- **Why**: a fixed ceiling is simpler to reason about and to prove
+  `BOUNDED ADMITTED WORK` against; an adaptive controller adds a new
+  class of failure mode (mistuning, oscillation) this release's own
+  gate-6 benchmark-derived defaults do not need to solve yet.
+- **Revisit when**: measured production load patterns show fixed
+  ceilings are operationally difficult to tune well, with a specific
+  proposed control law and its own ADR.
+
+## Tiered / cold storage
+
+- **Deferred**: moving older/cold WAL segments or snapshot data to
+  cheaper storage (object storage, a slower disk tier), as opposed to
+  `docs/storage-lifecycle.md`'s retention knobs, which only ever
+  retain-on-the-same-disk or delete.
+- **Why**: see [`docs/storage.md`](storage.md) §1's "smallest
+  technically real storage design" principle — a second storage tier
+  is exactly the kind of complexity this project defers until a
+  measured need exists, and `v0.6.0`'s own disk-pressure admission
+  already addresses the acute "about to run out of space" case without
+  it.
+- **Revisit when**: a specific, measured retention-cost or -capacity
+  limitation of single-tier local disk is demonstrated, with its own
+  ADR.

@@ -192,6 +192,42 @@ merely convenient: it is what lets §9's idempotency table resolve to
 the real outcome (committed or not) instead of risking a second,
 independent attempt at the same change.
 
+### 8a. Admission control (`v0.6.0`) never sheds a membership call
+
+Membership actions are Lane A1 (control plane), structurally disjoint
+from Lane B (client reads/writes) — `docs/admission-control.md` §3's
+four-lane model. `/admin/membership/*` acquires
+`internal/node`'s dedicated control admission gate
+(`internal/node/membership.go`), never the write/read gates a
+saturated client workload contends for, so a client-side overload that
+sheds `/propose`/read traffic under `docs/admission-control.md`'s
+admission control never blocks, delays, or sheds a membership call —
+proven under an actively saturating write load by
+`internal/node/ac11_ac12_test.go`'s
+`TestAC12_SaturationPlusMembershipChange_AdminLaneNeverBlocked`.
+
+`503` already existed in this document's own vocabulary (§8's table,
+above) for two membership-specific transient conditions. `v0.6.0`
+introduces a second, entirely separate `503` vocabulary —
+`internal/admission.Reason` (`docs/admission-control.md` §8.2:
+`queue_full`, `queue_timeout`, `concurrency_limit`, `disk_pressure`,
+`disk_critical`, `memory_pressure`, `read_lease_limit`,
+`admin_operation_in_progress`, `shutting_down`) — used for *client*
+Lane B admission rejections and Lane A2 (maintenance: backup/scrub)
+single-slot busy signals. This is additive, not a replacement: a
+membership call can still fail with this document's own
+`not-ready-inherited-suffix`/`not-ready-no-current-term-commit`
+reasons, on the identical `503` status code, and a caller must
+distinguish the two vocabularies by the `reason` field's actual string
+value, never by status code alone (§8's own opening rule, unchanged).
+The one exception where the two vocabularies *do* meet: a second
+concurrent call to the *same* Lane A2 maintenance kind (backup or
+scrub) is refused with `admission.ReasonAdminOperationInProgress`,
+`docs/admission-control.md`'s own analogue of this document's
+`change-in-progress` — see `docs/admission-control.md` §3.2a for why
+that is a Lane A2, not Lane A1, concern and therefore never applies to
+`/admin/membership/*` itself.
+
 ## 9. RBAC and audit
 
 `/admin/membership/add`, `/promote`, and `/remove` require the `admin`

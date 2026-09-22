@@ -82,6 +82,13 @@ func TestControlServerMetricsExposesExpectedNames(t *testing.T) {
 		"chronicledb_proposals_committed_total",
 		"chronicledb_requestid_duplicates_total",
 		"chronicledb_snapshots_created_total",
+		"chronicledb_admission_defense_rejections_total",
+		"chronicledb_node_waiters",
+		"chronicledb_node_pending_reads",
+		"chronicledb_read_leases_active",
+		"chronicledb_raft_message_process_seconds",
+		"chronicledb_mvcc_gc_watermark",
+		"chronicledb_storage_health",
 	} {
 		if !strings.Contains(body, want) {
 			t.Errorf("/metrics output missing %q", want)

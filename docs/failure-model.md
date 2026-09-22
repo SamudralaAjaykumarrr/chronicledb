@@ -111,15 +111,76 @@ Covered in full in [`docs/wal.md`](wal.md) §6. Summary:
 - **Invariants**: `DURABILITY`.
 - **Future tests**: fault-injected write/fsync error return codes at
   each pipeline stage.
+- **Status (`v0.6.0`)**: the Raft durable path (`ApplyPersistRequest`)
+  is unchanged from the description above — a failure there still
+  halts the node (`Node.fail`) — but now classifies the error
+  (`wal.ErrOutOfSpace`/generic I/O), emits an audit record, and marks
+  `/health` not-ready *before* the halt, so an operator learns why
+  rather than finding a stopped process
+  (`chronicledb_fsync_failures_total{path="raft"}`). Non-Raft durable
+  paths — snapshot creation and backup export — no longer halt the
+  node at all: each failure increments a consecutive-failure counter,
+  and reaching `-fsync-failure-threshold` (default 3) marks the node
+  storage-unhealthy (`/health` not-ready, an audit record,
+  `chronicledb_storage_health = 1`) while it keeps participating in
+  Raft (voting, replicating) as long as the consensus path still
+  works. A single subsequent success on that path resets the counter
+  and, if already unhealthy, restores readiness — no restart required.
+  See [`docs/storage-lifecycle.md`](storage-lifecycle.md) and §28.1's
+  table below for the complete picture, and `ADR-0021` for why the
+  Raft/non-Raft split is drawn where it is.
 
 ### 1.9 Out-of-space condition
 
 - Treated the same as a disk write failure (§1.8) at the storage
-  layer: the write fails explicitly. Graceful degradation (e.g.
-  proactive space-based backpressure before the OS reports `ENOSPC`)
-  is a possible future enhancement, not a V1 correctness requirement;
-  V1's requirement is only that an out-of-space condition never be
-  silently treated as success.
+  layer: the write fails explicitly. Through `v0.5.0` this section
+  described graceful degradation (proactive space-based backpressure
+  before the OS reports `ENOSPC`) as a possible future enhancement.
+- **Status (`v0.6.0`)**: implemented — see
+  [`docs/admission-control.md`](admission-control.md) (the disk-pressure
+  admission states, `LowSpace`/`Critical`, that tighten or refuse
+  client writes before the filesystem actually fills) and
+  [`docs/storage-lifecycle.md`](storage-lifecycle.md) (the `ENOSPC`
+  classification into `wal.ErrOutOfSpace`/`storage.ErrOutOfSpace`, so a
+  real out-of-space condition is never conflated with a transaction
+  conflict, a generic I/O error, or an admission rejection —
+  `DISK-FULL EXPLICITNESS`, [`docs/invariants.md`](invariants.md)).
+  Recovery once space is freed is automatic, with no restart, in both
+  the admission-pressure and the actual-`ENOSPC` case.
+
+### 1.10 Admission Control / Storage Lifecycle failure-semantics table (`v0.6.0`)
+
+Merged in from `docs/v0.6.0-plan.md` §28.1 — see
+[`docs/admission-control.md`](admission-control.md) and
+[`docs/storage-lifecycle.md`](storage-lifecycle.md) for the mechanisms
+behind each row.
+
+| Condition | May be lost | Must survive | Must never happen | Client sees |
+|---|---|---|---|---|
+| Admission queue full | Nothing | Everything | Silent drop; unbounded block; partial proposal | `503` `queue_full`, retryable |
+| Concurrency limit hit | Nothing | Everything | Admitting past the bound | `503` `concurrency_limit` |
+| Disk headroom below pressure threshold | Nothing | Everything | Deleting data to make room | Reduced write concurrency; `503` `disk_pressure` when saturated |
+| Disk headroom below critical threshold | Nothing | Everything; reads and consensus continue | Refusing Raft traffic | `503` `disk_critical` |
+| Actual `ENOSPC` on the Raft path | The failed write only | Everything already durable | Treating it as success; reporting it as an SI abort | Explicit classified error; node halts (`v0.5.0` behavior) |
+| Actual `ENOSPC` on a non-Raft path | That operation only | Everything | Silently ignoring it | Explicit error; consecutive-failure counter |
+| fsync failure, Raft path | The failed write | Everything already durable | Continuing as if synced | Node halts with a classified error + audit record |
+| fsync failure, non-Raft path, below threshold | That operation | Everything | Silently ignoring it | Explicit error; node stays ready |
+| fsync failures reaching threshold | — | Everything durable | Continuing to advertise readiness | `/health` not-ready; audit record |
+| GC crash mid-Apply | Nothing | Everything | Premature removal; a nondeterministic result | Nothing; replay reproduces it exactly |
+| Transaction below the GC horizon | That transaction | Everything | A silent stale read | `ErrSnapshotTooOld` on read; `ABORTED_STALE` on commit |
+| Read lease leaked | Nothing | Everything | Unsafe reclamation | GC stalls until `-read-lease-max-age`; metric rises |
+| Scrub finds corruption | Nothing | Everything | Automatic repair; modifying state | A report with findings; audit record |
+| Scrub races a compaction | Nothing | Everything | Reporting a compacted-away file as corrupt | `os.IsNotExist` skipped silently |
+| Pressure probe fails | Nothing | Everything | Assuming healthy | `LowSpace`; probe-failure counter |
+| Admission component bug | Nothing | Everything | Bypassing the limit | Event-loop ceiling rejects; defense counter rises |
+
+Two honest limits `v0.6.0` does not fix, named rather than silently
+left out — see [`docs/storage-lifecycle.md`](storage-lifecycle.md) for
+the full reasoning: the `RequestID` outcome table (`fsm.outcomes`)
+grows without bound regardless of GC (measured via
+`chronicledb_requestid_outcomes`, tracked as a `v1.0.0` blocker in
+[`docs/roadmap.md`](roadmap.md)); and a fully-deleted key's final
+tombstone is never reclaimed (`docs/mvcc.md` §9).
 
 ## 2. Raft / replication failures
 

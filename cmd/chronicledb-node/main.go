@@ -588,6 +588,17 @@ func (s *controlServer) handleMetrics(w http.ResponseWriter, r *http.Request) {
 	line("chronicledb_mvcc_gc_passes_total", "completed full-keyspace GC walks", "counter", float64(fsmState.GCPasses()))
 	line("chronicledb_requestid_outcomes", "distinct CommitTxn RequestIDs ever recorded — unbounded by design (§28.2), measured honestly rather than claimed stable", "gauge", float64(fsmState.OutcomesCount()))
 
+	// Admission control (docs/v0.6.0-plan.md §11.2). §5.3/§9.1a's two
+	// event-loop ceilings: a normal operating signal under client
+	// cancellation, not a bug signal — see docs/admission-control.md §4.
+	fmt.Fprintf(w, "# HELP %s %s\n# TYPE %s %s\n", "chronicledb_admission_defense_rejections_total", "an event-loop ceiling (not the admission gate itself) rejected a caller", "chronicledb_admission_defense_rejections_total", "counter")
+	fmt.Fprintf(w, "chronicledb_admission_defense_rejections_total{ceiling=\"waiters\"} %d\n", m.AdmissionDefenseRejectionsWaitersTotal)
+	fmt.Fprintf(w, "chronicledb_admission_defense_rejections_total{ceiling=\"pending_reads\"} %d\n", m.AdmissionDefenseRejectionsPendingReadsTotal)
+	line("chronicledb_node_waiters", "len(n.waiters) — the authoritative BOUNDED ADMITTED WORK ceiling for client writes", "gauge", float64(m.WaitersGauge))
+	line("chronicledb_node_pending_reads", "len(n.pendingReads) — the authoritative ceiling for pending BeginReadIndex calls", "gauge", float64(m.PendingReadsGauge))
+	line("chronicledb_read_leases_active", "currently live read leases (§15.3)", "gauge", float64(m.ReadLeasesActiveGauge))
+	m.RaftMessageProcessSeconds.WriteProm(w, "chronicledb_raft_message_process_seconds", "Lane K's own per-message service-time histogram — the CONTROL-PLANE NON-STARVATION proof metric, unaffected by admission state by construction")
+
 	// Compatibility / Rolling Upgrades metrics (docs/enterprise-v1-plan.md
 	// §7 Observability: "cluster version gauge, per-node reported-version
 	// gauge... precheck pass/fail history, finalize event... as a

@@ -245,6 +245,43 @@ future Operations phase (`docs/enterprise-v1-plan.md` §11); today, use
 `internal/audit.ReadAll`/`Verify` as a library, or inspect it with the
 package's own tests as a reference.
 
+### 8a. Storage-integrity scrub, and node-health audit events (`v0.6.0`)
+
+`POST /admin/storage/scrub` is `admin`-role only (`internal/authz.
+EndpointStorageScrub`) — the same posture as `/fault` and membership
+changes, since a full scrub is a bulk, rate-limited read of every
+retained WAL segment and snapshot file, not an ordinary operational
+action. `GET /admin/storage/status` (the last scrub's report) is
+`operator`+, read-only, mirroring `/admin/membership/status`'s own
+openness. Both endpoints are wired through the identical
+`security.wrap` middleware chain as every other administrative route;
+a scrub call produces exactly one audit record
+(`cmd/chronicledb-node/storage.go`'s `recordStorageAudit`), success or
+failure, same as `/admin/backup`.
+
+`v0.6.0` also appends audit records for node-health state transitions
+that no HTTP request ever triggers directly: entering/leaving disk
+pressure (`node.pressure_state`), storage becoming unhealthy or healthy
+again (`node.storage_unhealthy`/`node.storage_healthy`, §20.2's
+consecutive-fsync-failure threshold), and a classified fsync failure on
+the Raft durable path immediately before the node halts
+(`node.raft_fsync_failure`) — see `docs/storage-lifecycle.md` §19-§20.
+These are appended by `internal/node` itself
+(`Config.AuditLog`/`internal/node/pressure.go`'s `auditHealth`), not by
+the HTTP layer, with `Principal: "node"`, `Role: "system"`.
+
+**Behavior change**: because these events must be recorded regardless
+of whether client authentication is configured at all, `v0.6.0` opens
+the audit log **unconditionally** at startup — previously (`v0.1.0`
+through `v0.5.0`), `-auth-mode=none` (the default) meant the audit log
+was never opened and `<datadir>/audit` (or `-audit-log-dir`) was never
+created. As of `v0.6.0`, that directory is always created and written
+to, even with authentication disabled. `cmd/chronicledb-node` opens
+exactly one `*audit.Log` per process and shares it between this
+node-health auditing and the pre-existing request-level auditing —
+two independent `*audit.Log` instances appending to the same on-disk
+hash chain would corrupt it.
+
 ## 9. Non-goals (unchanged from `docs/enterprise-v1-plan.md` §5)
 
 - OIDC/SSO/LDAP/SAML integration.

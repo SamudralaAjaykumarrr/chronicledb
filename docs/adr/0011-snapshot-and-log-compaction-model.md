@@ -72,3 +72,19 @@ snapshot install when the required log range has been compacted away.
   covering normal restore, crash during creation, interrupted
   installation, corruption, follower catch-up, and safe truncation
   ordering.
+
+## Extended by `v0.6.0`, and how
+
+`v0.6.0` adds two retention knobs on top of this ADR's existing
+single-snapshot model without changing it: `-snapshot-retain-count`
+(retaining more than one snapshot file, shrinking the window a
+snapshot-serve-miss can occur in) and `-wal-retain-extra-segments`
+(retaining whole log segments past the compaction boundary this ADR
+already established, so a lagging follower can sometimes catch up by
+log replication instead of a full snapshot transfer). Neither changes
+"MVCC version GC, Raft log compaction, and database snapshots remain
+three distinct mechanisms" — MVCC GC (`docs/storage-lifecycle.md`,
+[`ADR-0020`](0020-mvcc-gc-replicated-watermark.md)) is a fourth,
+newly-implemented mechanism reclaiming *memory*, never a file this
+ADR's own compaction model governs. See `docs/wal.md` §15 and
+`docs/snapshots.md` §12 for the full `v0.6.0` decisions.

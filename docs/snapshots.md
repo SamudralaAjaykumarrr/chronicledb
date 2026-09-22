@@ -173,6 +173,19 @@ Before a snapshot is used for recovery or installed on a follower:
   validation on arrival rejects it and requests re-transmission; it
   never installs a snapshot it cannot verify.
 
+**`-snapshot-retain-count` (`v0.6.0`, default `1`).**
+`internal/snapshot.Manager.SetRetainCount(n)` raises how many of the
+newest snapshot files `Manager.Prune` keeps, from the default of
+exactly `1` (today's — and every prior release's — exact behavior).
+Retaining more than one never changes the "at least one valid snapshot
+present at every instant" guarantee this document already requires
+(§3's atomic create-before-any-deletion ordering) — it only widens the
+window in which a leader can still serve an older boundary a follower
+was asked for before that boundary was pruned, shrinking the
+`chronicledb_snapshot_serve_miss_total` hazard §12 below names. `n < 1`
+is refused at startup, the same posture `-wal-retain-extra-segments`
+takes for a negative value (`docs/wal.md` §15).
+
 ## 7. Follower snapshot installation
 
 When a follower is too far behind for normal log replication to catch
@@ -229,6 +242,16 @@ recovery correctly re-deriving it).
   of a leader deciding when a follower needs a snapshot instead of a
   log range (§7).
 
+**Restated (`v0.6.0`) — the reclamation boundary, precisely.** No
+durable WAL segment or snapshot file is ever deleted before the
+snapshot that supersedes it is fully written, `fsync`'d, recorded in
+durable WAL metadata, and has had `HardState` re-affirmed; and nothing
+above that boundary is ever deleted. This is `RECLAMATION BOUNDARY`
+([`docs/invariants.md`](invariants.md)) — the same ordering this
+section already required, named and proof-obligated explicitly because
+`v0.6.0`'s retention knobs (`-wal-retain-extra-segments`,
+`-snapshot-retain-count` above) touch the same code paths.
+
 ## 9. Relationship to MVCC GC and Raft log compaction
 
 Three distinct mechanisms, easy to conflate, kept explicitly separate:
@@ -237,7 +260,7 @@ Three distinct mechanisms, easy to conflate, kept explicitly separate:
 |---|---|---|---|
 | **Database (state-machine) snapshot** | Nothing by itself — it is a checkpoint, a byproduct that *enables* the other two | Log growth threshold | This document |
 | **Raft log compaction** | Durable WAL segments/entries at or before a snapshot's `lastIncludedIndex` | A confirmed, valid snapshot existing (§8) | This document §8, [`docs/wal.md`](wal.md) §7 |
-| **MVCC version garbage collection** (not implemented in V1) | Old, no-longer-visible-to-any-snapshot MVCC versions of a key | `GCWatermark` advancing past a version's superseding version's `CommitSeq` | [`docs/mvcc.md`](mvcc.md) §6 |
+| **MVCC version garbage collection** (implemented `v0.6.0`, replicated mode only) | Old, no-longer-visible-to-any-snapshot MVCC versions of a key | A replicated `AdvanceGCWatermarkCommand`, applied identically by every replica inside `fsm.Apply` — never a per-node background process | [`docs/mvcc.md`](mvcc.md) §6, §9; [`docs/storage-lifecycle.md`](storage-lifecycle.md) |
 
 A database snapshot capturing "current live state" and MVCC GC
 "removing old versions" are related (a snapshot only needs to persist
@@ -367,3 +390,38 @@ snapshot is read by the real startup path of a live node, not only by
 `cmd/chronicledb-node`'s test suite rather than this package's own.
 `docs/backup.md` §10a covers the equivalent real-`v0.4.0`-binary proof
 for backup/restore.
+
+## 12. `v0.6.0` decisions (Admission Control / Storage Lifecycle)
+
+`docs/v0.6.0-plan.md` §16.2/§18, [`docs/storage-lifecycle.md`](storage-lifecycle.md),
+and `ADR-0020`/`ADR-0021` are the full architecture.
+
+- **The snapshot-serve-miss hazard.** A leader deciding a follower
+  needs `MsgInstallSnapshotRequest` bytes for index `X`, and the leader
+  actually filling those bytes moments later, are two separate steps —
+  a snapshot created (and an old one pruned) by this same leader's own
+  `maybeSnapshot` cycle can land in between them, self-healing away the
+  very file the leader just promised to serve. `internal/node.processOutput`
+  detects exactly this (`n.snapMgr.Bytes` returning "not found" for the
+  requested index), increments `chronicledb_snapshot_serve_miss_total`,
+  and skips that round rather than failing — `raft.Core` re-derives a
+  request for the follower's now-current needed index on the next
+  heartbeat, so the follower still converges, just one round later.
+  Nonzero is an expected, bounded operating signal, not a bug by
+  itself; `-snapshot-retain-count`/`-wal-retain-extra-segments` (§6,
+  `docs/wal.md` §15) both exist partly to shrink this window.
+- **The generation-3 trailing block.** `internal/fsm.EncodeState`/
+  `DecodeState` gain a fourth trailing block — `gcWatermark uint64`,
+  `gcCursor string`, `gcPassSeq uint64` — appended only at write-version
+  `>= 3` (the same additive-and-conditional discipline
+  [`docs/wal.md`](wal.md) §14 and this document's own §10/§11 already
+  use: a pre-generation-3 snapshot is byte-identical to what a
+  generation-2 binary would have produced). `DecodeState` calls
+  `Store.SetGCWatermark` as part of restoring this block, so
+  `Store.GCWatermark() == FSM.gcWatermark` holds on a restored or
+  installed node *before its first read* — the equality `GC SAFETY`
+  ([`docs/invariants.md`](invariants.md)) depends on. This document's
+  own outer frame (§2, §11) needed no change at all for this addition,
+  for the identical reason `v0.4.0`'s cluster-generation field needed
+  none (§10): the FSM state blob is, by construction, opaque to this
+  package.

@@ -80,3 +80,22 @@ than trusting "what's on disk" at face value.
 - Restart-with-uncommitted-durable-suffix scenario (extension of
   RF-4/RF-9) verifying the committed-boundary reconstruction rule, not
   log-presence, governs what gets applied.
+
+## Extended by `v0.6.0`, and how
+
+`v0.6.0` adds `internal/node.Node.Scrub` — an *operator-triggered*,
+read-only integrity check (`POST /admin/storage/scrub`) that walks
+every retained WAL segment, snapshot file, and the audit-log hash
+chain, reporting checksum/framing/version/index-ordering/chain-break
+findings. This does not weaken this ADR's core decision in any way:
+scrub never repairs (`SCRUB NON-DESTRUCTIVE`,
+[`docs/invariants.md`](../invariants.md)) and never runs automatically
+at startup — this ADR's own `RECOVERY-NON-INVENTION` posture (refuse
+and let the operator decide, never guess or auto-fix) is exactly
+scrub's own "reports, the operator acts" contract, applied
+proactively/on-demand rather than only reactively at `Open`. A torn
+tail in the current, still-open segment — this ADR's own explicitly
+legal case (see the Decision section above; proven at startup by
+LD-4) — is deliberately never reported as a scrub finding, for the
+identical reason it is never treated as corruption at startup. See `docs/recovery.md` §4 and `docs/storage-lifecycle.md`
+§21 for the full scrub contract.
