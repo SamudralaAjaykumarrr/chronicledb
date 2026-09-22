@@ -246,11 +246,32 @@ func TestDynamicMembershipWithConcurrentSQLReads(t *testing.T) {
 	c.addrs[learnerID] = learnerAddr
 	clusterMu.Unlock()
 
-	addCtx, addCancel := context.WithTimeout(context.Background(), 5*time.Second)
-	if _, err := leader.AddLearner(addCtx, "dm16-add-n4", learnerID, learnerAddr); err != nil {
-		t.Fatalf("AddLearner: %v", err)
+	// Same structural staleness risk as every membership call below:
+	// re-fetch whichever node currently holds leadership on each
+	// attempt rather than assuming the leader captured at the top of
+	// this test is still it.
+	var addErr error
+	awaitConditionSQL(t, 5*time.Second, "AddLearner(n4) eventually succeeds", func() bool {
+		cur := currentSQLLeader(c, &clusterMu)
+		if cur == nil {
+			return false
+		}
+		actx, acancel := context.WithTimeout(context.Background(), time.Second)
+		defer acancel()
+		_, err := cur.AddLearner(actx, "dm16-add-n4", learnerID, learnerAddr)
+		if err != nil {
+			var nle *node.NotLeaderError
+			if errors.As(err, &nle) || errors.Is(err, node.ErrLeadershipLost) || isRetryableConfigChangeRefusal(err) {
+				return false
+			}
+			addErr = err
+			return true
+		}
+		return true
+	})
+	if addErr != nil {
+		t.Fatalf("AddLearner: %v", addErr)
 	}
-	addCancel()
 	awaitConditionSQL(t, 5*time.Second, "n4 catches up", func() bool {
 		return learner.Status().AppliedIndex >= uint64(leader.Status().LastIndex)
 	})
@@ -305,7 +326,12 @@ func TestDynamicMembershipWithConcurrentSQLReads(t *testing.T) {
 	})
 
 	// Remove one of the three original voters (not the current leader),
-	// leaving 3 voters — no confirmation required.
+	// leaving 3 voters — no confirmation required. Same structural
+	// staleness risk as the PromoteToVoter/self-removal calls above (a
+	// captured leader variable, real timers, the background reader
+	// still driving real traffic): re-fetch whichever node currently
+	// holds leadership on each attempt. removeTarget itself is
+	// independent of who currently leads, so it is computed once.
 	var removeTarget raft.NodeID
 	for _, id := range c.ids {
 		if id != leaderID && id != learnerID {
@@ -313,11 +339,28 @@ func TestDynamicMembershipWithConcurrentSQLReads(t *testing.T) {
 			break
 		}
 	}
-	removeCtx, removeCancel := context.WithTimeout(context.Background(), 5*time.Second)
-	if _, err := leader.RemoveServer(removeCtx, "dm16-remove-1", removeTarget, 0); err != nil {
-		t.Fatalf("RemoveServer(%s): %v", removeTarget, err)
+	var removeErr error
+	awaitConditionSQL(t, 5*time.Second, "RemoveServer(original voter) eventually succeeds", func() bool {
+		cur := currentSQLLeader(c, &clusterMu)
+		if cur == nil {
+			return false
+		}
+		rctx, rcancel := context.WithTimeout(context.Background(), time.Second)
+		defer rcancel()
+		_, err := cur.RemoveServer(rctx, "dm16-remove-1", removeTarget, 0)
+		if err != nil {
+			var nle *node.NotLeaderError
+			if errors.As(err, &nle) || errors.Is(err, node.ErrLeadershipLost) || isRetryableConfigChangeRefusal(err) {
+				return false
+			}
+			removeErr = err
+			return true
+		}
+		return true
+	})
+	if removeErr != nil {
+		t.Fatalf("RemoveServer(%s): %v", removeTarget, removeErr)
 	}
-	removeCancel()
 	awaitConditionSQL(t, 5*time.Second, "cluster converges on 3 voters after removal", func() bool {
 		return leader.Status().VoterCount == 3
 	})
