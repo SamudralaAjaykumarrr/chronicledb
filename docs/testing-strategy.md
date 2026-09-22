@@ -854,9 +854,17 @@ Control / Storage Lifecycle adds:
   artifact of a scenario too gentle to ever produce one.
 - **Horizon guard** (`docs/storage-lifecycle.md` §15.2):
   `internal/mvcc.Store.SetSkipHorizonGuardForTest` disables the
-  `startSeq < gcWatermark` check inside `Visible`/`ScanVisible`. SL-3
-  drives GC SAFETY's positive property (SL-1) with it set and asserts
-  the harness's oracle detects the resulting silent stale read.
+  `startSeq < gcWatermark` check inside `Visible`/`ScanVisible`. SL-1
+  (`internal/mvcc/gc_safety_property_test.go`,
+  `TestGCSafety_SL1_PropertyRandomizedChainsSnapshotsWatermarks`) is the
+  positive property: randomized chains, randomized query points,
+  randomized watermarks — no surviving snapshot's version is ever
+  reclaimed, and every below-horizon read is refused. SL-3
+  (`TestGCSafety_SL3_NegativeControl_HorizonGuardDisabledDetectsSilentStaleRead`)
+  re-runs the same scenarios with the guard disabled and asserts a
+  divergence from the reference model is actually observed on some
+  below-horizon query across the seed set — proving SL-1's generator
+  isn't too gentle to have ever exercised the guard at all.
 - **`FSM.mu` exclusivity** (`docs/admission-control.md` §5.4a):
   `internal/fsm.FSM.SetExclusiveOutcomeLockForTest` reverts every
   read-only accessor from `f.mu.RLock()` back to `f.mu.Lock()`. AC-19's
