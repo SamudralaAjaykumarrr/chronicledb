@@ -559,9 +559,13 @@ func TestApplyAdvanceGCWatermark_SL4_DeterministicReplayEquivalence(t *testing.T
 // (verified directly: a generation-2 FSM's encoding is identical
 // whether or not GC fields are their zero values, since the block is
 // structurally absent below generation 3). The full external-binary
-// byte-comparison against a real v0.5.0 build (SL-16's real-process
-// form) is proven in the mixed-binary suite (docs/v0.6.0-plan.md §33
-// slice 13).
+// byte-comparison against a real v0.5.0 build (SL-16's real-process,
+// producer-side form, gate 9) is proven in
+// cmd/chronicledb-node/sl16_producer_test.go's
+// TestSL16_ProducerSideByteIdenticalOutput — not merely referenced
+// here as if it already existed elsewhere (v0.6.0 review F3: this
+// comment previously made that claim without the test actually being
+// there).
 func TestGenerationGate_AdvanceGCWatermarkOnlyEncodesAtGeneration3Plus(t *testing.T) {
 	build := func(finalizeTo uint32) *FSM {
 		f := New(mvcc.NewStore())
