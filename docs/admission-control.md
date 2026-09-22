@@ -31,7 +31,6 @@ number that "looks reasonable" (`docs/v0.6.0-plan.md` §10.3).
 | `-max-inflight-proposals` | `256` | Lane B write concurrency, and the authoritative `len(n.waiters)` event-loop ceiling (§4). `0` is a startup error. |
 | `-max-concurrent-reads` | `512` | Lane B `BeginReadIndex` concurrency, and the `len(n.pendingReads)` ceiling. `0` is a startup error. |
 | `-max-live-read-leases` | `4096` | Ceiling on simultaneously live read leases (`docs/storage-lifecycle.md` §4). `0` is a startup error. |
-| `-max-concurrent-transactions` / `-max-concurrent-sql-statements` | `256` | Either name sets the `internal/sql` statement gate; setting both is a startup error. |
 | `-admission-queue-depth` | `256` | Waiting-room capacity behind the write/read gates. `0` = reject immediately, never wait — a legitimate permanent choice, not merely "unset." |
 | `-admission-max-wait` | `500ms` | Upper bound on queued wait before `queue_timeout`. `0` = bounded only by the caller's own context. |
 | `-max-admin-concurrency` | `2` | Lane A1 concurrency. `0` is a startup error. |
@@ -47,6 +46,17 @@ number that "looks reasonable" (`docs/v0.6.0-plan.md` §10.3).
 | `-http-read-timeout` | `30s` | `http.Server.ReadTimeout`. |
 | `-http-write-timeout` | `60s` | `http.Server.WriteTimeout`. |
 | `-http-idle-timeout` | `120s` | `http.Server.IdleTimeout`. |
+
+**`internal/sql`'s statement gate is not one of these flags.** Every
+SQL statement, replicated or standalone, passes through its own
+`internal/admission.Gate` (§9 below) at a fixed built-in default of
+256 concurrent statements — not independently configurable in this
+release, because `internal/sql` is a Go-library surface only
+(`docs/sql.md` §8: no SQL CLI/web console this phase) and
+`cmd/chronicledb-node` never constructs an `internal/sql.Engine`, so
+there is no CLI flag to set it with. See
+[`docs/configuration.md`](configuration.md)'s "Not yet exposed as a
+flag" note.
 
 **The one default-behavior change in `v0.6.0`:** the HTTP timeouts and
 connection caps above are on by default, because "no timeouts at all"

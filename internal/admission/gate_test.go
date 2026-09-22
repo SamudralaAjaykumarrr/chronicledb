@@ -212,8 +212,13 @@ func TestGateContextCancellationReleasesQueueSlot(t *testing.T) {
 // (docs/v0.6.0-plan.md §30.1): MaxConcurrent<=0 refuses construction
 // with a message naming the flag/field, never silently substituting
 // "unlimited" (ADMISSION FAILS CLOSED). The remaining AC-4 sub-cases
-// (threshold ordering, platform support, flag mutual exclusivity) are
-// covered where those flags are wired up (later slices).
+// (threshold ordering: internal/node/ac13_test.go/pressure_test.go;
+// platform support: internal/node/pressure_test.go) are covered where
+// those flags are wired up. The originally-planned fourth sub-case
+// (flag mutual exclusivity between -max-concurrent-transactions and
+// -max-concurrent-sql-statements) does not apply: neither is a
+// cmd/chronicledb-node flag in this release — see
+// docs/v0.6.0-plan.md §26/D3.
 func TestNewGateRejectsInvalidConfig(t *testing.T) {
 	cases := []Limits{
 		{MaxConcurrent: 0},
