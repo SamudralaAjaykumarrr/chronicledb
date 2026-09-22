@@ -131,6 +131,19 @@ func main() {
 		fsyncFailureThreshold = flag.Int("fsync-failure-threshold", 3, "consecutive non-Raft-path (snapshot/backup/audit) fsync failures before this node marks itself storage-unhealthy (§20.2)")
 		scrubBytesPerSec      = flag.Int64("scrub-bytes-per-sec", 64<<20, "POST /admin/storage/scrub's combined WAL+snapshot+audit read-rate cap (§21.4); 0 = unlimited")
 
+		// debugForceExclusiveOutcomeLock exists solely so AC-19's negative
+		// control (docs/v0.6.0-plan.md §31 gate 3, §5.4a) is reachable
+		// against a real OS process, not only internal/fsm's own unit
+		// test: it reverts FSM.mu's read-only accessors from RLock back to
+		// the pre-v0.6.0 exclusive Lock, at startup, so a real-process
+		// integration test can start a second node with it set and observe
+		// raft_message_process_seconds p99 actually regress under the
+		// identical flood that leaves an ordinary node's p99 unaffected.
+		// Never documented in -help's own text as an operator-facing flag
+		// (docs/configuration.md never lists it): it exists only to make a
+		// test-only FSM hook reachable from outside the test binary.
+		debugForceExclusiveOutcomeLock = flag.Bool("debug-force-exclusive-outcome-lock", false, "")
+
 		// HTTP server hardening (docs/v0.6.0-plan.md §10.1, §10.4 — the
 		// one v0.6.0 default-behavior change: on by default, since "no
 		// timeouts at all" was never a behavior worth preserving).
@@ -339,6 +352,9 @@ func main() {
 	n, err := node.Open(cfg)
 	if err != nil {
 		logger.Fatalf("opening node: %v", err)
+	}
+	if *debugForceExclusiveOutcomeLock {
+		n.FSM().SetExclusiveOutcomeLockForTest(true)
 	}
 
 	sec, err := newSecurity(secFlags, authModeValue, logger, auditLog)

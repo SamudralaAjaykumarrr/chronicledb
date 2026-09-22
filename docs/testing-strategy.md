@@ -868,12 +868,29 @@ Control / Storage Lifecycle adds:
 - **`FSM.mu` exclusivity** (`docs/admission-control.md` §5.4a):
   `internal/fsm.FSM.SetExclusiveOutcomeLockForTest` reverts every
   read-only accessor from `f.mu.RLock()` back to `f.mu.Lock()`. AC-19's
-  negative control
+  negative control is proven deterministically at the unit tier
   (`internal/fsm/rwlock_test.go`'s
-  `TestExclusiveOutcomeLockForTestSerializesReads`, and the
-  `internal/node`/real-process tier built on top of it) proves a
-  concurrent-read regression is actually detected, not merely that the
-  `RWMutex` change compiles.
+  `TestExclusiveOutcomeLockForTestSerializesReads`, which holds
+  `f.mu.Lock()` directly from the test goroutine and asserts a
+  concurrent `GetOutcome` blocks until it is released) — a real
+  regression is actually detected, not merely that the `RWMutex` change
+  compiles. `cmd/chronicledb-node/ac19_realprocess_test.go` adds the
+  real-process **positive** proof (a real leader under sustained Raft
+  traffic, flooded with `/outcome`+`/status` at the HTTP connection cap,
+  `chronicledb_raft_message_process_seconds` p99 held within baseline —
+  reachable via a new, undocumented `-debug-force-exclusive-outcome-lock`
+  debug flag that makes the FSM hook callable from outside the test
+  binary at all). A real-process **quantitative negative control** was
+  attempted there too and deliberately removed rather than shipped
+  non-discriminating: `GetOutcome`'s critical section is a single map
+  lookup (tens of nanoseconds), so even full serialization across
+  hundreds of concurrent callers adds only microseconds of aggregate
+  queuing delay, several orders of magnitude below this WSL2-hosted
+  machine's scheduling/network noise floor — neither
+  `raft_message_process_seconds` p99 nor direct client-observed
+  `/outcome` latency showed any reliable signal across multiple
+  concurrency levels and two independent measurement techniques. See
+  the comment left in that file's place for the full record.
 - **Scrub calibration**: not a disable-hook on production code, but the
   same "prove the detector can be wrong in both directions" idea
   applied to `internal/wal.Scrub`/`internal/snapshot.Scrub`/
