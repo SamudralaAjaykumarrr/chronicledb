@@ -209,6 +209,18 @@ func (f *FSM) GetOutcome(id RequestID) (outcome Outcome, ok bool) {
 	return entry.outcome, ok
 }
 
+// OutcomesCount returns the number of distinct CommitTxn RequestIDs
+// this FSM has ever recorded an outcome for — docs/v0.6.0-plan.md §25's
+// chronicledb_requestid_outcomes, "the unbounded table... measured
+// precisely because it is not fixed" (§28.2/D6: unlike MVCC versions,
+// this table has no GC and this release makes no claim that it ever
+// stabilizes). A diagnostic read only, never a correctness dependency.
+func (f *FSM) OutcomesCount() int {
+	f.rLock()
+	defer f.rUnlock()
+	return len(f.outcomes)
+}
+
 // Apply is the sole deterministic boundary between "this command
 // occupies log index index in the ordered committed history" and
 // "database state" (docs/architecture.md §5, ADR-0007). It must be

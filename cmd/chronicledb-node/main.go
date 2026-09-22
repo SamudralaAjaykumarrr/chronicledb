@@ -586,6 +586,7 @@ func (s *controlServer) handleMetrics(w http.ResponseWriter, r *http.Request) {
 	line("chronicledb_mvcc_versions", "total versions across all chains — the number GC is supposed to bound", "gauge", float64(versions))
 	line("chronicledb_mvcc_gc_watermark", "applied GC watermark", "gauge", float64(fsmState.GCWatermark()))
 	line("chronicledb_mvcc_gc_passes_total", "completed full-keyspace GC walks", "counter", float64(fsmState.GCPasses()))
+	line("chronicledb_requestid_outcomes", "distinct CommitTxn RequestIDs ever recorded — unbounded by design (§28.2), measured honestly rather than claimed stable", "gauge", float64(fsmState.OutcomesCount()))
 
 	// Compatibility / Rolling Upgrades metrics (docs/enterprise-v1-plan.md
 	// §7 Observability: "cluster version gauge, per-node reported-version
