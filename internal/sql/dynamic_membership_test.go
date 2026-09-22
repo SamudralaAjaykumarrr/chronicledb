@@ -411,21 +411,32 @@ func TestDynamicMembershipWithConcurrentSQLReads(t *testing.T) {
 	// background SQL reader still running, against a healthy, fully
 	// reachable remaining voter. Structurally identical staleness risk
 	// to the PromoteToVoter loop above (a captured leader variable,
-	// real timers, the background reader still driving real traffic) —
-	// re-fetch whichever node currently holds leadership on each
-	// attempt rather than assuming newLeader is still it; the removal
-	// target stays newLeaderID regardless of which current leader
-	// proposes it.
+	// real timers, the background reader still driving real traffic).
+	// But unlike those calls, the proposer is not interchangeable here:
+	// a different leader removing newLeaderID is an ordinary follower
+	// removal, and would pass every assertion below without ever
+	// exercising self-removal. So only newLeader itself may propose,
+	// until newLeader has returned ErrLeadershipLost for this exact
+	// RequestID — its self-removal proposal's outcome is then unknown,
+	// and retrying the SAME RequestID against whichever node now leads
+	// is that sentinel's own documented recovery (it deduplicates to
+	// the original outcome). If newLeader merely stops leading without
+	// that, keep waiting for it to lead again; the outer bound fails
+	// closed if the self-removal path is never exercised.
 	var selfRemoveOutcome fsm.Outcome
 	var selfRemoveErr error
+	selfRemoveOutcomeUnknown := false
 	awaitConditionSQL(t, 5*time.Second, "self-removal of the new leader eventually succeeds", func() bool {
 		cur := currentSQLLeader(c, &clusterMu)
-		if cur == nil {
+		if cur == nil || (cur != newLeader && !selfRemoveOutcomeUnknown) {
 			return false
 		}
 		pctx, pcancel := context.WithTimeout(context.Background(), time.Second)
 		defer pcancel()
 		o, err := cur.RemoveServer(pctx, "dm16-self-remove", newLeaderID, 1)
+		if cur == newLeader && errors.Is(err, node.ErrLeadershipLost) {
+			selfRemoveOutcomeUnknown = true
+		}
 		if err != nil {
 			var nle *node.NotLeaderError
 			if errors.As(err, &nle) || errors.Is(err, node.ErrLeadershipLost) || isRetryableConfigChangeRefusal(err) {
