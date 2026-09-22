@@ -415,6 +415,47 @@ func TestAC20_CancelHeavyWorkloadBoundedAndNoLeakAfterQuiescence(t *testing.T) {
 		}
 	}()
 
+	// Deterministically fill len(n.waiters) to its ceiling before ever
+	// starting the timing-sensitive cancel flood below. The original
+	// version of this test relied on the flood itself to both fill and
+	// then overflow n.waiters within one shared 40ms client deadline —
+	// a real race (the admission gate's own MaxConcurrent equals
+	// maxClientWaiters here, and its queue depth is small too, so a 5th
+	// request only ever reaches handlePropose once one of the first 4
+	// gate slots is recycled, which happens right around every other
+	// caller's own near-identical deadline) that went flaky under -race
+	// (~1/10-2/10 in isolation: AdmissionDefenseRejectionsWaitersTotal
+	// stayed 0 because too few requests reached handlePropose in time).
+	//
+	// A waiter entry survives its own caller's cancellation — only
+	// apply, stepdown, or shutdown remove it (§5.3, handlePropose's own
+	// doc comment) — so canceling these seed calls, once confirmed via
+	// WaitersGauge to have actually landed, frees their gate slots for
+	// the flood below while their waiter entries persist, guaranteeing
+	// n.waiters is already at the ceiling before the flood's first
+	// request can possibly arrive.
+	seedCancels := make([]context.CancelFunc, maxInflight)
+	var seedWG sync.WaitGroup
+	seedWG.Add(maxInflight)
+	for i := 0; i < maxInflight; i++ {
+		ctx, cancel := context.WithCancel(context.Background())
+		seedCancels[i] = cancel
+		go func(i int) {
+			defer seedWG.Done()
+			_, _ = leader.Propose(ctx, cmd(fmt.Sprintf("ac20-seed-%d", i), uint64(1000+i), 0, fmt.Sprintf("ac20seedk%d", i), "v"))
+		}(i)
+	}
+	pollUntil(t, 5*time.Second, func() bool {
+		return leader.Metrics().WaitersGauge == int64(maxInflight)
+	})
+	for _, cancel := range seedCancels {
+		cancel()
+	}
+	seedWG.Wait()
+	pollUntil(t, 5*time.Second, func() bool {
+		return leader.admission.write.InFlight() == 0
+	})
+
 	var wg sync.WaitGroup
 	const flood = 60
 	wg.Add(flood)
