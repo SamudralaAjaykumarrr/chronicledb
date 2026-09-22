@@ -102,6 +102,22 @@ jobs:
         # and chaos_test.go's doc comments for the explicit standalone
         # invocation.
         run: go test -tags=integration ./cmd/chronicledb-node/... -v -timeout 180s
+      - name: go vet (faulttest build tag)
+        run: go vet -tags=faulttest ./...
+      - name: crash-injection proofs (SL-8/SL-24/SL-26, v0.6.0 slice 10a)
+        # internal/node/faultpoint_hook.go's SetFaultPointForTest/
+        # CrashOnceAtFaultPointForTest only exist in a binary built with
+        # the faulttest build tag (docs/testing-strategy.md §17) — no
+        # production binary, including every one cmd/chronicledb-node
+        # ships, ever links that file. Without this step, SL-8/SL-24/
+        # SL-26's permanent crash-safety proofs (a simulated ungraceful
+        # crash at each of maybeSnapshot's six ordering points and
+        # handleInstallSnapshot's three, plus the six-step call-order
+        # pin) compile but never actually run in CI. Targeted by -run,
+        # not a bare `-tags=faulttest ./internal/node/...`, so this step
+        # doesn't re-run the rest of that package's already-covered
+        # suite a second time under a different tag.
+        run: go test -tags=faulttest ./internal/node/... -run 'TestFaultPointSmoke_|TestMaybeSnapshotSixStepCallOrder_SL24|TestCrashInjection_' -v -timeout 120s
       - name: fuzz smoke (wal)
         run: go test ./internal/wal/... -fuzz FuzzDecodeFrameBytes -fuzztime 15s
       - name: fuzz smoke (fsm)
