@@ -868,29 +868,46 @@ Control / Storage Lifecycle adds:
 - **`FSM.mu` exclusivity** (`docs/admission-control.md` §5.4a):
   `internal/fsm.FSM.SetExclusiveOutcomeLockForTest` reverts every
   read-only accessor from `f.mu.RLock()` back to `f.mu.Lock()`. AC-19's
-  negative control is proven deterministically at the unit tier
-  (`internal/fsm/rwlock_test.go`'s
-  `TestExclusiveOutcomeLockForTestSerializesReads`, which holds
-  `f.mu.Lock()` directly from the test goroutine and asserts a
-  concurrent `GetOutcome` blocks until it is released) — a real
-  regression is actually detected, not merely that the `RWMutex` change
-  compiles. `cmd/chronicledb-node/ac19_realprocess_test.go` adds the
-  real-process **positive** proof (a real leader under sustained Raft
-  traffic, flooded with `/outcome`+`/status` at the HTTP connection cap,
-  `chronicledb_raft_message_process_seconds` p99 held within baseline —
-  reachable via a new, undocumented `-debug-force-exclusive-outcome-lock`
-  debug flag that makes the FSM hook callable from outside the test
-  binary at all). A real-process **quantitative negative control** was
-  attempted there too and deliberately removed rather than shipped
-  non-discriminating: `GetOutcome`'s critical section is a single map
-  lookup (tens of nanoseconds), so even full serialization across
-  hundreds of concurrent callers adds only microseconds of aggregate
-  queuing delay, several orders of magnitude below this WSL2-hosted
-  machine's scheduling/network noise floor — neither
-  `raft_message_process_seconds` p99 nor direct client-observed
-  `/outcome` latency showed any reliable signal across multiple
-  concurrency levels and two independent measurement techniques. See
-  the comment left in that file's place for the full record.
+  negative control is proven at two tiers, with the **same oracle** at
+  both — how many read-only callers are inside `GetOutcome`'s critical
+  section at once, which is unbounded under the `RWMutex` and exactly
+  one under the mutex the hook reverts to:
+
+  - unit (`internal/fsm/rwlock_test.go`):
+    `TestExclusiveOutcomeLockForTestSerializesReads` holds `f.mu.Lock()`
+    directly from the test goroutine and asserts a concurrent
+    `GetOutcome` blocks until it is released, and
+    `TestReadRendezvousDiscriminatesLockMode` calibrates the rendezvous
+    barrier below by running it in both modes;
+  - real process (`cmd/chronicledb-node/ac19_realprocess_test.go`):
+    `TestAC19_RealProcess_OutcomeReadersShareFSMLock` arms
+    `internal/fsm`'s one-shot rendezvous barrier over `/fault` against
+    two genuine three-node clusters, one started with the undocumented
+    `-debug-force-exclusive-outcome-lock` flag, drives 8 concurrent
+    `/outcome` requests on 8 distinct connections at each, and gets
+    `Arrived 8 / Peak 8 / Reached true` from the ordinary cluster
+    against `Arrived 8 / Peak 1 / Reached false` from the reverted one.
+    The same file's
+    `TestAC19_RealProcess_ConcurrentOutcomeFloodP99WithinBaseline` is
+    the real-process **positive** proof of §30.1's scenario as worded (a
+    real leader under sustained Raft traffic, flooded with
+    `/outcome`+`/status` at the HTTP connection cap,
+    `chronicledb_raft_message_process_seconds` p99 held within
+    baseline).
+
+  The oracle is reader overlap rather than latency for a structural
+  reason, not a convenience one, and this is the §12-style record of
+  that choice: a **quantitative** real-process control was tried first —
+  `raft_message_process_seconds` p99, then direct client-observed
+  `/outcome` round-trip p99 — and neither discriminated at any
+  concurrency level, because `GetOutcome`'s critical section is a single
+  map lookup (tens of nanoseconds), so even full serialization across
+  hundreds of concurrent callers adds microseconds of aggregate queuing
+  delay against a millisecond-scale noise floor. More load does not fix
+  that; a threshold tuned until it "passed" would be passing on noise.
+  Counting overlap discriminates by a factor of N instead, and is exact:
+  under a true mutex an overlap of two is impossible, not merely
+  unlikely. `docs/v0.6.0-plan.md` §30.1a has the full argument.
 - **Scrub calibration**: not a disable-hook on production code, but the
   same "prove the detector can be wrong in both directions" idea
   applied to `internal/wal.Scrub`/`internal/snapshot.Scrub`/

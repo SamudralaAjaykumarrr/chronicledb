@@ -28,6 +28,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -724,12 +725,25 @@ func (s *controlServer) handleFault(w http.ResponseWriter, r *http.Request) {
 	action := r.URL.Query().Get("action")
 
 	// Node-scoped actions, checked before the peer requirement below:
-	// unlike the transport faults, these name no peer. They hold and
-	// release dynamic-membership plan §11's post-election not-ready
-	// boundary (internal/node.HoldElectionNoOpForTest), which no
-	// transport fault can express — the election and the no-op commit
-	// need the same majority of the same voters, so any block that
-	// stalls the no-op also prevents the election before it.
+	// unlike the transport faults, these name no peer.
+	//
+	// holdelectionnoop/releaseelectionnoop hold and release dynamic-
+	// membership plan §11's post-election not-ready boundary
+	// (internal/node.HoldElectionNoOpForTest), which no transport fault
+	// can express — the election and the no-op commit need the same
+	// majority of the same voters, so any block that stalls the no-op
+	// also prevents the election before it.
+	//
+	// armoutcomereadrendezvous/outcomereadrendezvousresult are AC-19's
+	// real-process negative control (docs/v0.6.0-plan.md §5.4a, §31
+	// gate 3): they arm, and then read back, the one-shot barrier
+	// internal/fsm/readrendezvous.go places inside GetOutcome's
+	// critical section, which counts how many /outcome requests are
+	// simultaneously inside it. That count — unbounded under the
+	// RWMutex, exactly one under the exclusive mutex
+	// -debug-force-exclusive-outcome-lock reverts to — is the only
+	// observable that discriminates the two at all; see that file's
+	// header for why latency cannot.
 	switch action {
 	case "holdelectionnoop":
 		s.n.HoldElectionNoOpForTest()
@@ -738,6 +752,23 @@ func (s *controlServer) handleFault(w http.ResponseWriter, r *http.Request) {
 	case "releaseelectionnoop":
 		s.n.ReleaseElectionNoOpForTest()
 		w.WriteHeader(http.StatusOK)
+		return
+	case "armoutcomereadrendezvous":
+		want, err := strconv.Atoi(r.URL.Query().Get("n"))
+		if err != nil {
+			http.Error(w, "n must be an integer (<= 0 disarms)", http.StatusBadRequest)
+			return
+		}
+		timeoutMs, err := strconv.Atoi(r.URL.Query().Get("timeoutMs"))
+		if err != nil || timeoutMs < 0 {
+			http.Error(w, "timeoutMs must be a non-negative integer", http.StatusBadRequest)
+			return
+		}
+		s.n.FSM().ArmReadRendezvousForTest(want, time.Duration(timeoutMs)*time.Millisecond)
+		w.WriteHeader(http.StatusOK)
+		return
+	case "outcomereadrendezvousresult":
+		writeJSON(w, http.StatusOK, s.n.FSM().ReadRendezvousResultForTest())
 		return
 	}
 

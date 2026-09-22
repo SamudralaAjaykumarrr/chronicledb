@@ -1,23 +1,30 @@
 //go:build integration
 
-// This file is AC-19's real-process tier (docs/v0.6.0-plan.md §30.1):
-// a real leader under sustained Raft traffic, flooded with
-// /outcome+/status at the HTTP connection cap,
-// chronicledb_raft_message_process_seconds p99 held within its
-// pre-flood baseline. internal/fsm/rwlock_test.go's own
-// TestExclusiveOutcomeLockForTestSerializesReads already proves the
-// FSM.mu RWMutex mechanism deterministically at the unit level; a
-// real-process *quantitative* negative control was attempted here and
-// found impractical at CI scale — see the comment where it used to be,
-// below the positive test, for the full account of what was tried and
-// why.
+// This file is AC-19's real-process tier (docs/v0.6.0-plan.md §30.1,
+// §31 gate 3), in two parts:
 //
-//	go test -tags=integration ./cmd/chronicledb-node/... -run TestAC19_RealProcess -v
+//  1. TestAC19_RealProcess_ConcurrentOutcomeFloodP99WithinBaseline —
+//     the scenario as §30.1 words it: a real leader under sustained
+//     Raft traffic, flooded with /outcome+/status at the HTTP
+//     connection cap, chronicledb_raft_message_process_seconds p99 held
+//     within its pre-flood baseline.
+//
+//  2. TestAC19_RealProcess_OutcomeReadersShareFSMLock — the negative
+//     control, deterministic rather than statistical: it counts how
+//     many concurrent /outcome requests are inside GetOutcome's
+//     critical section at once in a real process (unbounded under the
+//     production RWMutex, exactly one under the exclusive mutex
+//     -debug-force-exclusive-outcome-lock reverts to). See the long
+//     comment above it for why that, and not latency, is the oracle
+//     that discriminates.
+//
+//     go test -tags=integration ./cmd/chronicledb-node/... -run TestAC19_RealProcess -v
 package main
 
 import (
 	"bufio"
 	"context"
+	"encoding/json"
 	"fmt"
 	"net/http"
 	"strconv"
@@ -26,6 +33,8 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/SamudralaAjaykumarrr/chronicledb/internal/fsm"
 )
 
 // histogramBuckets scrapes rn's /metrics for every cumulative
@@ -210,49 +219,176 @@ func TestAC19_RealProcess_ConcurrentOutcomeFloodP99WithinBaseline(t *testing.T) 
 	}
 }
 
-// A real-process quantitative negative control for AC-19 (§31 gate 3:
-// "the /outcome flood does move raft_message_process_seconds p99
-// outside the baseline") was attempted here and deliberately removed,
-// not merely left unwritten — the attempt and why it does not work are
-// recorded for whoever next looks at this gate, per this project's own
-// "benchmark and document honestly instead of forcing one" discipline
-// (docs/benchmarks.md §8.2):
+// ---------------------------------------------------------------------
+// AC-19's real-process negative control (§31 gate 3: "with FSM.mu
+// reverted to an exclusive mutex, the /outcome flood *does* move the
+// oracle outside its baseline").
 //
-//  1. Using chronicledb_raft_message_process_seconds itself (matching
-//     the positive test above and §5.4a's literal wording): that
-//     histogram observes one sample per inbound raft.Message, dominated
-//     by heartbeat/AppendEntries traffic that never touches FSM.mu at
-//     all — even 300 concurrent /outcome flooders against 32 concurrent
-//     writers sustained for 4s produced no detectable p99 shift with
-//     -debug-force-exclusive-outcome-lock set. The contention signal is
-//     diluted below detectability by unrelated traffic at any duration
-//     practical for an automated test.
-//  2. Using client-observed /outcome round-trip latency directly
-//     instead (bypassing that dilution — every concurrent caller
-//     serializes through the exact lock GetOutcome itself takes): at
-//     200 and again at 24 concurrent callers, with a Transport tuned to
-//     avoid connection-churn overhead, p99 was statistically
-//     indistinguishable between normal and forced-exclusive locking
-//     (in one run, the "regressed" case actually measured *lower*: e.g.
-//     baseline 22.97ms vs. exclusive-lock 19.84ms over ~10k samples
-//     each) — pure host noise, no signal either direction.
+// The first attempt at this used latency as the oracle — first
+// chronicledb_raft_message_process_seconds p99 (§5.4a's own wording),
+// then client-observed /outcome round-trip p99 — and neither
+// discriminated at any concurrency tried. That is not a property of
+// this host: GetOutcome's critical section is a single map lookup, so
+// serializing it adds microseconds of aggregate queuing delay to a
+// measurement whose noise floor is milliseconds. A latency oracle
+// cannot see a nanosecond-scale critical section no matter how much
+// load is applied to it, which makes "run a bigger flood" the wrong
+// response.
 //
-// Both results are consistent with the same underlying fact:
-// GetOutcome's critical section is a single map lookup, on the order of
-// tens of nanoseconds, so even full serialization across hundreds of
-// concurrent callers adds only microseconds of aggregate queuing delay
-// — several orders of magnitude below the ~10-100ms of scheduling/
-// network noise floor this WSL2-hosted, shared machine's real-process
-// tier already has (docs/benchmarks.md §2's own WSL2 caveat). The
-// mechanism itself (RWMutex readers do not serialize against each
-// other; SetExclusiveOutcomeLockForTest(true) reverts every accessor to
-// one that does) is proven deterministically, not statistically, at
-// internal/fsm/rwlock_test.go's TestExclusiveOutcomeLockForTestSerializesReads
-// — by directly holding f.mu.Lock() from the test goroutine itself,
-// which is not something a real-process integration test can do to
-// another OS process's internals without adding new non-test-only
-// production surface for exactly that purpose. §31 gate 3's AC-19 row
-// is satisfied at the unit tier; a real-process quantitative
-// reproduction is not achievable at CI-appropriate scale on this
-// environment, and forcing a threshold that "passes" would only ever
-// be passing on noise, not the property.
+// The property AC-19 actually asserts is not about latency at all. It
+// is that /outcome takes FSM.mu in *shared* mode, so the number of
+// client lookups simultaneously inside that critical section is
+// unbounded rather than exactly one. That is a counting property, it
+// discriminates by a factor of `readers` rather than by noise, and it
+// is exact. internal/fsm/readrendezvous.go's one-shot barrier measures
+// it, TestReadRendezvousDiscriminatesLockMode calibrates the barrier
+// itself at the internal/fsm tier, and the test below reads it out of
+// two genuine OS processes over the /fault control plane.
+//
+// What the real-process tier adds over that unit proof — which is the
+// whole reason this test exists rather than the unit test standing
+// alone — is that it observes the shipped binary end to end: real
+// concurrent client connections arriving at the real HTTP server, the
+// real handleOutcome route, into the real node's FSM, with the real
+// Raft event loop running alongside. The unit test proves the lock mode
+// is what it claims inside one package; only this proves that client
+// concurrency at the process boundary actually *survives* as
+// concurrency all the way into that critical section, and that
+// -debug-force-exclusive-outcome-lock is correctly wired to destroy it.
+// ---------------------------------------------------------------------
+
+// ac19Rendezvous is one arm-drive-read cycle against a real node
+// process: it establishes `readers` distinct keep-alive connections
+// first, arms the barrier, drives exactly one concurrent /outcome
+// request down each connection, waits for every one to return, and only
+// then reads the result back. No assertion anywhere depends on how long
+// anything took — only on how many readers were inside at once.
+func ac19Rendezvous(t *testing.T, rn *realNode, readers int, barrier time.Duration) fsm.ReadRendezvousResult {
+	t.Helper()
+
+	// One Transport per reader, so "concurrent request" really means
+	// "concurrent connection" and no reader can be queued behind another
+	// on a shared one. The client timeout must outlast the barrier's own
+	// deadline, since in the exclusive case every request is waiting on
+	// it; it is a safety net, never the thing under test.
+	clients := make([]*http.Client, readers)
+	for i := range clients {
+		clients[i] = &http.Client{
+			Timeout:   barrier + 30*time.Second,
+			Transport: &http.Transport{},
+		}
+	}
+	outcomeURL := "http://" + rn.httpAddr + "/outcome?requestId=ac19-rendezvous-nonexistent"
+
+	// Warm every connection *before* arming, so connection setup is not
+	// part of what the barrier has to wait for and these calls are not
+	// counted as arrivals.
+	for i, c := range clients {
+		resp, err := c.Get(outcomeURL)
+		if err != nil {
+			t.Fatalf("warming connection %d: %v", i, err)
+		}
+		resp.Body.Close()
+	}
+
+	ac19ArmRendezvous(t, rn, readers, barrier)
+	defer ac19ArmRendezvous(t, rn, 0, 0) // disarm
+
+	var wg sync.WaitGroup
+	wg.Add(readers)
+	for i, c := range clients {
+		go func(i int, c *http.Client) {
+			defer wg.Done()
+			resp, err := c.Get(outcomeURL)
+			if err != nil {
+				t.Errorf("reader %d: GET /outcome: %v", i, err)
+				return
+			}
+			resp.Body.Close()
+		}(i, c)
+	}
+	wg.Wait()
+
+	return ac19ReadRendezvousResult(t, rn)
+}
+
+func ac19ArmRendezvous(t *testing.T, rn *realNode, readers int, barrier time.Duration) {
+	t.Helper()
+	url := fmt.Sprintf("http://%s/fault?action=armoutcomereadrendezvous&n=%d&timeoutMs=%d",
+		rn.httpAddr, readers, barrier.Milliseconds())
+	resp, err := http.Post(url, "application/json", nil)
+	if err != nil {
+		t.Fatalf("arming the outcome-read rendezvous (n=%d): %v", readers, err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("arming the outcome-read rendezvous (n=%d): status %d", readers, resp.StatusCode)
+	}
+}
+
+func ac19ReadRendezvousResult(t *testing.T, rn *realNode) fsm.ReadRendezvousResult {
+	t.Helper()
+	resp, err := http.Post("http://"+rn.httpAddr+"/fault?action=outcomereadrendezvousresult", "application/json", nil)
+	if err != nil {
+		t.Fatalf("reading the outcome-read rendezvous result: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("reading the outcome-read rendezvous result: status %d", resp.StatusCode)
+	}
+	var got fsm.ReadRendezvousResult
+	if err := json.NewDecoder(resp.Body).Decode(&got); err != nil {
+		t.Fatalf("decoding the outcome-read rendezvous result: %v", err)
+	}
+	return got
+}
+
+// ac19RendezvousCluster starts a real three-node cluster and returns its
+// leader. -gc-interval=0 (the default, stated explicitly because this
+// test depends on it) is what guarantees no FSM *writer* runs during the
+// barrier: Go's RWMutex deliberately blocks new readers once a writer is
+// waiting — that is precisely the anti-starvation property §5.4a relies
+// on — so the reader-overlap measurement is taken with the write path
+// quiet. The sustained-Raft-traffic scenario is the positive test above;
+// this one isolates the lock mode.
+func ac19RendezvousCluster(t *testing.T, bin string, extraFlags ...string) *realNode {
+	t.Helper()
+	flags := append([]string{"-enable-fault-endpoint", "-gc-interval=0"}, extraFlags...)
+	nodes := newRealClusterWithFlags(t, bin, 3, flags...)
+	return awaitLeaderV2(t, nodes, 10*time.Second)
+}
+
+func TestAC19_RealProcess_OutcomeReadersShareFSMLock(t *testing.T) {
+	const readers = 8
+	const barrier = 5 * time.Second
+	bin := buildBinary(t)
+
+	// Positive: against an ordinary node, all `readers` concurrent
+	// /outcome requests are inside GetOutcome's critical section at the
+	// same time. Under an exclusive mutex this outcome is not merely
+	// unlikely, it is impossible.
+	t.Run("shared", func(t *testing.T) {
+		got := ac19Rendezvous(t, ac19RendezvousCluster(t, bin), readers, barrier)
+		t.Logf("AC-19 real process, shared mode: %+v", got)
+		if !got.Armed || got.Arrived != readers {
+			t.Fatalf("got %+v; want Armed with Arrived = %d — the %d concurrent /outcome requests never all reached the FSM, so this run proves nothing either way", got, readers, readers)
+		}
+		if got.Peak != readers || !got.Reached {
+			t.Errorf("got Peak = %d, Reached = %v; want Peak = %d, Reached = true — concurrent /outcome lookups must not serialize against each other in a real process (§5.4a)", got.Peak, got.Reached, readers)
+		}
+	})
+
+	// Negative control: the identical scenario against a node started
+	// with FSM.mu reverted to an exclusive mutex must be *detected* —
+	// same arrivals, but never more than one reader inside at a time.
+	t.Run("negative control: exclusive mutex", func(t *testing.T) {
+		got := ac19Rendezvous(t, ac19RendezvousCluster(t, bin, "-debug-force-exclusive-outcome-lock"), readers, barrier)
+		t.Logf("AC-19 real process, forced-exclusive mode: %+v", got)
+		if !got.Armed || got.Arrived != readers {
+			t.Fatalf("got %+v; want Armed with Arrived = %d — the %d concurrent /outcome requests never all reached the FSM, so the control did not actually run", got, readers, readers)
+		}
+		if got.Peak != 1 || got.Reached {
+			t.Errorf("got Peak = %d, Reached = %v; want Peak = 1, Reached = false — with FSM.mu reverted to an exclusive mutex the oracle must detect that readers serialize (§31 gate 3); an oracle that reports the same thing in both modes does not calibrate the positive run above", got.Peak, got.Reached)
+		}
+	})
+}

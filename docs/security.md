@@ -195,7 +195,11 @@ sends is rejected.
 ## 6. `/fault` — off by default
 
 `/fault` (real fault injection: `block`/`unblock`/`blocksend`/
-`blockrecv`/etc. against this process's live peer connections) is
+`blockrecv`/etc. against this process's live peer connections, plus
+node-scoped test controls that hold internal boundaries open —
+`holdelectionnoop`, and `armoutcomereadrendezvous`, which can park
+`/outcome` callers inside `FSM.mu` for a bounded interval as AC-19's
+negative control, `docs/v0.6.0-plan.md` §30.1a) is
 **not registered on the HTTP mux at all** unless `-enable-fault-endpoint`
 is passed — a request to it gets `404`, not `403`, proving the route is
 structurally absent, not merely access-controlled. When enabled, it

@@ -113,6 +113,14 @@ type FSM struct {
 	// proving the positive test would actually have caught the
 	// regression this field reverts. Never set in production.
 	exclusiveOutcomeLockForTest atomic.Bool
+
+	// readRendezvous holds AC-19's real-process negative-control
+	// barrier when a test has armed one via ArmReadRendezvousForTest;
+	// nil (always, in production) makes GetOutcome's call into it a
+	// single atomic load. See readrendezvous.go's header for why the
+	// control counts simultaneous readers rather than measuring
+	// latency.
+	readRendezvous atomic.Pointer[readRendezvous]
 }
 
 // SetExclusiveOutcomeLockForTest is AC-19's negative-control hook (see
@@ -205,6 +213,10 @@ func (f *FSM) lookupLocked(cmd CommitTxnCommand) (Outcome, error) {
 func (f *FSM) GetOutcome(id RequestID) (outcome Outcome, ok bool) {
 	f.rLock()
 	defer f.rUnlock()
+	// AC-19's negative-control observation point, inside the critical
+	// section and under whichever lock mode rLock chose (readrendezvous.go).
+	// A no-op — one atomic load — unless a test has armed a barrier.
+	f.readRendezvousArrive()
 	entry, ok := f.outcomes[id]
 	return entry.outcome, ok
 }
