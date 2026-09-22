@@ -96,10 +96,15 @@ jointly cap how fast GC can reclaim. If `reclaim_rate` is below a
 workload's own version-creation rate, `chronicledb_mvcc_versions` grows
 monotonically **even with GC enabled and working correctly** — these
 three values must be derived from a measured version-creation rate for
-the actual workload, not chosen by intuition
-(`docs/benchmarks.md`). `-gc-max-keys-per-pass` is different in kind: it
-is a pure work bound (any value >= 1 is safe and deterministic), not a
-rate bound, and is a normal implementation-time tuning choice.
+the actual workload, not chosen by intuition. `docs/benchmarks.md` §12
+does this derivation against SL-19's own measured workload (108.5
+versions/sec): with the `-gc-min-advance-seqs`/`-gc-max-versions-per-pass`
+defaults (`256`/`4096`) and a recommended starting `-gc-interval=1s`,
+`reclaim_rate ≈ 1,736 versions/sec`, a 16x margin. Re-derive this for any
+workload whose sustained write rate is materially higher.
+`-gc-max-keys-per-pass` is different in kind: it is a pure work bound
+(any value >= 1 is safe and deterministic), not a rate bound, and is a
+normal implementation-time tuning choice.
 
 ## 3. Retention flags
 

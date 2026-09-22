@@ -195,6 +195,16 @@ func TestAC6_ControlPlaneNonStarvationUnderSaturatedClientLoad(t *testing.T) {
 				ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
 				_, _ = leader.Propose(ctx, cmd(fmt.Sprintf("ac6-%d-%d", i, j), uint64(i*100000+j), 0, fmt.Sprintf("k-%d-%d", i, j), "v"))
 				cancel()
+				// A real client backs off between retries instead of
+				// spinning as fast as the runtime allows; a zero-backoff
+				// spin across all 8 saturators pegs every host CPU and can
+				// itself delay this process's own tick goroutine past the
+				// election timeout, producing a spurious election that has
+				// nothing to do with the lane-separation property under
+				// test. 1ms keeps the gate genuinely saturated (capacity 2,
+				// far below what 8 backed-off goroutines still produce)
+				// without that self-inflicted CPU storm.
+				time.Sleep(time.Millisecond)
 			}
 		}(i)
 	}

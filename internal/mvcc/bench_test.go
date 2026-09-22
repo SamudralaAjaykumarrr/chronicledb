@@ -108,3 +108,50 @@ func BenchmarkCheckConflictsWithConflict(b *testing.B) {
 		}
 	}
 }
+
+// BenchmarkApplyCommitFirstWriteByKeyCount isolates the §14.4 ordered
+// key index's own cost on ApplyCommit's write path (docs/v0.6.0-plan.md
+// §31 gate 6 requires this measured and recorded): insertOrderedKeyLocked
+// does a sorted-slice insert (binary search + a shifting copy), so it is
+// O(existing keys) per *new* key, not O(log n).
+//
+// Each subtest holds a store's key count fixed at "existing" and times
+// only the marginal cost of inserting one more, brand-new key, so the
+// timed loop must actually stay at close to that key count throughout —
+// which means it must NOT run for however many iterations default
+// `go test -bench` calibration wants (an op this fast would calibrate
+// into the millions, growing "existing" by that same amount and erasing
+// the very difference this benchmark exists to show). Run it with an
+// explicit small fixed count instead of letting it calibrate:
+//
+//	go test ./internal/mvcc/... -run '^$' \
+//	    -bench BenchmarkApplyCommitFirstWriteByKeyCount -benchtime=200x
+func BenchmarkApplyCommitFirstWriteByKeyCount(b *testing.B) {
+	for _, existing := range []int{100, 1_000, 10_000, 100_000} {
+		b.Run(fmt.Sprintf("existingKeys=%d", existing), func(b *testing.B) {
+			b.StopTimer()
+			s := NewStore()
+			for i := 0; i < existing; i++ {
+				_ = s.ApplyCommit(uint64(i+1), []Mutation{{Key: fmt.Sprintf("k%08d", i), Value: []byte("v")}})
+			}
+			seq := uint64(existing + 1)
+			b.ReportAllocs()
+			b.StartTimer()
+			for i := 0; i < b.N; i++ {
+				// "!" sorts before every "k%08d" existing key, so this
+				// always inserts at position 0 — the worst case for
+				// insertOrderedKeyLocked's shifting copy, which must move
+				// the entire existing slice one slot to make room. A key
+				// that instead sorted after everything (the common case
+				// for a monotonically-issued key scheme) would insert at
+				// the tail for ~free and understate this index's real
+				// cost on an adversarial or reverse-ordered key scheme.
+				key := fmt.Sprintf("!%08d", b.N-i)
+				if err := s.ApplyCommit(seq, []Mutation{{Key: key, Value: []byte("v")}}); err != nil {
+					b.Fatalf("ApplyCommit: %v", err)
+				}
+				seq++
+			}
+		})
+	}
+}
