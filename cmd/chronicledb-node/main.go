@@ -575,6 +575,18 @@ func (s *controlServer) handleMetrics(w http.ResponseWriter, r *http.Request) {
 	line("chronicledb_scrub_findings_total", "findings across every scrub run", "counter", float64(m.ScrubFindingsTotal))
 	line("chronicledb_scrub_last_duration_seconds", "the most recent scrub run's wall-clock duration", "gauge", float64(m.ScrubLastDurationMillis)/1000)
 
+	// MVCC GC (docs/v0.6.0-plan.md §25). GC's own versions-reclaimed/
+	// proposals-total/apply-seconds metrics are not yet wired here —
+	// gcWatermark/gcPasses (fsm.FSM's own replicated state) and the
+	// live key/version counts (internal/mvcc.Store.Stats) are cheap,
+	// already-tracked reads with no new counter plumbing required.
+	fsmState := s.n.FSM()
+	keys, versions := fsmState.Store().Stats()
+	line("chronicledb_mvcc_keys", "distinct keys with a live chain", "gauge", float64(keys))
+	line("chronicledb_mvcc_versions", "total versions across all chains — the number GC is supposed to bound", "gauge", float64(versions))
+	line("chronicledb_mvcc_gc_watermark", "applied GC watermark", "gauge", float64(fsmState.GCWatermark()))
+	line("chronicledb_mvcc_gc_passes_total", "completed full-keyspace GC walks", "counter", float64(fsmState.GCPasses()))
+
 	// Compatibility / Rolling Upgrades metrics (docs/enterprise-v1-plan.md
 	// §7 Observability: "cluster version gauge, per-node reported-version
 	// gauge... precheck pass/fail history, finalize event... as a

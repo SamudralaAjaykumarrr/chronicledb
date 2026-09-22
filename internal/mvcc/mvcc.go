@@ -378,6 +378,21 @@ func (s *Store) Export() []KeyChain {
 	return out
 }
 
+// Stats returns the distinct key count and the total version count
+// across every chain — docs/v0.6.0-plan.md §25's
+// chronicledb_mvcc_keys/chronicledb_mvcc_versions (the number GC is
+// supposed to bound). A diagnostic snapshot only, never a correctness
+// dependency; unlike Export, safe to call from any package.
+func (s *Store) Stats() (keys, versions int) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	keys = len(s.chains)
+	for _, v := range s.chains {
+		versions += len(v)
+	}
+	return keys, versions
+}
+
 // RestoreStore reconstructs a Store directly from previously-exported
 // key chains (docs/recovery.md snapshot restore path), bypassing
 // ApplyCommit's monotonicity/atomicity machinery entirely: a snapshot
