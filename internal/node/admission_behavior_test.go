@@ -622,8 +622,17 @@ func TestAC22Partial_BackupDoesNotBlockMembershipChange(t *testing.T) {
 
 	// Give the backup a moment to actually be in flight before issuing
 	// the membership call, so Lane A2 saturation is genuinely exercised
-	// (not a race that happens to pass regardless).
-	pollUntil(t, 2*time.Second, func() bool { return leader.admission.maintenance.InFlight() > 0 })
+	// (not a race that happens to pass regardless). This is purely a
+	// scheduling-latency budget for the backup goroutine to run and
+	// register itself on the gate, not part of AC-22's own semantic
+	// assertion (the AddLearner call's own 5s ctx timeout below) — 5s
+	// matches this file's other InFlight()-registration polls for an
+	// already-launched goroutine (e.g. TestAC20's seed-fill polls), and
+	// is wide enough to absorb CI-runner scheduling jitter that a
+	// tighter 2s budget observed failing on (a bare goroutine-launch
+	// wait, not a deadlock: the identical wait passed 100/100 local runs,
+	// including under 2x CPU oversubscription).
+	pollUntil(t, 5*time.Second, func() bool { return leader.admission.maintenance.InFlight() > 0 })
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
