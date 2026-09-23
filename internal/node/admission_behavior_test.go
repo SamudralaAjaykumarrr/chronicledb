@@ -622,17 +622,35 @@ func TestAC22Partial_BackupDoesNotBlockMembershipChange(t *testing.T) {
 
 	// Give the backup a moment to actually be in flight before issuing
 	// the membership call, so Lane A2 saturation is genuinely exercised
-	// (not a race that happens to pass regardless). This is purely a
-	// scheduling-latency budget for the backup goroutine to run and
-	// register itself on the gate, not part of AC-22's own semantic
-	// assertion (the AddLearner call's own 5s ctx timeout below) — 5s
-	// matches this file's other InFlight()-registration polls for an
-	// already-launched goroutine (e.g. TestAC20's seed-fill polls), and
-	// is wide enough to absorb CI-runner scheduling jitter that a
-	// tighter 2s budget observed failing on (a bare goroutine-launch
-	// wait, not a deadlock: the identical wait passed 100/100 local runs,
-	// including under 2x CPU oversubscription).
-	pollUntil(t, 5*time.Second, func() bool { return leader.admission.maintenance.InFlight() > 0 })
+	// (not a race that happens to pass regardless). This must race
+	// backupDone, not just InFlight(): a plain pollUntil on InFlight()
+	// alone previously masked a Backup failure/early-return entirely —
+	// if Acquire (or anything else in Backup) ever errors before
+	// InFlight() goes above 0, backupDone receives that error
+	// immediately (it's buffered) but nothing reads it until after this
+	// wait, so the poll burns its whole budget watching a condition
+	// that can never become true and reports a content-free "condition
+	// did not become true" instead of the real failure. CI saw exactly
+	// that shape twice in a row (a full-budget timeout, unchanged by
+	// doubling the budget from 2s to 5s) — a deterministic rejection
+	// burns the entire budget every time, unlike scheduling jitter,
+	// which would show variance. Racing backupDone surfaces the real
+	// error immediately if that is what is happening.
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		if leader.admission.maintenance.InFlight() > 0 {
+			break
+		}
+		select {
+		case err := <-backupDone:
+			t.Fatalf("Backup finished (err=%v) before ever registering as in-flight on the maintenance gate — Lane A2 saturation was never exercised", err)
+		default:
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("backup did not register as in-flight on the maintenance gate within 5s (and did not finish either)")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
