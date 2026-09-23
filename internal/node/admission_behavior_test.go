@@ -611,6 +611,37 @@ func TestAC22Partial_BackupDoesNotBlockMembershipChange(t *testing.T) {
 		_, _ = propose(t, leader, cmd(fmt.Sprintf("ac22-%d", i), uint64(i), 0, fmt.Sprintf("k%d", i), "v"), 2*time.Second)
 	}
 
+	// Lane A2 saturation must be genuinely exercised while the
+	// membership change below runs, not merely not-raced-against. A
+	// prior version of this test polled leader.admission.maintenance.
+	// InFlight() with a wall-clock deadline, hoping to catch Backup
+	// "in flight" — but InFlight() becoming nonzero is only ever a
+	// momentary, externally-sampled counter value: on a fast enough
+	// disk, Acquire, the real Export work, and the deferred Release can
+	// all complete inside a single Go scheduling quantum, so a poller
+	// can legitimately never observe it, even though the permit really
+	// was held throughout. CI proved this directly: Backup finishing
+	// successfully (err=nil) in ~0.1s, reproducibly, well under one
+	// polling interval — not a timing budget problem doubling the
+	// deadline could ever fix (tried: 2s then 5s, both failed the same
+	// way, a full-budget burn each time, the signature of a condition
+	// that can never become true rather than one that is merely slow).
+	//
+	// Fixed by rendezvousing on the real event instead of sampling a
+	// transient counter: SetBackupEnteredMaintenanceHookForTest arms a
+	// hook Backup calls synchronously the instant it holds the Lane A2
+	// permit, before doing any work — and, because the armed hook here
+	// blocks on entered/proceed, Backup is provably still holding that
+	// permit for the entire time AddLearner runs below, not merely
+	// "probably still running it."
+	entered := make(chan struct{})
+	proceed := make(chan struct{})
+	leader.SetBackupEnteredMaintenanceHookForTest(func() {
+		close(entered)
+		<-proceed
+	})
+	defer leader.SetBackupEnteredMaintenanceHookForTest(nil)
+
 	outDir := t.TempDir() + "/backup"
 	backupDone := make(chan error, 1)
 	go func() {
@@ -620,36 +651,13 @@ func TestAC22Partial_BackupDoesNotBlockMembershipChange(t *testing.T) {
 		backupDone <- err
 	}()
 
-	// Give the backup a moment to actually be in flight before issuing
-	// the membership call, so Lane A2 saturation is genuinely exercised
-	// (not a race that happens to pass regardless). This must race
-	// backupDone, not just InFlight(): a plain pollUntil on InFlight()
-	// alone previously masked a Backup failure/early-return entirely —
-	// if Acquire (or anything else in Backup) ever errors before
-	// InFlight() goes above 0, backupDone receives that error
-	// immediately (it's buffered) but nothing reads it until after this
-	// wait, so the poll burns its whole budget watching a condition
-	// that can never become true and reports a content-free "condition
-	// did not become true" instead of the real failure. CI saw exactly
-	// that shape twice in a row (a full-budget timeout, unchanged by
-	// doubling the budget from 2s to 5s) — a deterministic rejection
-	// burns the entire budget every time, unlike scheduling jitter,
-	// which would show variance. Racing backupDone surfaces the real
-	// error immediately if that is what is happening.
-	deadline := time.Now().Add(5 * time.Second)
-	for {
-		if leader.admission.maintenance.InFlight() > 0 {
-			break
-		}
-		select {
-		case err := <-backupDone:
-			t.Fatalf("Backup finished (err=%v) before ever registering as in-flight on the maintenance gate — Lane A2 saturation was never exercised", err)
-		default:
-		}
-		if time.Now().After(deadline) {
-			t.Fatalf("backup did not register as in-flight on the maintenance gate within 5s (and did not finish either)")
-		}
-		time.Sleep(5 * time.Millisecond)
+	select {
+	case <-entered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("backup did not reach the maintenance-admitted region within 5s")
+	}
+	if got := leader.admission.maintenance.InFlight(); got == 0 {
+		t.Fatalf("maintenance.InFlight() = 0 while Backup is confirmed held inside the maintenance-admitted region (hook fired) — Acquire's own accounting is broken")
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
@@ -662,7 +670,59 @@ func TestAC22Partial_BackupDoesNotBlockMembershipChange(t *testing.T) {
 		t.Fatalf("AddLearner outcome = %+v, want StatusCommitted", outcome)
 	}
 
+	// The membership change above provably ran to completion while
+	// Backup was still blocked inside the maintenance-admitted region
+	// (it cannot have progressed past the hook: proceed is still open).
+	// Only now let Backup finish.
+	close(proceed)
+
 	if err := <-backupDone; err != nil {
 		t.Fatalf("Backup: %v", err)
+	}
+	if got := leader.admission.maintenance.InFlight(); got != 0 {
+		t.Fatalf("maintenance.InFlight() = %d after Backup completed, want 0 (no permit leak)", got)
+	}
+}
+
+// TestAC22NegativeControl_MembershipBlockedByAdminLaneSaturationIsDetected
+// is AC-22's negative control: it proves the assertion pattern the
+// positive test above relies on (AddLearner returning a non-nil error
+// fails the test) actually fires when a membership change genuinely
+// cannot get admitted — i.e. that TestAC22Partial itself is not
+// vacuously green regardless of whether Lane A1 is blocked. It
+// saturates Lane A1 (control) directly — the same gate AddLearner
+// itself acquires — rather than trying to force a real cross-lane leak
+// from Lane A2 into Lane A1 (AC-18's AST test, CP-3, already proves
+// structurally that no such leak can exist: the two gates are
+// mutually unreachable from each other's code paths).
+func TestAC22NegativeControl_MembershipBlockedByAdminLaneSaturationIsDetected(t *testing.T) {
+	tc := newTestClusterWithAdmissionOverride(t, 3, func(cfg *Config) {
+		cfg.MaxAdminConcurrency = 1
+	})
+	leaderID := tc.awaitLeader(5 * time.Second)
+	leader := tc.node(leaderID)
+	mustFinalizeToMax(t, tc, leader)
+	tc.pauseTicking()
+	defer tc.resumeTicking()
+
+	// Hold Lane A1's single slot from the test goroutine directly —
+	// the same gate AddLearner's own admission check acquires.
+	holderCtx, holderCancel := context.WithCancel(context.Background())
+	defer holderCancel()
+	release, err := leader.admission.control.Acquire(holderCtx)
+	if err != nil {
+		t.Fatalf("Acquire (holder): %v", err)
+	}
+	defer release()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	_, err = leader.AddLearner(ctx, fsm.RequestID("ac22-neg-learner"), "n4", "127.0.0.1:0")
+	if err == nil {
+		t.Fatal("AddLearner succeeded while Lane A1 was fully saturated by another holder — the admission check that TestAC22Partial relies on to fail is not actually being exercised")
+	}
+	var rej *admission.RejectedError
+	if !errors.As(err, &rej) {
+		t.Fatalf("expected *admission.RejectedError when Lane A1 is saturated, got %v", err)
 	}
 }

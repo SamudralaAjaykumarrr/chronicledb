@@ -842,6 +842,23 @@ type Node struct {
 	// by timing. Never set in production.
 	preSnapshotBytesFillHookForTest atomic.Pointer[func(index uint64)]
 
+	// backupEnteredMaintenanceForTest is AC-22's determinism hook
+	// (docs/v0.6.0-plan.md §30.1): when armed, called synchronously by
+	// Backup immediately after it acquires the Lane A2 maintenance
+	// permit, before doing any work. admission.Gate.InFlight() becoming
+	// nonzero is only ever a momentary, externally-polled sample — on a
+	// fast enough disk, Acquire, the real Export work, and the deferred
+	// Release can all complete inside a single Go scheduling quantum, so
+	// a poller can legitimately observe InFlight()==0 for the entire
+	// call even though the permit really was held throughout (confirmed
+	// via CI: Backup finishing successfully in ~0.1s, well under one
+	// polling interval). This hook gives a test a real rendezvous with
+	// "the permit is held right now" instead of racing a transient
+	// counter — if fn itself blocks, Backup stays inside the
+	// maintenance-admitted region until the test releases it. Never set
+	// in production.
+	backupEnteredMaintenanceForTest atomic.Pointer[func()]
+
 	// clusterGeneration mirrors fsm.FSM.ClusterGeneration() but is
 	// written directly by run's own goroutine (via
 	// adoptClusterGeneration) instead of read through fsmachine's mutex
@@ -1347,6 +1364,18 @@ func (n *Node) SetPreSnapshotBytesFillHookForTest(fn func(index uint64)) {
 	}
 	f := fn
 	n.preSnapshotBytesFillHookForTest.Store(&f)
+}
+
+// SetBackupEnteredMaintenanceHookForTest arms fn as
+// backupEnteredMaintenanceForTest; passing nil disarms it. Test-only;
+// production code never calls it.
+func (n *Node) SetBackupEnteredMaintenanceHookForTest(fn func()) {
+	if fn == nil {
+		n.backupEnteredMaintenanceForTest.Store(nil)
+		return
+	}
+	f := fn
+	n.backupEnteredMaintenanceForTest.Store(&f)
 }
 
 // Status returns a snapshot of the node's current diagnostic state.
@@ -1865,6 +1894,9 @@ func (n *Node) Backup(ctx context.Context, outDir string, continuous bool, clust
 		return backup.Manifest{}, err
 	}
 	defer release()
+	if hook := n.backupEnteredMaintenanceForTest.Load(); hook != nil {
+		(*hook)()
+	}
 	releaseSlot, err := acquireSingleSlot(ctx, n.admission.backupSlot)
 	if err != nil {
 		return backup.Manifest{}, err
