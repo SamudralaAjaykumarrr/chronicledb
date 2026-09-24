@@ -27,6 +27,12 @@ MVCC data has never been stored in one.**
 GC is **disabled by default** (`-gc-interval=0`): a node started with
 no new flags proposes zero `AdvanceGCWatermark` commands and is
 byte-identical in behavior to `v0.5.0`.
+Turning GC on by default is deliberately deferred: it is a named
+`v1.0.0` (Enterprise V1) gate item, owned by
+`docs/enterprise-v1-plan.md` §17.1 item 3 ("MVCC GC runs by default"),
+and recorded as item 1 of [`docs/roadmap.md`](roadmap.md)'s `v0.6.0`
+"Deferred to `v1.0.0`" list. Until then, enabling GC is an explicit
+operator choice (`-gc-interval` > `0`).
 
 When enabled, the current leader periodically computes a candidate
 watermark `W = min(minLease, appliedIndex, appliedIndex -
