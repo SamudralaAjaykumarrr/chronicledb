@@ -224,6 +224,22 @@ func TestGCStateSurvivesLogReplayAndInstallSnapshotIdentically(t *testing.T) {
 	leader := tc.node(leaderID)
 	mustFinalizeToMax(t, tc, leader)
 
+	// Freeze every node's election clock for the rest of this test: it
+	// drives a real, multi-second sequence (isolate, write, snapshot,
+	// heal, InstallSnapshot catch-up) over real disk/TCP while holding a
+	// single `leader` reference throughout without ever re-fetching it —
+	// the same real-scheduling-under-load hazard
+	// TestCrashInjection_HandleInstallSnapshotThreePoints_SL26 and
+	// mustFinalizeToMax's own doc comment describe, confirmed here too
+	// (3/50 -race runs timed out waiting for the isolated follower's
+	// InstallSnapshot catch-up, consistent with a spontaneous
+	// re-election silently invalidating the captured `leader` reference
+	// under sustained -race scheduling pressure). Heartbeat ticks keep
+	// running, so replication/InstallSnapshot and GC's own background
+	// proposer are unaffected.
+	tc.pauseTicking()
+	defer tc.resumeTicking()
+
 	var replayFollower, snapshotFollower raft.NodeID
 	for _, id := range tc.ids {
 		if id == leaderID {
@@ -275,23 +291,49 @@ func TestGCStateSurvivesLogReplayAndInstallSnapshotIdentically(t *testing.T) {
 		return tc.node(snapshotFollower).FSM().GCWatermark() == leader.FSM().GCWatermark()
 	})
 
-	// Let the cluster fully quiesce on one applied index before taking
-	// the byte-comparison snapshot, so the assertion below compares
-	// three settled states rather than racing an in-flight proposal.
-	awaitCondition(t, 10*time.Second, "cluster quiesces on one applied index", func() bool {
-		li := leader.Status().AppliedIndex
-		return tc.node(replayFollower).Status().AppliedIndex == li && tc.node(snapshotFollower).Status().AppliedIndex == li
-	})
-
-	leaderState := leader.FSM().EncodeState()
-	replayState := tc.node(replayFollower).FSM().EncodeState()
-	snapshotState := tc.node(snapshotFollower).FSM().EncodeState()
-
-	if string(replayState) != string(leaderState) {
-		t.Fatalf("replay-follower FSM.EncodeState() diverges from leader's (len %d vs %d)", len(replayState), len(leaderState))
+	// Let the cluster fully quiesce on one settled instant before taking
+	// the byte-comparison snapshot. A two-step "wait for applied-index
+	// equality, THEN separately re-read state" check is a genuine TOCTOU
+	// race: gcTuningOverride's 15ms GC interval keeps the leader
+	// proposing continuation passes in the background even after this
+	// test's own writes stop (maybeProposeGC's own !advance && !cont
+	// guard is what eventually stops it for good), so a continuation
+	// pass can commit on the leader between the index-equality check and
+	// the later sequential EncodeState() reads, landing on the leader
+	// before it replicates to a follower — exactly the race
+	// sl12_gc_chaos_test.go's checkConverged helper documents and avoids
+	// for this same GC feature. Only a same-iteration, all-fresh-reads
+	// comparison is race-free; mirror that established pattern here.
+	ok := false
+	var mismatch string
+	deadline := time.Now().Add(10 * time.Second)
+	for time.Now().Before(deadline) {
+		wantIndex := leader.Status().AppliedIndex
+		wantState := leader.FSM().EncodeState()
+		mismatch = ""
+		for _, follower := range []struct {
+			id    raft.NodeID
+			label string
+		}{{replayFollower, "replay-follower"}, {snapshotFollower, "snapshot-follower"}} {
+			n := tc.node(follower.id)
+			if n.Status().AppliedIndex != wantIndex {
+				mismatch = fmt.Sprintf("%s applied index not yet settled to leader's %d", follower.label, wantIndex)
+				break
+			}
+			got := n.FSM().EncodeState()
+			if string(got) != string(wantState) {
+				mismatch = fmt.Sprintf("%s FSM.EncodeState() diverges from leader's (len %d vs %d)", follower.label, len(got), len(wantState))
+				break
+			}
+		}
+		if mismatch == "" {
+			ok = true
+			break
+		}
+		time.Sleep(5 * time.Millisecond)
 	}
-	if string(snapshotState) != string(leaderState) {
-		t.Fatalf("snapshot-follower FSM.EncodeState() diverges from leader's (len %d vs %d)", len(snapshotState), len(leaderState))
+	if !ok {
+		t.Fatalf("cluster never reached a stable converged instant within 10s: %s", mismatch)
 	}
 
 	for _, id := range []raft.NodeID{leaderID, replayFollower, snapshotFollower} {
