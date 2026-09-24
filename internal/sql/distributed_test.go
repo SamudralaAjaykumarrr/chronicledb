@@ -2,10 +2,12 @@ package sql
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log"
 	"net"
 	"os"
+	"sync"
 	"testing"
 	"time"
 
@@ -178,6 +180,46 @@ func awaitConditionSQL(t *testing.T, timeout time.Duration, msg string, cond fun
 	t.Fatalf("condition not met within %s: %s", timeout, msg)
 }
 
+// mustExecRetryingLeadershipLoss executes sqlText/requestID against
+// whichever node in c currently reports itself leader, re-fetching that
+// node and retrying with the identical requestID on the two documented-
+// safe-to-retry classes (node.ErrLeadershipLost's own doc comment:
+// "outcome unknown, retry by RequestID against the current leader"; a
+// bare *node.NotLeaderError, the same node not yet — or no longer —
+// leader when this attempt's own Execute reached its admission check) —
+// dynamic_membership_test.go's currentSQLLeader/awaitConditionSQL
+// pattern already established for this identical error class, applied
+// here to plain writes instead of membership calls. Any other error is
+// a real, unexpected failure and fails the test immediately, exactly
+// like mustExec.
+func mustExecRetryingLeadershipLoss(t *testing.T, c *sqlCluster, mu *sync.Mutex, sqlText, requestID string) Result {
+	t.Helper()
+	var res Result
+	var execErr error
+	awaitConditionSQL(t, 5*time.Second, fmt.Sprintf("Execute(%q) eventually succeeds against the current leader", sqlText), func() bool {
+		cur := currentSQLLeader(c, mu)
+		if cur == nil {
+			return false
+		}
+		s := NewSession(NewReplicatedEngine(cur))
+		r, err := s.Execute(context.Background(), sqlText, requestID)
+		if err != nil {
+			var nle *node.NotLeaderError
+			if errors.As(err, &nle) || errors.Is(err, node.ErrLeadershipLost) {
+				return false
+			}
+			execErr = fmt.Errorf("Execute(%q): unexpected error: %w", sqlText, err)
+			return true
+		}
+		res = r
+		return true
+	})
+	if execErr != nil {
+		t.Fatal(execErr)
+	}
+	return res
+}
+
 // TestDistributedSQLInsertReplicates proves the headline Phase 8
 // distributed scenario: SQL INSERT -> Raft commit -> replicated state
 // -> every node (not just the leader) ends up with the identical
@@ -260,7 +302,6 @@ func TestDistributedSQLSnapshotCompactionSurvivesRestart(t *testing.T) {
 	const rows = 20
 	c := newSQLClusterWithSnapshotThreshold(t, 3, 5)
 	leaderID := c.awaitLeader(10 * time.Second)
-	leader := c.nodes[leaderID]
 
 	// This test holds leader across a real multi-round-trip sequence
 	// (CREATE TABLE + 20 INSERTs) that deliberately crosses
@@ -289,10 +330,26 @@ func TestDistributedSQLSnapshotCompactionSurvivesRestart(t *testing.T) {
 		}
 	}()
 
-	s := NewSession(NewReplicatedEngine(leader))
-	mustExec(t, s, "CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)", "create")
+	// mustExecRetryingLeadershipLoss (not plain mustExec): freezing
+	// ticks above closes the self-initiated-re-election window, but not
+	// a step-down from a higher-term message already in flight when
+	// leaderID was first observed (leader is a momentary Role==Leader
+	// snapshot, not proof of settled leadership) — the same class
+	// TestPeerMTLS_ThreeNodeClusterReplicatesEndToEnd and
+	// TestAC6_ControlPlaneNonStarvationUnderSaturatedClientLoad were
+	// both independently reproduced hitting under induced contention
+	// during this investigation, confirming it is generic to real-
+	// cluster startup, not specific to this test's SnapshotThreshold.
+	// node.ErrLeadershipLost's own doc comment is "retry by RequestID
+	// against the current leader" — this re-fetches the current leader
+	// and retries with the identical RequestID, exactly that documented
+	// contract, exactly as dynamic_membership_test.go's own established
+	// pattern (currentSQLLeader + awaitConditionSQL) already does for
+	// this identical error class.
+	var mu sync.Mutex
+	mustExecRetryingLeadershipLoss(t, c, &mu, "CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)", "create")
 	for i := 0; i < rows; i++ {
-		mustExec(t, s, fmt.Sprintf("INSERT INTO t VALUES (%d, 'v%d')", i, i), fmt.Sprintf("ins-%d", i))
+		mustExecRetryingLeadershipLoss(t, c, &mu, fmt.Sprintf("INSERT INTO t VALUES (%d, 'v%d')", i, i), fmt.Sprintf("ins-%d", i))
 	}
 
 	followerID := c.anyOtherNode(leaderID)
