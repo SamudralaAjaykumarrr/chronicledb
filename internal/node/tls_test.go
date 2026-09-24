@@ -2,6 +2,7 @@ package node
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"testing"
 	"time"
@@ -64,6 +65,40 @@ func newTLSTestClusterWithSnapshotThreshold(t *testing.T, n int, snapshotThresho
 	return tc, ca
 }
 
+// proposeRetryingLeadershipLoss submits c against tc's current leader,
+// re-fetching that leader and retrying with the identical RequestID on
+// *NotLeaderError/ErrLeadershipLost — both documented
+// (internal/node/errors.go) as "outcome unknown, retry by RequestID
+// against the current leader," not a defect: tc.awaitLeader only
+// samples Role==Leader at one instant, a momentary snapshot rather than
+// proof of settled leadership, so a higher-term message from a peer's
+// own election already in flight at that instant can still arrive and
+// cause a legitimate step-down right as the very next Propose is
+// issued (the same class internal/sql's dynamic_membership_test.go
+// already retries for membership calls, and 70882bf hardens for a
+// different package's writes). Bounded by overall — a hard wall-clock
+// deadline, not an attempt count — never a blind retry: any other
+// error stops immediately.
+func proposeRetryingLeadershipLoss(t *testing.T, tc *testCluster, c fsm.CommitTxnCommand, overall time.Duration) (fsm.Outcome, error) {
+	t.Helper()
+	deadline := time.Now().Add(overall)
+	for {
+		leaderID := tc.awaitLeader(overall)
+		ln := tc.node(leaderID)
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		outcome, err := ln.Propose(ctx, c)
+		cancel()
+		if err == nil {
+			return outcome, nil
+		}
+		var nle *NotLeaderError
+		if (errors.As(err, &nle) || errors.Is(err, ErrLeadershipLost)) && time.Now().Before(deadline) {
+			continue
+		}
+		return outcome, err
+	}
+}
+
 // TestPeerMTLS_ThreeNodeClusterReplicatesEndToEnd is the required
 // integration proof: real TCP, real certs, a real three-node cluster,
 // leader election, and a replicated write confirmed committed on every
@@ -71,15 +106,10 @@ func newTLSTestClusterWithSnapshotThreshold(t *testing.T, n int, snapshotThresho
 func TestPeerMTLS_ThreeNodeClusterReplicatesEndToEnd(t *testing.T) {
 	tc, _ := newTLSTestCluster(t, 3)
 
-	leader := tc.awaitLeader(10 * time.Second)
-	ln := tc.node(leader)
-
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-	outcome, err := ln.Propose(ctx, fsm.CommitTxnCommand{
+	outcome, err := proposeRetryingLeadershipLoss(t, tc, fsm.CommitTxnCommand{
 		RequestID: "r1", TxnID: 1, StartSeq: 0,
 		Mutations: []mvcc.Mutation{{Key: "k1", Value: []byte("v1")}},
-	})
+	}, 10*time.Second)
 	if err != nil || outcome.Status != fsm.StatusCommitted {
 		t.Fatalf("Propose over mTLS cluster: outcome=%+v err=%v", outcome, err)
 	}
