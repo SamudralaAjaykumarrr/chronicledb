@@ -10,9 +10,12 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/SamudralaAjaykumarrr/chronicledb/internal/admission"
+	"github.com/SamudralaAjaykumarrr/chronicledb/internal/audit"
 	"github.com/SamudralaAjaykumarrr/chronicledb/internal/backup"
 	"github.com/SamudralaAjaykumarrr/chronicledb/internal/fsm"
 	"github.com/SamudralaAjaykumarrr/chronicledb/internal/identity"
+	"github.com/SamudralaAjaykumarrr/chronicledb/internal/metrics"
 	"github.com/SamudralaAjaykumarrr/chronicledb/internal/mvcc"
 	"github.com/SamudralaAjaykumarrr/chronicledb/internal/raft"
 	"github.com/SamudralaAjaykumarrr/chronicledb/internal/snapshot"
@@ -97,6 +100,166 @@ type Config struct {
 	// This is an operational threshold, never a safety rule (§2.6
 	// enforces every safety property regardless of its value).
 	PromotionMaxLagEntries uint64
+
+	// --- Admission control (docs/v0.6.0-plan.md Part A, §10.1) ---
+	//
+	// Every "MaxConcurrent"-shaped field below follows
+	// SnapshotThreshold's existing "0 means use the package default"
+	// convention for direct Go-API construction (setDefaults below),
+	// exactly like every other Config field — this is what keeps
+	// Config{}-constructed nodes in every pre-v0.6.0 test working with
+	// no admission-specific changes (release gate 10: no regression in
+	// any existing scenario). §10.1's "0 is a startup error" rule binds
+	// the *CLI flag* an operator can type (enforced in
+	// cmd/chronicledb-node, where the flag's own default is already the
+	// production value, so parsing 0 can only mean an explicit,
+	// deliberate override) — a different, narrower boundary than this
+	// Go struct's own zero value.
+
+	// MaxInflightProposals is Lane B write concurrency (-max-inflight-
+	// proposals), and separately the len(n.waiters) event-loop ceiling
+	// (§5.3) — the authoritative BOUNDED ADMITTED WORK mechanism, not
+	// merely a copy of the gate's own bound (see fact 8d: a canceled
+	// caller frees its gate slot while its waiter survives).
+	MaxInflightProposals int
+	// MaxConcurrentReads is Lane B BeginReadIndex concurrency
+	// (-max-concurrent-reads), and separately the len(n.pendingReads)
+	// event-loop ceiling (§9.1a).
+	MaxConcurrentReads int
+	// MaxLiveReadLeases bounds the live-read-lease registry
+	// (-max-live-read-leases, §9.1a/§15.3) — unlike MaxInflightProposals/
+	// MaxConcurrentReads, this ceiling has no caller-side gate
+	// counterpart at all, so it is the primary limiter for this
+	// resource, not a backstop.
+	MaxLiveReadLeases int
+	// AdmissionQueueDepth is the waiting-room capacity behind Lane B's
+	// write/read gates (-admission-queue-depth). 0 = reject
+	// immediately, never wait — a legitimate, permanent configuration,
+	// not merely "use the default."
+	AdmissionQueueDepth int
+	// AdmissionMaxWait bounds how long a queued Lane B caller waits
+	// before ReasonQueueTimeout (-admission-max-wait). 0 = bounded only
+	// by the caller's own ctx.
+	AdmissionMaxWait time.Duration
+	// MaxAdminConcurrency is Lane A1 (control: membership, upgrade
+	// precheck/finalize, TLS reload) concurrency (-max-admin-concurrency).
+	MaxAdminConcurrency int
+	// MaxMaintenanceConcurrency is Lane A2 (maintenance: backup, scrub)
+	// concurrency (-max-maintenance-concurrency); each kind is
+	// additionally single-slot (§3.2a).
+	MaxMaintenanceConcurrency int
+	// MaxPeerConnections bounds concurrent inbound Raft peer connections
+	// (-max-peer-connections). 0 means unlimited — v0.5.0 behavior
+	// exactly.
+	MaxPeerConnections int
+	// PeerIdleTimeout is the read deadline applied to an inbound peer
+	// connection (-peer-idle-timeout). 0 means no deadline — v0.5.0
+	// behavior exactly.
+	PeerIdleTimeout time.Duration
+
+	// --- MVCC GC (docs/v0.6.0-plan.md §10.2, §13.4) ---
+
+	// GCInterval is how often the leader evaluates and, if warranted,
+	// proposes a GC watermark advance (-gc-interval). 0 (the default)
+	// disables GC entirely (S-12) — deliberately NOT defaulted to a
+	// nonzero value in setDefaults, exactly like AdmissionQueueDepth:
+	// 0 is GC's own meaningful, intentional "off" state, not merely
+	// "unset". A v0.6.0 node started with no new flags must propose
+	// zero AdvanceGCWatermark commands (release gate 9).
+	GCInterval time.Duration
+	// GCMinRetainSeqs is the lag floor (-gc-min-retain-seqs, §14.2):
+	// the proposed watermark never exceeds appliedCommitSeq minus this.
+	GCMinRetainSeqs uint64
+	// GCMinAdvanceSeqs gates watermark ADVANCES, not continuation
+	// passes (-gc-min-advance-seqs, §13.4a).
+	GCMinAdvanceSeqs uint64
+	// GCMaxVersionsPerPass/GCMaxKeysPerPass bound one Apply's removed/
+	// examined work (-gc-max-versions-per-pass, -gc-max-keys-per-pass,
+	// §14.4) — carried in the proposed command itself, so every replica
+	// performs byte-identical work regardless of its own flags.
+	GCMaxVersionsPerPass uint32
+	GCMaxKeysPerPass     uint32
+
+	// --- Retention knobs (docs/v0.6.0-plan.md §17.3, §18.2) ---
+
+	// WALRetainExtraSegments is passed through to
+	// WAL.CompactBeforeRetaining on every maybeSnapshot cycle
+	// (-wal-retain-extra-segments). 0 (the default) reproduces
+	// CompactBefore's own exact v0.5.0 behavior. Must be >= 0;
+	// Open refuses a negative value (SL-9).
+	WALRetainExtraSegments int
+	// SnapshotRetainCount is how many of the newest snapshot files
+	// Manager retains (-snapshot-retain-count). 0 means "unset, keep
+	// Manager's own built-in default of 1" — today's exact v0.5.0
+	// behavior — for a direct Go-API caller that never sets it; the CLI
+	// itself defaults its flag to 1 and refuses 0 explicitly (SL-9),
+	// since an operator typing -snapshot-retain-count=0 almost
+	// certainly means "I want no retention," which is not an available
+	// configuration (Manager.SetRetainCount's own floor — retaining
+	// zero would risk having no valid snapshot on disk at all). A
+	// negative value is refused by Open either way.
+	SnapshotRetainCount int
+
+	// --- Disk/heap pressure and fsync-failure health (docs/v0.6.0-plan.md
+	// §6, §10.1, §10.2, §19, §20) ---
+
+	// DiskPressureThreshold/DiskCriticalThreshold are the raw
+	// -disk-pressure-threshold/-disk-critical-threshold flag values
+	// (admission.ParseThreshold syntax: an absolute size like "2GiB" or
+	// a percentage like "10%"), parsed and validated by Open. "" (the
+	// default) means "off" for that threshold, exactly v0.5.0 behavior
+	// (§10.3): disk pressure never gates admission or drives the §19.1
+	// state machine past Healthy unless at least one is set.
+	DiskPressureThreshold string
+	DiskCriticalThreshold string
+	// MaxHeapBytes is -max-heap-bytes: an admission threshold (§6.3;
+	// never an allocator limit) above which Lane B writes are tightened
+	// exactly as disk LowSpace does. 0 (the default) disables it.
+	MaxHeapBytes uint64
+	// ResourcePollInterval is -resource-poll-interval: the cadence at
+	// which the disk/heap PressureMonitor goroutine samples (§6.1). 0
+	// means "use the package default" (5s) — this field has no
+	// legitimate "off" meaning of its own, unlike AdmissionQueueDepth.
+	ResourcePollInterval time.Duration
+	// FsyncFailureThreshold is -fsync-failure-threshold (§20.2):
+	// consecutive non-Raft-path (snapshot/backup/audit) fsync failures
+	// before this node marks itself storage-unhealthy. 0 is a
+	// legitimate, strict configuration ("unhealthy on the very first
+	// such failure"), not merely "unset" — mirroring
+	// AdmissionQueueDepth's own "0 has a real meaning" convention — so
+	// it is deliberately NOT defaulted in setDefaults;
+	// cmd/chronicledb-node's own flag default (3) supplies the
+	// recommended out-of-the-box value.
+	FsyncFailureThreshold int
+	// AuditLog, when non-nil, receives one audit.Entry
+	// (Action="node.health") for every §19.1/§20.2 state transition
+	// this node experiences (§20.3) — hash-chained, append-only,
+	// exactly like every other administrative audit record. nil (the
+	// default for any test or Go-API caller that does not care) simply
+	// skips auditing these transitions; it is never a correctness
+	// dependency for the state machine itself (docs/roadmap.md
+	// §Observability's "never a correctness dependency" rule, applied
+	// here as it is to Logger). cmd/chronicledb-node opens exactly one
+	// *audit.Log per process and shares it between this field and its
+	// own request-level admin-action auditing, since two independent
+	// *audit.Log instances Append-ing to the same on-disk chain would
+	// corrupt it.
+	AuditLog *audit.Log
+	// AuditLogDir, when set, is the directory Node.Scrub reads to verify
+	// the audit-log hash chain (§21.3) — a plain path, deliberately
+	// separate from AuditLog itself: scrub never touches a live
+	// *audit.Log (which is single-caller-owned, exactly like
+	// n.walog/n.snapMgr), only the directory's on-disk contents, via its
+	// own read-only internal/audit.Scrub (§21.4). "" skips the audit
+	// chain check (auditRecordsChecked stays 0) — a Go-API caller that
+	// never configured an audit log has nothing to scrub there anyway.
+	AuditLogDir string
+	// ScrubBytesPerSec is -scrub-bytes-per-sec (§21.4): caps Node.Scrub's
+	// combined WAL+snapshot+audit read rate. 0 means unlimited — a
+	// legitimate configuration, not merely "unset", so it is not
+	// defaulted in setDefaults; cmd/chronicledb-node's own flag default
+	// (64MiB) supplies the recommended out-of-the-box value.
+	ScrubBytesPerSec int64
 }
 
 // PeerTLSEnabled reports whether Config requests peer mTLS.
@@ -110,6 +273,32 @@ const (
 	defaultHeartbeatTimeoutTicks      = 2
 	defaultTickInterval               = 20 * time.Millisecond
 	defaultSnapshotThreshold          = 4096
+
+	// Admission control defaults (docs/v0.6.0-plan.md §10.1). Only the
+	// fields where 0 has no legitimate meaning of its own are defaulted
+	// here — see setDefaults' AdmissionQueueDepth/AdmissionMaxWait
+	// comment for why those two are not.
+	defaultMaxInflightProposals      = 256
+	defaultMaxConcurrentReads        = 512
+	defaultMaxLiveReadLeases         = 4096
+	defaultMaxAdminConcurrency       = 2
+	defaultMaxMaintenanceConcurrency = 2
+
+	// defaultResourcePollInterval is -resource-poll-interval's package
+	// default (docs/v0.6.0-plan.md §10.1): frequent enough that AC-13's
+	// "tightens before any real write failure" holds well within a
+	// human-perceptible interval, infrequent enough to cost nothing
+	// (one syscall.Statfs plus one runtime/metrics.Read per tick).
+	defaultResourcePollInterval = 5 * time.Second
+
+	// MVCC GC has no in-package defaults (docs/v0.6.0-plan.md §10.2):
+	// GCInterval, GCMinRetainSeqs, GCMinAdvanceSeqs,
+	// GCMaxVersionsPerPass and GCMaxKeysPerPass are all left at their
+	// Go zero value by setDefaults (see its own comment) — every one of
+	// them has a legitimate explicit meaning at 0, not just GCInterval.
+	// cmd/chronicledb-node's flag defaults (0, 1024, 256, 4096, 16384)
+	// are the single source of truth for the recommended production
+	// values.
 )
 
 func (c *Config) setDefaults() {
@@ -128,6 +317,53 @@ func (c *Config) setDefaults() {
 	if c.SnapshotThreshold == 0 {
 		c.SnapshotThreshold = defaultSnapshotThreshold
 	}
+	if c.MaxInflightProposals == 0 {
+		c.MaxInflightProposals = defaultMaxInflightProposals
+	}
+	if c.MaxConcurrentReads == 0 {
+		c.MaxConcurrentReads = defaultMaxConcurrentReads
+	}
+	if c.MaxLiveReadLeases == 0 {
+		c.MaxLiveReadLeases = defaultMaxLiveReadLeases
+	}
+	// AdmissionQueueDepth and AdmissionMaxWait are deliberately NOT
+	// defaulted here, unlike every field above: 0 is a fully legitimate,
+	// intentional value for both (§10.1: "0 = reject immediately, never
+	// wait" / "0 = bounded only by the caller's own ctx"), not merely
+	// "unset" — silently substituting a nonzero default would make it
+	// impossible for a direct Go-API caller to actually request either
+	// behavior. cmd/chronicledb-node's own flag defaults (256, 500ms)
+	// supply the recommended out-of-the-box CLI values instead.
+	if c.MaxAdminConcurrency == 0 {
+		c.MaxAdminConcurrency = defaultMaxAdminConcurrency
+	}
+	if c.MaxMaintenanceConcurrency == 0 {
+		c.MaxMaintenanceConcurrency = defaultMaxMaintenanceConcurrency
+	}
+	if c.ResourcePollInterval <= 0 {
+		c.ResourcePollInterval = defaultResourcePollInterval
+	}
+	// FsyncFailureThreshold is deliberately NOT defaulted here, for the
+	// same reason as AdmissionQueueDepth above: 0 is a fully legitimate,
+	// strict, intentional value (§20.2: "unhealthy on the very first
+	// non-Raft-path fsync failure"), not merely "unset".
+	// cmd/chronicledb-node's own flag default (3) supplies the
+	// recommended out-of-the-box CLI value instead.
+	// GCInterval, GCMinRetainSeqs, GCMinAdvanceSeqs, GCMaxVersionsPerPass
+	// and GCMaxKeysPerPass are all deliberately NOT defaulted here, for
+	// the same reason as AdmissionQueueDepth/AdmissionMaxWait above: 0
+	// is a fully legitimate, intentional value for each of them, not
+	// merely "unset" — GCInterval's 0 disables GC entirely (S-12);
+	// GCMinRetainSeqs/GCMinAdvanceSeqs's 0 requests no safety slack
+	// (still bounded by minLease/appliedIndex, never unsafe, just less
+	// conservative); GCMaxVersionsPerPass/GCMaxKeysPerPass's 0 requests
+	// "advance/record the watermark but reclaim nothing this pass"
+	// (internal/fsm/gc.go's ApplyAdvanceGCWatermark: `if cmd.MaxKeys > 0`
+	// guards the whole reclaim walk). Silently substituting a nonzero
+	// default here would make every one of those explicit choices
+	// unreachable for a direct Go-API caller. cmd/chronicledb-node's own
+	// flag defaults (0, 1024, 256, 4096, 16384) supply the recommended
+	// out-of-the-box CLI values instead.
 }
 
 func (c Config) validate() error {
@@ -157,6 +393,28 @@ func (c Config) validate() error {
 		if c.PeerTLSCertFile == "" || c.PeerTLSKeyFile == "" || c.PeerTLSCAFile == "" {
 			return fmt.Errorf("node: peer mTLS requires PeerTLSCertFile, PeerTLSKeyFile, and PeerTLSCAFile all set (got cert=%q key=%q ca=%q) — partial peer-TLS configuration is not supported (NO PLAINTEXT PEER REPLICATION)",
 				c.PeerTLSCertFile, c.PeerTLSKeyFile, c.PeerTLSCAFile)
+		}
+	}
+	if c.WALRetainExtraSegments < 0 {
+		return fmt.Errorf("node: Config.WALRetainExtraSegments must be >= 0, got %d", c.WALRetainExtraSegments)
+	}
+	if c.SnapshotRetainCount < 0 {
+		return fmt.Errorf("node: Config.SnapshotRetainCount must be >= 0 (0 means \"use Manager's default of 1\"), got %d", c.SnapshotRetainCount)
+	}
+	// Syntax only here (ADMISSION FAILS CLOSED must still refuse a
+	// malformed flag value at startup): the platform-support check and
+	// the critical<pressure comparison both need DataDir to already
+	// exist (an absolute threshold needs nothing, but a percentage one
+	// needs DiskTotalBytes) and are performed by Open, after wal.Open
+	// has created DataDir (docs/v0.6.0-plan.md §6.2).
+	if c.DiskPressureThreshold != "" {
+		if _, err := admission.ParseThreshold(c.DiskPressureThreshold); err != nil {
+			return fmt.Errorf("node: Config.DiskPressureThreshold: %w", err)
+		}
+	}
+	if c.DiskCriticalThreshold != "" {
+		if _, err := admission.ParseThreshold(c.DiskCriticalThreshold); err != nil {
+			return fmt.Errorf("node: Config.DiskCriticalThreshold: %w", err)
 		}
 	}
 	return nil
@@ -200,6 +458,20 @@ type Status struct {
 	// non-leader.
 	ChangesReady   bool
 	NotReadyReason string
+
+	// DiskPressure is this node's current diskPressure status string
+	// (docs/v0.6.0-plan.md §11.3): one of "normal", "low", "critical",
+	// "unsupported" (this platform/config never probes disk usage), or
+	// "probe_failed" (probing is configured/possible but the most
+	// recent sample errored — §6.2's fail-safe direction).
+	DiskPressure string
+	// StorageHealthy is false once §20.2's consecutive non-Raft fsync
+	// failure threshold has been reached (chronicledb_storage_health).
+	StorageHealthy bool
+	// Ready mirrors the exact /health readiness rule (§11.3): false iff
+	// DiskPressure=="critical" or !StorageHealthy. A node in "low" disk
+	// pressure is still Ready (with a warning, at the HTTP layer).
+	Ready bool
 }
 
 type waiter struct {
@@ -220,10 +492,15 @@ type proposeReq struct {
 
 type readResult struct {
 	startSeq uint64
+	lease    *ReadLease
 	err      error
 }
 
 type readIndexReq struct {
+	// leaseID is pre-allocated by BeginReadIndex, on the caller's own
+	// goroutine, before this request is even sent — see
+	// Node.nextLeaseID's doc comment.
+	leaseID  uint64
 	resultCh chan readResult
 }
 
@@ -343,7 +620,13 @@ type pendingRead struct {
 	// directly, or against a purely local processing-order counter, is
 	// not sufficient).
 	requiredSeq uint64
-	resultCh    chan readResult
+	// leaseID is the read lease registered at capture time, alongside
+	// target (docs/v0.6.0-plan.md §15.3): kept here so a resolution-
+	// failure path (leadership lost) can release it — a successful
+	// resolution instead hands the live *ReadLease to the caller via
+	// readResult, who now owns releasing it.
+	leaseID  uint64
+	resultCh chan readResult
 }
 
 // Node is ChronicleDB's process-level runtime (docs/architecture.md §5
@@ -441,6 +724,141 @@ type Node struct {
 	waiters      map[raft.Index]waiter
 	pendingReads []pendingRead
 
+	// leases is the live-read-lease registry (docs/v0.6.0-plan.md
+	// §9.1a/§15.3): read and written exclusively on run()'s own
+	// goroutine, exactly like waiters/pendingReads.
+	leases *leaseRegistry
+	// maxLiveReadLeases is the -max-live-read-leases event-loop
+	// ceiling (§9.1a): unlike maxClientWaiters/maxPendingReads, this
+	// ceiling has no caller-side gate counterpart at all, so it is the
+	// PRIMARY limiter for this resource, not a backstop.
+	maxLiveReadLeases int
+	// releaseLeaseCh carries a released/abandoned lease's id onto
+	// run()'s goroutine, the only one permitted to mutate leases — used
+	// by both ReadLease.Release (a caller done with its transaction)
+	// and BeginReadIndex's own ctx-cancellation path (§15.3's lifecycle
+	// table).
+	releaseLeaseCh chan uint64
+	// nextLeaseID allocates read-lease ids from any caller goroutine
+	// (atomic, unlike the rest of the event-loop-owned state above):
+	// BeginReadIndex allocates one before ever sending its request, so
+	// its own cancellation path can name the lease without having
+	// received a result. handleReadIndex uses the caller-supplied id
+	// rather than generating its own.
+	nextLeaseID atomic.Uint64
+
+	// --- MVCC GC leader proposer (docs/v0.6.0-plan.md §13.4) ---
+	//
+	// gcIntervalTicks is cfg.GCInterval expressed in TickInterval units
+	// (0 means GC is disabled — no ticker, no evaluation, ever: the
+	// exact v0.5.0-behavior guarantee release gate 9 requires). gcTicksLeft
+	// counts down exactly like electionTicksLeft/heartbeatTicksLeft.
+	gcIntervalTicks      int
+	gcTicksLeft          int
+	gcMinRetainSeqs      uint64
+	gcMinAdvanceSeqs     uint64
+	gcMaxVersionsPerPass uint32
+	gcMaxKeysPerPass     uint32
+	// gcProposalInFlight/gcProposalIndex track "no GC proposal already
+	// in flight" (§13.4): set when maybeProposeGC's own InputPropose is
+	// accepted, cleared either when that exact index actually applies
+	// (applyAdvanceGCWatermarkEntry) or on stepping down as leader —
+	// never on any other condition, since §13.4a's RequestID is a pure
+	// function of replicated state, so the next leader (possibly this
+	// same node re-elected) needs no cross-term memory of an
+	// unresolved attempt.
+	gcProposalInFlight bool
+	gcProposalIndex    raft.Index
+
+	// --- Disk/heap pressure + fsync-failure health (docs/v0.6.0-plan.md
+	// §6.4, §19, §20) — see pressure.go. pressureMon always runs, even
+	// with every threshold off, purely for /status diagnostics (§6.1) —
+	// it never itself decides admission; pressureState is what does.
+	// pressureMon is an atomic.Pointer, not a plain field, because
+	// refreshStatusLocked reads it (via diskPressureStatusString) on
+	// every single event-loop iteration regardless of
+	// resourcePollTicks, while SetPressureSourceForTest reassigns it
+	// from a test goroutine (found by this slice's own -race run: a
+	// plain-field version of this raced a live node's refreshStatusLocked
+	// against SetPressureSourceForTest's swap).
+	pressureMon        atomic.Pointer[admission.PressureMonitor]
+	diskPressureSet    bool // -disk-pressure-threshold configured
+	diskCriticalSet    bool // -disk-critical-threshold configured
+	diskPressureThresh admission.Threshold
+	diskCriticalThresh admission.Threshold
+	resourcePollTicks  int // cfg.ResourcePollInterval expressed in TickInterval units
+	resourcePollLeft   int
+	// pressureState is written from run's own goroutine (inside
+	// checkResourcePressure, called from tick — same-package tests also
+	// call checkResourcePressure directly, from a test goroutine) while
+	// refreshStatusLocked reads it (via diskPressureStatusString) on
+	// every event-loop iteration; an atomic, not a plain PressureState
+	// field, is what makes that concurrent read/write pattern race-free.
+	pressureState atomic.Int32
+
+	// consecutiveNonRaftFsyncFailures/storageUnhealthy implement §20.2's
+	// threshold: incremented/cleared exclusively from
+	// Node.noteFsyncResult, which every non-Raft-path durable write
+	// (maybeSnapshot's four durable steps, Node.Backup, and — via
+	// NoteAuditWriteResult — every internal/audit.Log.Append this
+	// process makes) funnels through. atomic because
+	// NoteAuditWriteResult is called from cmd/chronicledb-node's HTTP
+	// request-handling goroutines, not run's event-loop goroutine.
+	consecutiveNonRaftFsyncFailures atomic.Int64
+	storageUnhealthy                atomic.Bool
+	fsyncFailuresTotal              map[FsyncPath]*metrics.Counter
+
+	// admission holds every internal/admission.Gate this node owns
+	// (docs/v0.6.0-plan.md §3.2's four lanes). Every acquisition happens
+	// on a caller's goroutine, in Propose/BeginReadIndex/Backup/
+	// membershipRequest/UpgradePrecheck/FinalizeUpgrade — never here in
+	// a field read by run()'s own goroutine, which is Rule CP-1/CP-2
+	// (§4.2), asserted structurally by
+	// TestAdmissionNeverReachableFromEventLoop.
+	admission *admissionGates
+	// maxClientWaiters/maxPendingReads are the two event-loop ceilings
+	// (§5.3, §9.1a) — the *authoritative* BOUNDED ADMITTED WORK
+	// mechanism, checked on run()'s own goroutine in handlePropose/
+	// handleReadIndex, independently of admission.Gate's own bound (see
+	// fact 8d/8c: a caller that cancels its context frees its gate slot
+	// while its waiter/pendingRead entry survives).
+	maxClientWaiters int
+	maxPendingReads  int
+
+	// noopWriteGateForTest/skipLaneSeparationForTest are AC-5/AC-7's
+	// negative-control hooks (docs/v0.6.0-plan.md §29:
+	// node.SetNoopAdmissionGateForTest,
+	// node.SetSkipAdmissionLaneSeparationForTest). Never set in
+	// production. See each Set*ForTest method's doc comment.
+	noopWriteGateForTest      atomic.Bool
+	skipLaneSeparationForTest atomic.Bool
+
+	// preSnapshotBytesFillHookForTest is SL-11's determinism hook
+	// (docs/v0.6.0-plan.md §18.1): when armed, called with the index
+	// processOutput is about to ask snapMgr.Bytes for, immediately
+	// before that call — solely so a test can force the exact
+	// decision-then-fill race deterministically (synchronously prune the
+	// requested index away right there) instead of relying on hitting it
+	// by timing. Never set in production.
+	preSnapshotBytesFillHookForTest atomic.Pointer[func(index uint64)]
+
+	// backupEnteredMaintenanceForTest is AC-22's determinism hook
+	// (docs/v0.6.0-plan.md §30.1): when armed, called synchronously by
+	// Backup immediately after it acquires the Lane A2 maintenance
+	// permit, before doing any work. admission.Gate.InFlight() becoming
+	// nonzero is only ever a momentary, externally-polled sample — on a
+	// fast enough disk, Acquire, the real Export work, and the deferred
+	// Release can all complete inside a single Go scheduling quantum, so
+	// a poller can legitimately observe InFlight()==0 for the entire
+	// call even though the permit really was held throughout (confirmed
+	// via CI: Backup finishing successfully in ~0.1s, well under one
+	// polling interval). This hook gives a test a real rendezvous with
+	// "the permit is held right now" instead of racing a transient
+	// counter — if fn itself blocks, Backup stays inside the
+	// maintenance-admitted region until the test releases it. Never set
+	// in production.
+	backupEnteredMaintenanceForTest atomic.Pointer[func()]
+
 	// clusterGeneration mirrors fsm.FSM.ClusterGeneration() but is
 	// written directly by run's own goroutine (via
 	// adoptClusterGeneration) instead of read through fsmachine's mutex
@@ -516,6 +934,15 @@ type Node struct {
 	statusMu sync.Mutex
 	status   Status
 
+	// scrubMu/lastScrubReport hold the most recent Scrub result for
+	// GET /admin/storage/status (§21.1) — Scrub itself never runs
+	// concurrently with another Scrub call (bounded by
+	// admission.scrubSlot's single-slot capacity), but this mutex is
+	// still required for the READ side, from an unrelated HTTP request
+	// goroutine.
+	scrubMu         sync.Mutex
+	lastScrubReport *ScrubReport
+
 	// metrics holds this node's diagnostic counters (docs/roadmap.md
 	// Phase 9, see metrics.go). Every field is itself concurrency-safe
 	// (sync/atomic-backed), so metrics is read via Metrics() from any
@@ -552,6 +979,12 @@ func Open(cfg Config) (*Node, error) {
 	if err != nil {
 		w.Close()
 		return nil, fmt.Errorf("node: opening snapshot directory: %w", err)
+	}
+	if cfg.SnapshotRetainCount > 0 {
+		if err := snapMgr.SetRetainCount(cfg.SnapshotRetainCount); err != nil {
+			w.Close()
+			return nil, fmt.Errorf("node: %w", err)
+		}
 	}
 
 	// Recovery steps 1-4 (docs/recovery.md §1): locate and validate the
@@ -681,38 +1114,114 @@ func Open(cfg Config) (*Node, error) {
 		w.Close()
 		return nil, err
 	}
+	tr.SetMaxPeerConnections(cfg.MaxPeerConnections)
+	tr.SetPeerIdleTimeout(cfg.PeerIdleTimeout)
+
+	admissionGates, err := newAdmissionGates(cfg)
+	if err != nil {
+		w.Close()
+		return nil, fmt.Errorf("node: %w", err)
+	}
+
+	// Disk/heap pressure (docs/v0.6.0-plan.md §6.2): resolved here,
+	// after wal.Open has ensured cfg.DataDir exists, since a percentage
+	// threshold needs DiskTotalBytes and the platform-support check
+	// needs a real path to probe.
+	pressureSetup, err := setupDiskPressure(cfg)
+	if err != nil {
+		w.Close()
+		return nil, err
+	}
 
 	n := &Node{
-		cfg:                cfg,
-		core:               core,
-		walog:              w,
-		storage:            st,
-		snapMgr:            snapMgr,
-		tr:                 tr,
-		identityHolder:     identityHolder,
-		logger:             cfg.Logger,
-		appliedIndex:       baseIndex,
-		clusterGeneration:  fsmachine.ClusterGeneration(),
-		waiters:            make(map[raft.Index]waiter),
-		ackSeq:             make(map[raft.NodeID]uint64, len(cfg.Peers)),
-		peerGenerations:    make(map[raft.NodeID]uint32, len(cfg.Peers)),
-		proposeCh:          make(chan proposeReq),
-		controlCh:          make(chan controlProposeReq),
-		readIndexCh:        make(chan readIndexReq),
-		backupCh:           make(chan backupReq),
-		precheckCh:         make(chan precheckReq),
-		membershipCh:       make(chan membershipReq),
-		membershipStatusCh: make(chan membershipStatusReq),
-		releaseNoOpCh:      make(chan chan struct{}),
-		stopCh:             make(chan struct{}),
-		doneCh:             make(chan struct{}),
+		cfg:                  cfg,
+		core:                 core,
+		walog:                w,
+		storage:              st,
+		snapMgr:              snapMgr,
+		tr:                   tr,
+		identityHolder:       identityHolder,
+		logger:               cfg.Logger,
+		appliedIndex:         baseIndex,
+		clusterGeneration:    fsmachine.ClusterGeneration(),
+		waiters:              make(map[raft.Index]waiter),
+		ackSeq:               make(map[raft.NodeID]uint64, len(cfg.Peers)),
+		peerGenerations:      make(map[raft.NodeID]uint32, len(cfg.Peers)),
+		admission:            admissionGates,
+		maxClientWaiters:     cfg.MaxInflightProposals,
+		maxPendingReads:      cfg.MaxConcurrentReads,
+		leases:               newLeaseRegistry(),
+		maxLiveReadLeases:    cfg.MaxLiveReadLeases,
+		releaseLeaseCh:       make(chan uint64),
+		gcMinRetainSeqs:      cfg.GCMinRetainSeqs,
+		gcMinAdvanceSeqs:     cfg.GCMinAdvanceSeqs,
+		gcMaxVersionsPerPass: cfg.GCMaxVersionsPerPass,
+		gcMaxKeysPerPass:     cfg.GCMaxKeysPerPass,
+		proposeCh:            make(chan proposeReq),
+		controlCh:            make(chan controlProposeReq),
+		readIndexCh:          make(chan readIndexReq),
+		backupCh:             make(chan backupReq),
+		precheckCh:           make(chan precheckReq),
+		membershipCh:         make(chan membershipReq),
+		membershipStatusCh:   make(chan membershipStatusReq),
+		releaseNoOpCh:        make(chan chan struct{}),
+		stopCh:               make(chan struct{}),
+		doneCh:               make(chan struct{}),
+
+		diskPressureSet:    pressureSetup.pressureSet,
+		diskCriticalSet:    pressureSetup.criticalSet,
+		diskPressureThresh: pressureSetup.pressureThresh,
+		diskCriticalThresh: pressureSetup.criticalThresh,
+		fsyncFailuresTotal: newFsyncFailuresTotal(),
 	}
+	n.pressureMon.Store(pressureSetup.mon)
 	n.fsmachine.Store(fsmachine)
+	n.metrics.RaftMessageProcessSeconds = metrics.NewHistogram(metrics.DefaultLatencyBounds...)
+	n.metrics.GCApplySeconds = metrics.NewHistogram(metrics.DefaultLatencyBounds...)
 	n.electionArmed = true
 	n.electionTicksLeft = core.NewElectionTimeout()
+	n.pressureMon.Load().Start()
+	// ResourcePollInterval expressed in TickInterval units, mirroring
+	// gcIntervalTicks immediately below — always > 0 (setDefaults never
+	// leaves it at 0), unlike GCInterval, so resourcePollTicks is always
+	// at least 1: pressure sampling is never itself disable-able, only
+	// what it can affect (no threshold configured) is.
+	n.resourcePollTicks = int(cfg.ResourcePollInterval / cfg.TickInterval)
+	if n.resourcePollTicks < 1 {
+		n.resourcePollTicks = 1
+	}
+	n.resourcePollLeft = n.resourcePollTicks
+	if cfg.GCInterval > 0 {
+		// GCInterval expressed in TickInterval units (docs/v0.6.0-plan.md
+		// §13.4) — 0 stays 0 (GC disabled, no evaluation ever) whenever
+		// cfg.GCInterval itself is 0, the default.
+		n.gcIntervalTicks = int(cfg.GCInterval / cfg.TickInterval)
+		if n.gcIntervalTicks < 1 {
+			n.gcIntervalTicks = 1
+		}
+		n.gcTicksLeft = n.gcIntervalTicks
+	}
 	n.refreshStatusLocked()
 
-	go n.run()
+	// The recover here is exclusively for faultPointCrash
+	// (faultpoint.go, §33 slice 10a): run()'s own defer chain
+	// (shutdown, ticker.Stop) still executes normally as the panic
+	// unwinds through it — see faultPointCrash's own doc comment for
+	// why that is the intended, already-established fidelity level, not
+	// a gap. Any other panic value is a real bug and is re-panicked
+	// immediately, so it still crashes the process exactly as an
+	// unrecovered panic always has.
+	go func() {
+		defer func() {
+			if r := recover(); r != nil {
+				if _, ok := r.(faultPointCrash); ok {
+					return
+				}
+				panic(r)
+			}
+		}()
+		n.run()
+	}()
 	return n, nil
 }
 
@@ -753,7 +1262,20 @@ var ErrPeerTLSNotConfigured = errors.New("node: peer TLS is not configured on th
 // internal/identity.Holder's hot-swap semantics — see its doc comment).
 // A live connection using the previously loaded certificate is never
 // forcibly dropped by this call.
-func (n *Node) ReloadPeerTLS() error {
+func (n *Node) ReloadPeerTLS(ctx context.Context) error {
+	// Lane A1 (docs/v0.6.0-plan.md §3.2): the seventh Lane A1 member,
+	// living in cmd/chronicledb-node's own call sites (SIGHUP, /admin/
+	// reload-tls) — this method is internal/node's own gated entry
+	// point for both. Acquired even though the reload itself never
+	// touches the event loop, for the same reason every other Lane A1
+	// action is gated: a saturated client workload must not be able to
+	// delay an operator's TLS rotation either.
+	release, err := n.admission.control.Acquire(ctx)
+	if err != nil {
+		return err
+	}
+	defer release()
+
 	if n.identityHolder == nil {
 		return ErrPeerTLSNotConfigured
 	}
@@ -814,6 +1336,48 @@ func (n *Node) ReleaseElectionNoOpForTest() {
 	}
 }
 
+// SetNoopAdmissionGateForTest is AC-5's negative-control hook
+// (docs/v0.6.0-plan.md §29, §27.4 ADMISSION FAILS CLOSED): when noop is
+// true, Propose skips admission.write entirely (as if the gate
+// mechanism were absent or broken). Proves the event-loop len(n.waiters)
+// ceiling (§5.3) still holds the bound independently — the gate and the
+// ceiling are two independent mechanisms, not one relying on the
+// other. Test-only; production code never calls it.
+func (n *Node) SetNoopAdmissionGateForTest(noop bool) { n.noopWriteGateForTest.Store(noop) }
+
+// SetSkipAdmissionLaneSeparationForTest is AC-7's negative control for
+// CONTROL-PLANE NON-STARVATION (docs/v0.6.0-plan.md §29.3): see
+// handlePropose's own comment on skipLaneSeparationForTest for exactly
+// what it reintroduces and why. Test-only; production code never calls
+// it.
+func (n *Node) SetSkipAdmissionLaneSeparationForTest(skip bool) {
+	n.skipLaneSeparationForTest.Store(skip)
+}
+
+// SetPreSnapshotBytesFillHookForTest arms fn as
+// preSnapshotBytesFillHookForTest (SL-11, docs/v0.6.0-plan.md §18.1);
+// passing nil disarms it. Test-only; production code never calls it.
+func (n *Node) SetPreSnapshotBytesFillHookForTest(fn func(index uint64)) {
+	if fn == nil {
+		n.preSnapshotBytesFillHookForTest.Store(nil)
+		return
+	}
+	f := fn
+	n.preSnapshotBytesFillHookForTest.Store(&f)
+}
+
+// SetBackupEnteredMaintenanceHookForTest arms fn as
+// backupEnteredMaintenanceForTest; passing nil disarms it. Test-only;
+// production code never calls it.
+func (n *Node) SetBackupEnteredMaintenanceHookForTest(fn func()) {
+	if fn == nil {
+		n.backupEnteredMaintenanceForTest.Store(nil)
+		return
+	}
+	f := fn
+	n.backupEnteredMaintenanceForTest.Store(&f)
+}
+
 // Status returns a snapshot of the node's current diagnostic state.
 // Safe to call from any goroutine.
 func (n *Node) Status() Status {
@@ -826,6 +1390,16 @@ func (n *Node) refreshStatusLocked() {
 	cfg := n.core.ActiveConfig()
 	_, committedConfigIndex := n.core.ConfigAt(n.core.CommitIndex())
 	changesReady, notReadyReason := n.core.ConfigChangeReady()
+
+	// The two BOUNDED ADMITTED WORK ceiling gauges (docs/v0.6.0-plan.md
+	// §5.3/§9.1a) — refreshed here, once, on the single event-loop
+	// goroutine that owns both n.waiters and n.pendingReads, exactly
+	// mirroring how every other Status field is centrally refreshed
+	// after every select case, rather than at each individual mutation
+	// site (less surface to miss one).
+	n.metrics.WaitersGauge.Set(int64(len(n.waiters)))
+	n.metrics.PendingReadsGauge.Set(int64(len(n.pendingReads)))
+	n.metrics.ReadLeasesActiveGauge.Set(int64(n.leases.Len()))
 
 	n.statusMu.Lock()
 	n.status = Status{
@@ -845,6 +1419,9 @@ func (n *Node) refreshStatusLocked() {
 		CommittedConfigIndex:   committedConfigIndex,
 		ChangesReady:           changesReady,
 		NotReadyReason:         notReadyReason,
+		DiskPressure:           n.diskPressureStatusString(),
+		StorageHealthy:         !n.storageUnhealthy.Load(),
+		Ready:                  PressureState(n.pressureState.Load()) != PressureCritical && !n.storageUnhealthy.Load(),
 	}
 	n.statusMu.Unlock()
 }
@@ -957,6 +1534,16 @@ func (n *Node) computePrecheck() PrecheckResult {
 // leader (docs/upgrades.md's runbook does) for the authoritative
 // picture.
 func (n *Node) UpgradePrecheck(ctx context.Context) (PrecheckResult, error) {
+	// Lane A1 (docs/v0.6.0-plan.md §3.2, §5.4): the exported wrapper
+	// only — the unexported upgradePrecheck below, which FinalizeUpgrade
+	// also calls internally, never itself acquires (it would self-
+	// deadlock a goroutine that already holds this call's own slot).
+	release, err := n.admission.control.Acquire(ctx)
+	if err != nil {
+		return PrecheckResult{}, err
+	}
+	defer release()
+
 	res, err := n.upgradePrecheck(ctx)
 	if err != nil {
 		return PrecheckResult{}, err
@@ -1079,6 +1666,15 @@ var ErrAlreadyFinalized = errors.New("node: cluster is already finalized at this
 // reflects this node's just-changed role. A single live read inside
 // upgradePrecheck's own dispatch has no such gap.
 func (n *Node) FinalizeUpgrade(ctx context.Context) (fsm.Outcome, uint32, error) {
+	// Lane A1 (docs/v0.6.0-plan.md §3.2, §5.4). Acquired once, here;
+	// the internal upgradePrecheck call below does not re-acquire (see
+	// UpgradePrecheck's own comment on why nesting would self-deadlock).
+	release, err := n.admission.control.Acquire(ctx)
+	if err != nil {
+		return fsm.Outcome{}, 0, err
+	}
+	defer release()
+
 	// unexported upgradePrecheck, not the exported UpgradePrecheck: this
 	// internal re-check must not inflate UpgradePrecheckTotal, a metric
 	// meant to reflect explicit operator/CLI polling — see
@@ -1153,6 +1749,25 @@ func (n *Node) FinalizeUpgrade(ctx context.Context) (fsm.Outcome, uint32, error)
 // never resolved (not leader, leadership lost, superseded, canceled, or
 // stopped).
 func (n *Node) Propose(ctx context.Context, cmd fsm.CommitTxnCommand) (fsm.Outcome, error) {
+	// Admission gate first, before Precheck (docs/v0.6.0-plan.md §5.7):
+	// Precheck's fingerprintOf hashes the command's full mutation set on
+	// every call, which is unbounded client-caused CPU work, and
+	// admitting before doing any per-request work is this release's
+	// general rule. Consequence, by design: under overload, a retry of
+	// an already-decided RequestID can be rejected with 503 rather than
+	// returning its recorded outcome — safe (503 records nothing), and
+	// the deliberately-ungated GET /outcome remains the correct way to
+	// resolve a known RequestID under load (§3.3, §5.4a).
+	release := func() {}
+	if !n.noopWriteGateForTest.Load() {
+		var err error
+		release, err = n.admission.write.Acquire(ctx)
+		if err != nil {
+			return fsm.Outcome{}, err
+		}
+	}
+	defer release()
+
 	if outcome, err := n.fsmachine.Load().Precheck(cmd); err == nil {
 		n.metrics.RequestIDDuplicatesTotal.Inc()
 		return outcome, nil
@@ -1186,22 +1801,54 @@ func (n *Node) Propose(ctx context.Context, cmd fsm.CommitTxnCommand) (fsm.Outco
 // read index, before returning it as a safe StartSeq watermark. Returns
 // NotLeaderError if this node is not leader, or ErrLeadershipLost if it
 // steps down before the check completes.
-func (n *Node) BeginReadIndex(ctx context.Context) (uint64, error) {
-	req := readIndexReq{resultCh: make(chan readResult, 1)}
+//
+// On success, the returned *ReadLease must be released (Release is
+// idempotent) once the transaction it backs is done — Commit, Abort,
+// or the owning Session closing, on every exit path (docs/v0.6.0-
+// plan.md §15.3). It bounds the leader's proposed GC watermark
+// (§13.4/§14.2) for as long as it is held; a leaked lease stalls GC but
+// never makes it unsafe (the fail-safe direction), and
+// -read-lease-max-age force-expires an abandoned one.
+func (n *Node) BeginReadIndex(ctx context.Context) (uint64, *ReadLease, error) {
+	// The readGate slot is released when THIS CALL returns, not when
+	// the eventual transaction ends (docs/v0.6.0-plan.md §5.4, §9.1):
+	// holding it for a whole transaction would let a long-running,
+	// well-behaved reader consume admission capacity indefinitely. The
+	// read LEASE returned below is the mechanism with transaction
+	// lifetime; this gate's job ends here.
+	release, err := n.admission.read.Acquire(ctx)
+	if err != nil {
+		return 0, nil, err
+	}
+	defer release()
+
+	// Pre-allocated here, before the request is even sent, so the
+	// cancellation path below can name this lease without having
+	// received a result (§15.3's lifecycle table) — handleReadIndex
+	// uses this id rather than generating its own.
+	leaseID := n.nextLeaseID.Add(1)
+
+	req := readIndexReq{leaseID: leaseID, resultCh: make(chan readResult, 1)}
 	select {
 	case n.readIndexCh <- req:
 	case <-ctx.Done():
-		return 0, ctx.Err()
+		return 0, nil, ctx.Err()
 	case <-n.doneCh:
-		return 0, ErrNodeStopped
+		return 0, nil, ErrNodeStopped
 	}
 	select {
 	case res := <-req.resultCh:
-		return res.startSeq, res.err
+		return res.startSeq, res.lease, res.err
 	case <-ctx.Done():
-		return 0, ctx.Err()
+		// The request may already have been dispatched and the lease
+		// already registered by the time ctx fired — release
+		// unconditionally; it is a harmless no-op if registration never
+		// happened.
+		releaseLease(n, leaseID)
+		return 0, nil, ctx.Err()
 	case <-n.doneCh:
-		return 0, ErrNodeStopped
+		releaseLease(n, leaseID)
+		return 0, nil, ErrNodeStopped
 	}
 }
 
@@ -1236,6 +1883,26 @@ func (n *Node) BeginReadIndex(ctx context.Context) (uint64, error) {
 // maybeSnapshot's identical characteristic); docs/backup.md documents
 // this operationally.
 func (n *Node) Backup(ctx context.Context, outDir string, continuous bool, clusterID string) (backup.Manifest, error) {
+	// Lane A2 (docs/v0.6.0-plan.md §3.2a): the shared maintenance gate
+	// plus a dedicated single slot for this kind, so a running backup
+	// and a running scrub may overlap each other but a second concurrent
+	// backup is refused outright (admin_operation_in_progress) rather
+	// than queued — two concurrent exports both run on the event loop
+	// anyway, so queueing only hides the cost.
+	release, err := n.admission.maintenance.Acquire(ctx)
+	if err != nil {
+		return backup.Manifest{}, err
+	}
+	defer release()
+	if hook := n.backupEnteredMaintenanceForTest.Load(); hook != nil {
+		(*hook)()
+	}
+	releaseSlot, err := acquireSingleSlot(ctx, n.admission.backupSlot)
+	if err != nil {
+		return backup.Manifest{}, err
+	}
+	defer releaseSlot()
+
 	req := backupReq{outDir: outDir, continuous: continuous, clusterID: clusterID, resultCh: make(chan backupResult, 1)}
 	select {
 	case n.backupCh <- req:
@@ -1290,6 +1957,8 @@ func (n *Node) run() {
 			n.handleMembership(req)
 		case req := <-n.membershipStatusCh:
 			req.resultCh <- n.computeMembershipStatus()
+		case id := <-n.releaseLeaseCh:
+			n.leases.Release(id)
 		case ack := <-n.releaseNoOpCh:
 			// Test-only (ReleaseElectionNoOpForTest). Clearing the hold
 			// alone would leave a leader that already won its election
@@ -1316,11 +1985,13 @@ func (n *Node) shutdown() {
 		delete(n.waiters, idx)
 	}
 	for _, pr := range n.pendingReads {
+		n.leases.Release(pr.leaseID)
 		pr.resultCh <- readResult{err: ErrNodeStopped}
 	}
 	n.pendingReads = nil
 	n.tr.Close()
 	n.walog.Close()
+	n.pressureMon.Load().Stop()
 	close(n.doneCh)
 }
 
@@ -1339,11 +2010,39 @@ func (n *Node) tick() {
 			n.step(raft.Input{Kind: raft.InputHeartbeatTimeout})
 		}
 	}
+	// gcIntervalTicks == 0 means GC is disabled (docs/v0.6.0-plan.md
+	// §10.2/§13.4/S-12): no ticker, no evaluation, ever — the exact
+	// v0.5.0-behavior guarantee release gate 9 requires.
+	if n.gcIntervalTicks > 0 {
+		n.gcTicksLeft--
+		if n.gcTicksLeft <= 0 {
+			n.gcTicksLeft = n.gcIntervalTicks
+			n.maybeProposeGC()
+		}
+	}
+	// resourcePollTicks is always >= 1 (Open); disk/heap pressure is
+	// always sampled, even with every threshold off (§6.1's diagnostic
+	// sampling), unlike GC's own genuinely-disable-able ticker.
+	n.resourcePollLeft--
+	if n.resourcePollLeft <= 0 {
+		n.resourcePollLeft = n.resourcePollTicks
+		n.checkResourcePressure()
+	}
 }
 
 // step delivers one Input to Core and processes the resulting Output.
 // Call only from run's goroutine.
 func (n *Node) step(in raft.Input) {
+	// CONTROL-PLANE NON-STARVATION's own proof metric
+	// (docs/v0.6.0-plan.md §4.3, §11.2): one observation per inbound
+	// raft.Message this node's event loop processes, covering the whole
+	// call (Core.Step plus processOutput's side effects) — the exact
+	// quantity the invariant claims is independent of client admission-
+	// queue depth, concurrency, or rejection rate.
+	if in.Kind == raft.InputMessage {
+		start := time.Now()
+		defer func() { n.metrics.RaftMessageProcessSeconds.Observe(time.Since(start).Seconds()) }()
+	}
 	// Recognize a legitimate, current-term Success AppendEntriesResponse
 	// BEFORE handing it to Core, using exactly the same precondition
 	// (Role==Leader, msg.Term==CurrentTerm) Core itself uses to decide
@@ -1385,6 +2084,46 @@ func (n *Node) step(in raft.Input) {
 // mutation (docs replication.md §1.2 step 1: "the leader accepted the
 // client's request, validated it is current leader").
 func (n *Node) handlePropose(req proposeReq) {
+	// AC-7's negative control (docs/v0.6.0-plan.md §29.3): reintroduces,
+	// on demand, the exact shape of hazard Rule CP-1/CP-2 forbids —
+	// client-admitted work costing the event loop time — WITHOUT
+	// literally re-acquiring a gate from inside the loop (which risks a
+	// genuine, unrecoverable deadlock if every external caller is
+	// itself blocked waiting on this same goroutine). A fixed per-call
+	// delay, comfortably larger than this test tier's own election
+	// timeout budget (configFor's electionTicks x TickInterval), is a
+	// safe, deterministic stand-in that still faithfully demonstrates
+	// the consequence: sustained client load blocks the loop long
+	// enough that followers stop hearing from the leader in time and
+	// call an election, which the positive test (with this hook left
+	// off) proves does not happen.
+	if n.skipLaneSeparationForTest.Load() {
+		time.Sleep(150 * time.Millisecond)
+	}
+	// The authoritative BOUNDED ADMITTED WORK ceiling (docs/v0.6.0-
+	// plan.md §5.3): len(n.waiters) is the true proposed-but-unapplied
+	// set, and admission.write's own gate does NOT bound it — a caller
+	// that cancels its context frees its gate slot (deferred release())
+	// while its waiter here survives until the entry applies, the node
+	// steps down, or it shuts down (fact 8d). This check is what makes
+	// that survive-past-cancellation case fail-safe rather than
+	// unbounded, and it fires in NORMAL operation under a cancel-heavy
+	// workload (AC-20) — chronicledb_admission_defense_rejections_total
+	// is a cancellation signal, not a bug signal.
+	//
+	// Applies to CLIENT proposals only (§5.3): handleControlPropose
+	// (upgrade finalize), handleMembership, and proposeElectionNoOp
+	// never consult it — a saturated client workload must not be able
+	// to block a membership change or a new leader's own no-op. This is
+	// Lane A/Lane K priority expressed as an absence of a check, the
+	// only form of priority that cannot be misconfigured.
+	if len(n.waiters) >= n.maxClientWaiters {
+		n.metrics.AdmissionDefenseRejectionsWaitersTotal.Inc()
+		req.resultCh <- proposeResult{err: &admission.RejectedError{
+			Reason: admission.ReasonConcurrencyLimit, RetryAfter: admission.ReasonConcurrencyLimit.DefaultRetryAfter(),
+		}}
+		return
+	}
 	n.proposeAndAwait(req.payload, req.cmd.RequestID, req.resultCh,
 		func() { n.metrics.ProposalsRejectedTotal.Inc() },
 		func() { n.metrics.ProposalsTotal.Inc() })
@@ -1460,8 +2199,45 @@ func (n *Node) handleReadIndex(req readIndexReq) {
 		req.resultCh <- readResult{err: &NotLeaderError{Leader: n.core.LeaderID()}}
 		return
 	}
+	// The read-side twin of handlePropose's waiters ceiling
+	// (docs/v0.6.0-plan.md §9.1a): admission.read's own gate slot is
+	// released when BeginReadIndex *returns*, but a pendingRead entry
+	// here can outlive that — a caller that times out and abandons the
+	// call frees its gate slot while this entry survives until the read
+	// resolves or leadership is lost. checkPendingReads scans the whole
+	// slice after every processOutput, so its cost is on Lane K's
+	// critical path; this ceiling is what bounds that cost by a
+	// configured constant rather than by client read concurrency.
+	if len(n.pendingReads) >= n.maxPendingReads {
+		n.metrics.AdmissionDefenseRejectionsPendingReadsTotal.Inc()
+		req.resultCh <- readResult{err: &admission.RejectedError{
+			Reason: admission.ReasonConcurrencyLimit, RetryAfter: admission.ReasonConcurrencyLimit.DefaultRetryAfter(),
+		}}
+		return
+	}
+	// The live-read-lease ceiling (§9.1a): unlike the pendingReads
+	// ceiling above, this has no caller-side gate counterpart at all —
+	// it is the primary limiter for the lease registry, which outlives
+	// pendingReads (a lease is held for the whole transaction, §15.3).
+	if n.leases.Len() >= n.maxLiveReadLeases {
+		req.resultCh <- readResult{err: &admission.RejectedError{
+			Reason: admission.ReasonReadLeaseLimit, RetryAfter: admission.ReasonReadLeaseLimit.DefaultRetryAfter(),
+		}}
+		return
+	}
 	term0 := n.core.CurrentTerm()
 	target := n.core.LastIndex()
+	// Registered at CAPTURE, in the same statement sequence that
+	// captures target, before the pendingRead is appended
+	// (docs/v0.6.0-plan.md §15.3, resolved: registering at resolution
+	// instead would let the watermark overtake an already-captured
+	// boundary). Both the registry and the leader's own GC-watermark
+	// computation are mutated/read exclusively on this goroutine, so
+	// there is no window at all in which a read this leader has
+	// captured could receive a spurious ErrSnapshotTooOld. The id
+	// itself was allocated by the caller (BeginReadIndex), before this
+	// request was even sent.
+	n.leases.Register(req.leaseID, uint64(target))
 	// Every peer's ack must echo a request Seq strictly greater than
 	// sentSeqCounter's value right now — see Node.ackSeq's doc comment
 	// for why this must be a wire-carried, request-specific token
@@ -1476,7 +2252,7 @@ func (n *Node) handleReadIndex(req readIndexReq) {
 	// this node was still the legitimate leader after target was
 	// captured (docs/replication.md §4.1 steps 1-2).
 	out := n.core.Step(raft.Input{Kind: raft.InputHeartbeatTimeout})
-	n.pendingReads = append(n.pendingReads, pendingRead{term: term0, target: target, requiredSeq: requiredSeq, resultCh: req.resultCh})
+	n.pendingReads = append(n.pendingReads, pendingRead{term: term0, target: target, requiredSeq: requiredSeq, leaseID: req.leaseID, resultCh: req.resultCh})
 	n.processOutput(out)
 }
 
@@ -1496,6 +2272,11 @@ func (n *Node) checkPendingReads() {
 	remaining := n.pendingReads[:0]
 	for _, pr := range n.pendingReads {
 		if n.core.Role() != raft.Leader || n.core.CurrentTerm() != pr.term {
+			// Resolution failure (§15.3's lifecycle table): released
+			// immediately, here, at the same point the error is
+			// delivered — the caller never sees a lease, so it owes
+			// nothing.
+			n.leases.Release(pr.leaseID)
 			pr.resultCh <- readResult{err: ErrLeadershipLost}
 			continue
 		}
@@ -1521,7 +2302,11 @@ func (n *Node) checkPendingReads() {
 			remaining = append(remaining, pr)
 			continue
 		}
-		pr.resultCh <- readResult{startSeq: uint64(pr.target)}
+		// Successful resolution: the lease is already live (registered
+		// at capture) and is now handed to the caller, who owns
+		// releasing it (§15.3's lifecycle table).
+		lease := &ReadLease{n: n, id: pr.leaseID, startSeq: uint64(pr.target)}
+		pr.resultCh <- readResult{startSeq: uint64(pr.target), lease: lease}
 	}
 	n.pendingReads = remaining
 }
@@ -1548,8 +2333,12 @@ func (n *Node) processOutput(out raft.Output) {
 			// §7 step 1, raft.MsgInstallSnapshotRequest's doc comment) —
 			// fill them in from this node's own retained snapshot before
 			// the message ever reaches the wire.
+			if hook := n.preSnapshotBytesFillHookForTest.Load(); hook != nil {
+				(*hook)(uint64(m.LastIncludedIndex))
+			}
 			data, ok, err := n.snapMgr.Bytes(uint64(m.LastIncludedIndex))
 			if err != nil || !ok {
+				n.metrics.SnapshotServeMissTotal.Inc()
 				n.logf("node %s: cannot serve snapshot %d to %s (ok=%v err=%v); skipping this round, leader will retry", n.cfg.ID, m.LastIncludedIndex, m.To, ok, err)
 				continue
 			}
@@ -1569,6 +2358,18 @@ func (n *Node) processOutput(out raft.Output) {
 
 	if out.PersistRequest != nil {
 		if err := raft.ApplyPersistRequest(n.storage, out.PersistRequest); err != nil {
+			// §20.1: classify, audit, and mark not-ready BEFORE the halt
+			// — an fsync failure on the consensus path is still
+			// unconditionally fatal (unchanged from v0.5.0), but the
+			// operator now learns why rather than finding a stopped
+			// process. FsyncPathRaft never participates in the
+			// consecutive-failure threshold (noteFsyncResult's own
+			// early return) — it always halts on the first failure.
+			if c, ok := n.fsyncFailuresTotal[FsyncPathRaft]; ok {
+				c.Inc()
+			}
+			n.storageUnhealthy.Store(true)
+			n.auditHealth("node.raft_fsync_failure", fmt.Sprintf("classified=%v err=%v", classifyErrKind(err), err))
 			n.fail(fmt.Errorf("node: durable persistence failed: %w", err))
 			return
 		}
@@ -1584,6 +2385,12 @@ func (n *Node) processOutput(out raft.Output) {
 			w.resultCh <- proposeResult{err: ErrLeadershipLost}
 			delete(n.waiters, idx)
 		}
+		// §13.4a: no cross-term coordination is needed for an unresolved
+		// GC proposal — the next leader (possibly this same node,
+		// re-elected) simply reads its own applied gcPassSeq and
+		// proceeds, so this is a plain reset, not a resolution.
+		n.gcProposalInFlight = false
+		n.gcProposalIndex = 0
 	}
 	if out.BecameLeader {
 		n.metrics.LeaderChangesTotal.Inc()
@@ -1638,6 +2445,81 @@ func (n *Node) proposeElectionNoOp() {
 	if out.ProposalRejected {
 		return
 	}
+	n.processOutput(out)
+}
+
+// maybeProposeGC is the leader-only MVCC GC watermark proposer
+// (docs/v0.6.0-plan.md §13.4), called from tick() on every gcIntervalTicks
+// countdown (never at all when GC is disabled, gcIntervalTicks == 0).
+// Runs entirely on the event-loop goroutine — this IS the goroutine
+// InputPropose needs, so unlike Propose/BeginReadIndex there is no
+// channel hop into it, mirroring proposeElectionNoOp's identical shape.
+//
+// Never proposes on a follower, and never during a leadership
+// transition (simply finds Role != Leader and does nothing next tick).
+// Enforces the generation-3 floor independently on this, the leader
+// side (§23.4's two-sided gate — applyAdvanceGCWatermarkEntry is the
+// independent follower/apply-side half, already in place since slice 8).
+func (n *Node) maybeProposeGC() {
+	if n.core.Role() != raft.Leader || n.selfRemoved() {
+		return
+	}
+	if n.clusterGeneration < 3 {
+		return
+	}
+	if n.gcProposalInFlight {
+		return
+	}
+
+	f := n.fsmachine.Load()
+
+	// W = min(minLease, applied, floor) — docs/v0.6.0-plan.md §13.4.
+	// minLease is +inf (i.e. simply excluded) when no lease is live.
+	w := n.appliedIndex
+	if minLease, ok := n.leases.Min(); ok && minLease < w {
+		w = minLease
+	}
+	var floor uint64
+	if n.appliedIndex > n.gcMinRetainSeqs {
+		floor = n.appliedIndex - n.gcMinRetainSeqs
+	}
+	if floor < w {
+		w = floor
+	}
+
+	current := f.GCWatermark()
+	advance := w > current+n.gcMinAdvanceSeqs
+	cont := f.GCCursor() != "" // an unfinished pass at the current watermark
+	if !advance && !cont {
+		return
+	}
+
+	watermark := w
+	if current > watermark {
+		watermark = current // never propose a decrease
+	}
+	// Deterministic RequestID, a pure function of replicated state
+	// (§13.4a): distinct across continuation passes via gcPassSeq, but
+	// idempotent through controlOutcomes for a genuine retry of the
+	// identical pass (a leader crash mid-propose, or a replayed entry).
+	reqID := fsm.RequestID(fmt.Sprintf("\x00chronicledb-gc\x00w=%d\x00p=%d", watermark, f.GCPassSeq()))
+	payload := fsm.EncodeAdvanceGCWatermark(fsm.AdvanceGCWatermarkCommand{
+		RequestID: reqID, Watermark: watermark,
+		MaxVersions: n.gcMaxVersionsPerPass, MaxKeys: n.gcMaxKeysPerPass,
+	})
+
+	out := n.core.Step(raft.Input{Kind: raft.InputPropose, ProposeData: payload})
+	if out.ProposalRejected {
+		n.metrics.GCProposalsFailedTotal.Inc()
+		return
+	}
+	if out.PersistRequest == nil || len(out.PersistRequest.Entries) != 1 {
+		n.fail(fmt.Errorf("node: unexpected GC-propose output shape: %+v", out))
+		return
+	}
+	n.gcProposalInFlight = true
+	n.gcProposalIndex = out.PersistRequest.Entries[0].Index
+	n.metrics.GCProposalsTotal.Inc()
 	n.processOutput(out)
 }
 
@@ -1741,19 +2623,36 @@ func (n *Node) adoptClusterGeneration(generation uint32) bool {
 }
 
 // applyControlEntry applies one committed FSM control-command entry
-// (fsm.ControlCommandMarker — currently only SetClusterVersionCommand),
-// resolving any waiter registered for its index exactly as
-// applyCommitted does for an ordinary CommitTxn entry. Returns false if
-// it called n.fail (an unrecoverable decode/capability/apply error),
-// mirroring applyCommitted's own early-return-on-failure control flow
-// — the caller must stop processing further entries in that case.
+// (fsm.ControlCommandMarker), dispatching on the control-kind byte
+// (docs/v0.6.0-plan.md §16.1: "must switch on the kind byte rather than
+// assume SetClusterVersion" — true starting this release, now that a
+// second control-command kind exists). Returns false if it called
+// n.fail (an unrecoverable decode/capability/apply error), mirroring
+// applyCommitted's own early-return-on-failure control flow — the
+// caller must stop processing further entries in that case.
 func (n *Node) applyControlEntry(e raft.Entry) bool {
+	kind, ok := fsm.ControlKind(e.Data)
+	if !ok {
+		n.fail(fmt.Errorf("node: committed control entry %d: %w: payload too short for a control-kind byte", e.Index, fsm.ErrMalformedCommand))
+		return false
+	}
+	switch kind {
+	case fsm.ControlKindSetClusterVersion:
+		return n.applySetClusterVersionEntry(e)
+	case fsm.ControlKindAdvanceGCWatermark:
+		return n.applyAdvanceGCWatermarkEntry(e)
+	default:
+		// NO SILENT FORMAT MISINTERPRETATION: an unrecognized control
+		// command kind fails closed here exactly like an unrecognized
+		// CommitTxn command version does below — never guessed at.
+		n.fail(fmt.Errorf("node: committed control entry %d: %w: kind %d", e.Index, fsm.ErrUnknownControlCommand, kind))
+		return false
+	}
+}
+
+func (n *Node) applySetClusterVersionEntry(e raft.Entry) bool {
 	cmd, err := fsm.DecodeSetClusterVersion(e.Data)
 	if err != nil {
-		// NO SILENT FORMAT MISINTERPRETATION: an unrecognized control
-		// command kind (fsm.ErrUnknownControlCommand) or a malformed
-		// payload both fail closed here exactly like an unrecognized
-		// CommitTxn command version does below.
 		n.fail(fmt.Errorf("node: decoding committed control entry %d: %w", e.Index, err))
 		return false
 	}
@@ -1794,6 +2693,42 @@ func (n *Node) applyControlEntry(e raft.Entry) bool {
 	return true
 }
 
+// applyAdvanceGCWatermarkEntry applies one committed AdvanceGCWatermark
+// entry (docs/v0.6.0-plan.md §14.4). The generation-3 gate is enforced
+// two-sided (§23.4): the leader-side proposer (a later slice) refuses
+// to propose below generation 3, and this is the independent follower-
+// side half — a committed entry of this kind at a generation below 3
+// should be structurally unreachable given a correct leader, so any
+// occurrence here is treated as an unrecoverable local inconsistency
+// (fail-closed), exactly like applySetClusterVersionEntry's own
+// capability check above.
+func (n *Node) applyAdvanceGCWatermarkEntry(e raft.Entry) bool {
+	if n.clusterGeneration < 3 {
+		n.fail(fmt.Errorf("node: committed entry %d is an AdvanceGCWatermark command, but this node's cluster generation is only %d (requires >= 3)", e.Index, n.clusterGeneration))
+		return false
+	}
+	cmd, err := fsm.DecodeAdvanceGCWatermark(e.Data)
+	if err != nil {
+		n.fail(fmt.Errorf("node: decoding committed control entry %d: %w", e.Index, err))
+		return false
+	}
+	applyStart := time.Now()
+	outcome, err := n.fsmachine.Load().ApplyAdvanceGCWatermark(uint64(e.Index), cmd)
+	n.metrics.GCApplySeconds.Observe(time.Since(applyStart).Seconds())
+	if err != nil {
+		n.fail(fmt.Errorf("node: applying committed control entry %d: %w", e.Index, err))
+		return false
+	}
+	n.appliedIndex = uint64(e.Index)
+	n.core.SetApplied(e.Index)
+	if n.gcProposalInFlight && e.Index == n.gcProposalIndex {
+		n.gcProposalInFlight = false
+		n.gcProposalIndex = 0
+	}
+	n.resolveWaiter(e.Index, cmd.RequestID, outcome, nil)
+	return true
+}
+
 // maybeSnapshot creates a fresh local snapshot and compacts this node's
 // own log against it once durable log growth since the last snapshot
 // boundary reaches cfg.SnapshotThreshold (docs/snapshots.md §3's
@@ -1830,24 +2765,68 @@ func (n *Node) maybeSnapshot() {
 		HasConfiguration:  true,
 		Configuration:     toSnapshotConfiguration(cfgAtApplied),
 	}
+	// docs/v0.6.0-plan.md §20.2: every durable step below is a
+	// non-Raft-path write, so a failure here — including a classified
+	// ENOSPC (§19.3) — is recorded through noteFsyncResult(FsyncPathSnapshot,
+	// ...) and this attempt is simply abandoned (retried on the next
+	// snapshot cycle) rather than halting the node the way a Raft-path
+	// failure does (§20.1). This is safe at every one of these four
+	// points per §22's crash-safety table: Create's own failure leaves
+	// at most an orphan temp file; every step after it either has not
+	// yet mutated durable state the way the next step assumes, or (for
+	// Reaffirm/CompactBeforeRetaining, which run after the in-memory-only
+	// core.Compact/storage.Compact below) failing just means the old WAL
+	// segments are not reclaimed this cycle — the exact same "disk-space
+	// hygiene, not a durability concern" class Prune's own failure below
+	// already is.
 	if _, err := n.snapMgr.Create(meta, n.fsmachine.Load(), n.snapshotWriteVersion()); err != nil {
-		n.fail(fmt.Errorf("node: creating snapshot at index %d: %w", meta.LastIncludedIndex, err))
+		n.noteFsyncResult(FsyncPathSnapshot, err)
+		n.logf("node %s: creating snapshot at index %d: %v (classified=%s; non-fatal, will retry)", n.cfg.ID, meta.LastIncludedIndex, err, classifyErrKind(err))
 		return
 	}
+	n.noteFsyncResult(FsyncPathSnapshot, nil)
+	triggerFaultPoint(FaultAfterSnapshotCreate)
 	if err := n.walog.AppendMetadataSnapshot(meta.LastIncludedIndex); err != nil {
-		n.fail(fmt.Errorf("node: recording snapshot pointer at index %d: %w", meta.LastIncludedIndex, err))
+		n.noteFsyncResult(FsyncPathSnapshot, err)
+		n.logf("node %s: recording snapshot pointer at index %d: %v (classified=%s; non-fatal, will retry)", n.cfg.ID, meta.LastIncludedIndex, err, classifyErrKind(err))
 		return
 	}
+	n.noteFsyncResult(FsyncPathSnapshot, nil)
+	triggerFaultPoint(FaultAfterAppendMetadataSnapshot)
 	n.core.Compact(raft.Index(meta.LastIncludedIndex))
+	triggerFaultPoint(FaultAfterCoreCompact)
 	n.storage.Compact(raft.Index(meta.LastIncludedIndex))
+	triggerFaultPoint(FaultAfterStorageCompact)
 	if err := n.storage.Reaffirm(); err != nil {
-		n.fail(fmt.Errorf("node: reaffirming hard state before compaction: %w", err))
+		n.noteFsyncResult(FsyncPathSnapshot, err)
+		n.logf("node %s: reaffirming hard state before compaction: %v (classified=%s; non-fatal, will retry next cycle)", n.cfg.ID, err, classifyErrKind(err))
 		return
 	}
-	if err := n.walog.CompactBefore(meta.LastIncludedIndex); err != nil {
-		n.fail(fmt.Errorf("node: compacting log before index %d: %w", meta.LastIncludedIndex, err))
+	n.noteFsyncResult(FsyncPathSnapshot, nil)
+	triggerFaultPoint(FaultAfterReaffirm)
+	if err := n.walog.CompactBeforeRetaining(meta.LastIncludedIndex, n.cfg.WALRetainExtraSegments); err != nil {
+		n.noteFsyncResult(FsyncPathSnapshot, err)
+		n.logf("node %s: compacting log before index %d: %v (classified=%s; non-fatal, will retry next cycle)", n.cfg.ID, meta.LastIncludedIndex, err, classifyErrKind(err))
 		return
 	}
+	n.noteFsyncResult(FsyncPathSnapshot, nil)
+	triggerFaultPoint(FaultAfterCompactBefore)
+	// Pruning old snapshot FILES happens here — strictly after
+	// ReclaimBoundary has actually moved to meta.LastIncludedIndex
+	// (durable, pointer-recorded, and HardState reaffirmed by the five
+	// steps above), never any earlier (see Manager.Prune's own doc
+	// comment for the crash-safety hazard this ordering fixes, found by
+	// SL-8). Deliberately non-fatal: a failure here leaves an extra
+	// snapshot file or two on disk — a disk-space hygiene concern, not a
+	// durability one, so it does not need to stop the node the way a
+	// failure in any of the six steps above does.
+	if err := n.snapMgr.Prune(meta.LastIncludedIndex); err != nil {
+		n.noteFsyncResult(FsyncPathSnapshot, err)
+		n.logf("node %s: pruning old snapshot files after index %d: %v (non-fatal; will retry on the next snapshot cycle)", n.cfg.ID, meta.LastIncludedIndex, err)
+	} else {
+		n.noteFsyncResult(FsyncPathSnapshot, nil)
+	}
+	triggerFaultPoint(FaultAfterSnapshotPrune)
 	n.metrics.SnapshotsCreatedTotal.Inc()
 	n.logf("node %s: created snapshot at index %d, compacted log", n.cfg.ID, meta.LastIncludedIndex)
 }
@@ -1895,8 +2874,15 @@ func (n *Node) handleBackup(req backupReq) {
 		until = backup.UntilLatest
 	}
 	m, err := backup.Export(src, req.outDir, backup.ExportOptions{UntilIndex: until, ClusterID: req.clusterID})
+	// §20.2: backup export is one of the three named non-Raft-path
+	// durable-write operations feeding the consecutive-failure/
+	// storage-unhealthy threshold — it never halts the node either way
+	// (that was already true before v0.6.0; this only adds the
+	// counting/classification on top).
+	n.noteFsyncResult(FsyncPathBackup, err)
 	if err != nil {
 		n.metrics.BackupsFailedTotal.Inc()
+		n.logf("node %s: backup export to %s failed: %v (classified=%s)", n.cfg.ID, req.outDir, err, classifyErrKind(err))
 		req.resultCh <- backupResult{err: fmt.Errorf("node: backup: %w", err)}
 		return
 	}
@@ -2004,12 +2990,15 @@ func (n *Node) handleInstallSnapshot(msg raft.Message) {
 		lastIncluded > n.core.SnapshotIndex() &&
 		lastIncluded > n.core.CommitIndex()
 	if willAdvance {
+		triggerFaultPoint(FaultBeforeInstallSnapshotStorage)
 		if err := n.storage.InstallSnapshot(raft.Index(snap.Meta.LastIncludedIndex)); err != nil {
 			n.fail(fmt.Errorf("node: installing snapshot at index %d: %w", snap.Meta.LastIncludedIndex, err))
 			return
 		}
+		triggerFaultPoint(FaultAfterInstallSnapshotBeforeFSMSwap)
 		n.fsmachine.Store(snap.FSM)
 		n.appliedIndex = snap.Meta.LastIncludedIndex
+		triggerFaultPoint(FaultAfterFSMSwapBeforeGenerationAdopt)
 		// A follower catching up via a peer's snapshot, rather than
 		// replaying the committed SetClusterVersionCommand log entry
 		// itself (e.g. that entry was already compacted away by the
@@ -2023,6 +3012,15 @@ func (n *Node) handleInstallSnapshot(msg raft.Message) {
 		// two paths that must go through it).
 		if !n.adoptClusterGeneration(snap.FSM.ClusterGeneration()) {
 			return // n.fail already recorded the error and stopped the node
+		}
+		// Pruning old snapshot FILES happens here — strictly after the
+		// durable pointer (storage.InstallSnapshot, above) has already
+		// moved to this snapshot's boundary — the same ordering fix
+		// maybeSnapshot's own Prune call applies, and for the identical
+		// reason (Manager.Prune's own doc comment, SL-8/SL-26). Non-fatal:
+		// see maybeSnapshot's matching comment.
+		if err := n.snapMgr.Prune(snap.Meta.LastIncludedIndex); err != nil {
+			n.logf("node %s: pruning old snapshot files after installing %d: %v (non-fatal; will retry on the next cycle)", n.cfg.ID, snap.Meta.LastIncludedIndex, err)
 		}
 		n.metrics.SnapshotsInstalledTotal.Inc()
 		// Any waiter for an index this install just superseded is never

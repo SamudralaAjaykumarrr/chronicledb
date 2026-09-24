@@ -87,6 +87,13 @@ type testCluster struct {
 	// with peer mTLS (docs/enterprise-v1-plan.md §5 layer 2) instead of
 	// plaintext transport — see tls_test.go.
 	peerTLS map[raft.NodeID]peerTLSFiles
+
+	// admissionOverride, when non-nil, lets a test tune this cluster's
+	// admission-control Config fields (docs/v0.6.0-plan.md Part A)
+	// beyond configFor's own production-shaped defaults — e.g. a small
+	// MaxInflightProposals so a handful of goroutines can saturate it
+	// deterministically.
+	admissionOverride func(*Config)
 }
 
 // peerTLSFiles names one node's peer-TLS certificate/key/CA file paths
@@ -107,6 +114,73 @@ func newTestClusterWithSnapshotThreshold(t *testing.T, n int, snapshotThreshold 
 		dirs:              make(map[raft.NodeID]string, n),
 		nodes:             make(map[raft.NodeID]*Node, n),
 		snapshotThreshold: snapshotThreshold,
+	}
+	addrs := freeAddrs(t, n)
+	for i := 0; i < n; i++ {
+		id := raft.NodeID(fmt.Sprintf("n%d", i+1))
+		tc.ids = append(tc.ids, id)
+		tc.addrs[id] = addrs[i]
+		tc.dirs[id] = t.TempDir()
+	}
+	for _, id := range tc.ids {
+		tc.nodes[id] = tc.mustOpen(id)
+	}
+	t.Cleanup(func() {
+		for _, n := range tc.nodes {
+			n.Stop()
+		}
+	})
+	return tc
+}
+
+// newTestClusterWithAdmissionOverride is newTestCluster plus a hook to
+// tune every node's admission-control Config fields
+// (docs/v0.6.0-plan.md Part A) before Open — e.g. a small
+// MaxInflightProposals so AC-1/AC-3/AC-5…AC-9/AC-20-style tests can
+// saturate a gate with a handful of goroutines instead of hundreds.
+func newTestClusterWithAdmissionOverride(t *testing.T, n int, override func(*Config)) *testCluster {
+	t.Helper()
+	tc := &testCluster{
+		t:                 t,
+		addrs:             make(map[raft.NodeID]string, n),
+		dirs:              make(map[raft.NodeID]string, n),
+		nodes:             make(map[raft.NodeID]*Node, n),
+		admissionOverride: override,
+	}
+	addrs := freeAddrs(t, n)
+	for i := 0; i < n; i++ {
+		id := raft.NodeID(fmt.Sprintf("n%d", i+1))
+		tc.ids = append(tc.ids, id)
+		tc.addrs[id] = addrs[i]
+		tc.dirs[id] = t.TempDir()
+	}
+	for _, id := range tc.ids {
+		tc.nodes[id] = tc.mustOpen(id)
+	}
+	t.Cleanup(func() {
+		for _, n := range tc.nodes {
+			n.Stop()
+		}
+	})
+	return tc
+}
+
+// newTestClusterWithSnapshotThresholdAndAdmissionOverride combines
+// newTestClusterWithSnapshotThreshold's real snapshot-creation trigger
+// with newTestClusterWithAdmissionOverride's Config-tuning hook, for
+// tests that need both at once (e.g. SL-13: forcing a real
+// InstallSnapshot catch-up path while also driving the leader-GC-
+// proposer fast enough to produce continuation passes within the test's
+// own budget).
+func newTestClusterWithSnapshotThresholdAndAdmissionOverride(t *testing.T, n int, snapshotThreshold uint64, override func(*Config)) *testCluster {
+	t.Helper()
+	tc := &testCluster{
+		t:                 t,
+		addrs:             make(map[raft.NodeID]string, n),
+		dirs:              make(map[raft.NodeID]string, n),
+		nodes:             make(map[raft.NodeID]*Node, n),
+		snapshotThreshold: snapshotThreshold,
+		admissionOverride: override,
 	}
 	addrs := freeAddrs(t, n)
 	for i := 0; i < n; i++ {
@@ -168,6 +242,9 @@ func (tc *testCluster) configFor(id raft.NodeID) Config {
 		cfg.PeerTLSCertFile = files.CertFile
 		cfg.PeerTLSKeyFile = files.KeyFile
 		cfg.PeerTLSCAFile = files.CAFile
+	}
+	if tc.admissionOverride != nil {
+		tc.admissionOverride(&cfg)
 	}
 	return cfg
 }
@@ -340,7 +417,7 @@ func TestRF1_NormalReplicationConvergesAcrossRealNodes(t *testing.T) {
 	for _, id := range tc.ids {
 		id := id
 		awaitCondition(t, 3*time.Second, fmt.Sprintf("node %s converges on k1=v1", id), func() bool {
-			v, ok := tc.node(id).FSM().Store().Visible("k1", outcome.CommitSeq)
+			v, ok, _ := tc.node(id).FSM().Store().Visible("k1", outcome.CommitSeq)
 			return ok && string(v) == "v1"
 		})
 	}
@@ -454,13 +531,13 @@ func TestRF13_OldLeaderRejoinsAndConverges(t *testing.T) {
 	for _, id := range tc.ids {
 		id := id
 		awaitCondition(t, 5*time.Second, fmt.Sprintf("node %s converges on k1=v1 after heal", id), func() bool {
-			v, ok := tc.node(id).FSM().Store().Visible("k1", outcome.CommitSeq)
+			v, ok, _ := tc.node(id).FSM().Store().Visible("k1", outcome.CommitSeq)
 			return ok && string(v) == "v1"
 		})
 	}
 	// The stale, never-committed key must never appear anywhere.
 	for _, id := range tc.ids {
-		if _, ok := tc.node(id).FSM().Store().Visible("stale-key", outcome.CommitSeq); ok {
+		if _, ok, _ := tc.node(id).FSM().Store().Visible("stale-key", outcome.CommitSeq); ok {
 			t.Fatalf("node %s materialized the old leader's uncommitted speculative write", id)
 		}
 	}
@@ -577,7 +654,7 @@ func TestFollowerRestartCatchesUpViaLogReplication(t *testing.T) {
 
 	restarted := tc.restart(followerID)
 	awaitCondition(t, 5*time.Second, "restarted follower catches up", func() bool {
-		v, ok := restarted.FSM().Store().Visible("k1", outcome.CommitSeq)
+		v, ok, _ := restarted.FSM().Store().Visible("k1", outcome.CommitSeq)
 		return ok && string(v) == "v1"
 	})
 }
@@ -618,7 +695,7 @@ func TestIdempotencyAcrossFailover(t *testing.T) {
 	}
 
 	// The value must reflect exactly one application, not two.
-	v, ok := tc.node(newLeaderID).FSM().Store().Visible("balance", outcome1.CommitSeq)
+	v, ok, _ := tc.node(newLeaderID).FSM().Store().Visible("balance", outcome1.CommitSeq)
 	if !ok || string(v) != "100" {
 		t.Fatalf("balance = %q ok=%v, want \"100\" applied exactly once", v, ok)
 	}
@@ -652,7 +729,7 @@ func TestMultiKeyTransactionReplicationAtomic(t *testing.T) {
 		awaitCondition(t, 3*time.Second, fmt.Sprintf("node %s has all three keys", id), func() bool {
 			store := tc.node(id).FSM().Store()
 			for k, want := range map[string]string{"a": "1", "b": "2", "c": "3"} {
-				v, ok := store.Visible(k, outcome.CommitSeq)
+				v, ok, _ := store.Visible(k, outcome.CommitSeq)
 				if !ok || string(v) != want {
 					return false
 				}
@@ -745,7 +822,7 @@ func TestDurablePersistenceFailureStopsNodeWithoutFalseAck(t *testing.T) {
 		if id == leaderID {
 			continue
 		}
-		if _, ok := tc.node(id).FSM().Store().Visible("k1", ^uint64(0)); ok {
+		if _, ok, _ := tc.node(id).FSM().Store().Visible("k1", ^uint64(0)); ok {
 			t.Fatalf("node %s materialized a write that was never durably committed", id)
 		}
 	}
@@ -767,10 +844,11 @@ func TestBeginReadIndexOnLeaderSucceedsAfterCommit(t *testing.T) {
 
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
-	startSeq, err := leader.BeginReadIndex(ctx)
+	startSeq, lease, err := leader.BeginReadIndex(ctx)
 	if err != nil {
 		t.Fatalf("BeginReadIndex: %v", err)
 	}
+	defer lease.Release()
 	if startSeq < outcome.CommitSeq {
 		t.Fatalf("StartSeq = %d, want >= CommitSeq %d", startSeq, outcome.CommitSeq)
 	}
@@ -792,7 +870,7 @@ func TestBeginReadIndexRejectedOnFollower(t *testing.T) {
 
 	ctx, cancel := context.WithTimeout(context.Background(), 1*time.Second)
 	defer cancel()
-	_, err := tc.node(followerID).BeginReadIndex(ctx)
+	_, _, err := tc.node(followerID).BeginReadIndex(ctx)
 	var nle *NotLeaderError
 	if !errors.As(err, &nle) {
 		t.Fatalf("BeginReadIndex on follower: err = %v, want *NotLeaderError", err)
@@ -824,7 +902,7 @@ func TestBeginReadIndexBlockedAfterIsolationEvenWithStaleReplicatedLog(t *testin
 
 	ctx, cancel := context.WithTimeout(context.Background(), 1*time.Second)
 	defer cancel()
-	if _, err := leader.BeginReadIndex(ctx); err == nil {
+	if _, _, err := leader.BeginReadIndex(ctx); err == nil {
 		t.Fatal("isolated leader completed ReadIndex using stale pre-isolation replication facts alone")
 	}
 }
@@ -841,7 +919,7 @@ func TestBeginReadIndexBlockedDuringMinorityPartition(t *testing.T) {
 
 	ctx, cancel := context.WithTimeout(context.Background(), 1*time.Second)
 	defer cancel()
-	_, err := leader.BeginReadIndex(ctx)
+	_, _, err := leader.BeginReadIndex(ctx)
 	if err == nil {
 		t.Fatal("isolated leader completed a ReadIndex check during a minority partition; QUORUM-SAFETY/read-consistency violated")
 	}
@@ -877,7 +955,7 @@ func TestClusterRestartRecoversFSMAndRequestIDOutcomes(t *testing.T) {
 	}
 	awaitCondition(t, 3*time.Second, "all nodes apply before restart", func() bool {
 		for _, id := range tc.ids {
-			if _, ok := tc.node(id).FSM().Store().Visible("k1", outcome.CommitSeq); !ok {
+			if _, ok, _ := tc.node(id).FSM().Store().Visible("k1", outcome.CommitSeq); !ok {
 				return false
 			}
 		}
@@ -902,7 +980,7 @@ func TestClusterRestartRecoversFSMAndRequestIDOutcomes(t *testing.T) {
 	for _, id := range tc.ids {
 		id := id
 		awaitCondition(t, 5*time.Second, fmt.Sprintf("node %s recovers k1=v1 after full cluster restart", id), func() bool {
-			v, ok := tc.node(id).FSM().Store().Visible("k1", outcome.CommitSeq)
+			v, ok, _ := tc.node(id).FSM().Store().Visible("k1", outcome.CommitSeq)
 			return ok && string(v) == "v1"
 		})
 	}
@@ -967,7 +1045,7 @@ func TestSN1_RestartRestoresFromSnapshotAndCompactsLog(t *testing.T) {
 	}
 	for i := 0; i < numKeys; i++ {
 		key := fmt.Sprintf("k%d", i)
-		if _, ok := restarted.FSM().Store().Visible(key, outcomes[i].CommitSeq); !ok {
+		if _, ok, _ := restarted.FSM().Store().Visible(key, outcomes[i].CommitSeq); !ok {
 			t.Fatalf("key %s (covered by the snapshot) not immediately visible after restart", key)
 		}
 	}
@@ -1045,7 +1123,7 @@ func TestSN5_FollowerCatchesUpViaSnapshotAfterLeaderCompaction(t *testing.T) {
 	}
 	for i := 0; i < numKeys; i++ {
 		key := fmt.Sprintf("k%d", i)
-		if _, ok := fnode.FSM().Store().Visible(key, outcomes[i].CommitSeq); !ok {
+		if _, ok, _ := fnode.FSM().Store().Visible(key, outcomes[i].CommitSeq); !ok {
 			t.Fatalf("key %s not visible on the follower after snapshot catch-up", key)
 		}
 	}

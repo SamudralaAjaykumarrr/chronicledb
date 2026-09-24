@@ -104,7 +104,7 @@ func Open(dir string, opts Options) (*WAL, *RecoveryReport, error) {
 		segmentMaxSize = DefaultSegmentMaxSize
 	}
 	if err := storage.EnsureDir(dir); err != nil {
-		return nil, nil, err
+		return nil, nil, classifyStorageErr(err)
 	}
 
 	ids, err := storage.ListSegmentIDs(dir)
@@ -118,7 +118,7 @@ func Open(dir string, opts Options) (*WAL, *RecoveryReport, error) {
 	if len(ids) == 0 {
 		seg, err := storage.CreateSegment(dir, 1)
 		if err != nil {
-			return nil, nil, err
+			return nil, nil, classifyStorageErr(err)
 		}
 		w.current = seg
 		meta := Metadata{NodeID: newNodeID(), FormatVersion: FormatVersion}
@@ -128,7 +128,7 @@ func Open(dir string, opts Options) (*WAL, *RecoveryReport, error) {
 		}
 		if err := w.current.Sync(); err != nil {
 			seg.Close()
-			return nil, nil, err
+			return nil, nil, classifyStorageErr(err)
 		}
 		w.metadata = meta
 		w.firstLogIndex = 1
@@ -518,7 +518,7 @@ func (w *WAL) AppendMetadataSnapshot(uptoIndex uint64) error {
 		return err
 	}
 	if err := w.current.Sync(); err != nil {
-		return err
+		return classifyStorageErr(err)
 	}
 	w.metadata = meta
 	w.firstLogIndex = uptoIndex + 1
@@ -591,7 +591,7 @@ func (w *WAL) SetClusterGeneration(generation uint32) error {
 		return err
 	}
 	if err := w.current.Sync(); err != nil {
-		return err
+		return classifyStorageErr(err)
 	}
 	w.metadata = meta
 	return nil
@@ -627,16 +627,37 @@ func (w *WAL) SetClusterGeneration(generation uint32) error {
 // completed compaction is never a correctness problem, only a
 // (temporary, self-healing on the next successful call) disk-space one.
 func (w *WAL) CompactBefore(uptoIndex uint64) error {
+	return w.CompactBeforeRetaining(uptoIndex, 0)
+}
+
+// CompactBeforeRetaining is CompactBefore's more general form
+// (docs/v0.6.0-plan.md §17.3, `-wal-retain-extra-segments`): the same
+// unchanged eligibility computation (segment ids alone, never by
+// re-reading contents — see CompactBefore's own doc comment), but stops
+// deleting once retainExtraSegments otherwise-eligible segments remain,
+// giving a lagging follower a chance to catch up by log replication
+// rather than a full InstallSnapshot (per §4.4, one of the most
+// event-loop-expensive things a leader can be asked to do).
+// retainExtraSegments must be >= 0; retaining more history than required
+// is always safe, so this only ever moves the stopping point earlier,
+// never deletes anything CompactBefore itself would not have.
+// retainExtraSegments == 0 reproduces CompactBefore's exact behavior
+// (today's default).
+func (w *WAL) CompactBeforeRetaining(uptoIndex uint64, retainExtraSegments int) error {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	if w.closed {
 		return ErrClosed
+	}
+	if retainExtraSegments < 0 {
+		return fmt.Errorf("wal: retainExtraSegments must be >= 0, got %d", retainExtraSegments)
 	}
 	ids, err := storage.ListSegmentIDs(w.dir)
 	if err != nil {
 		return err
 	}
 	currentID := w.current.ID()
+	var eligible []uint64
 	for i, id := range ids {
 		if id == currentID {
 			break
@@ -653,6 +674,12 @@ func (w *WAL) CompactBefore(uptoIndex uint64) error {
 		if maxIndexInSegment > uptoIndex {
 			break // this segment (and every later one) is still needed
 		}
+		eligible = append(eligible, id)
+	}
+	if retainExtraSegments >= len(eligible) {
+		return nil // retain everything eligible; nothing to delete yet
+	}
+	for _, id := range eligible[:len(eligible)-retainExtraSegments] {
 		if err := storage.RemoveSegment(w.dir, id); err != nil {
 			return err
 		}
@@ -711,7 +738,7 @@ func (w *WAL) appendLocked(rt RecordType, payload []byte) error {
 		return err
 	}
 	if _, err := w.current.Append(frame); err != nil {
-		return err
+		return classifyStorageErr(err)
 	}
 	return nil
 }
@@ -737,11 +764,11 @@ func (w *WAL) maybeRotateLocked(nextFrameSize int64) error {
 	}
 	newSeg, err := storage.CreateSegment(w.dir, newID)
 	if err != nil {
-		return err
+		return classifyStorageErr(err)
 	}
 	if err := newSeg.Sync(); err != nil {
 		newSeg.Close()
-		return err
+		return classifyStorageErr(err)
 	}
 	old := w.current
 	w.current = newSeg
@@ -757,7 +784,7 @@ func (w *WAL) Sync() error {
 	if w.closed {
 		return ErrClosed
 	}
-	return w.current.Sync()
+	return classifyStorageErr(w.current.Sync())
 }
 
 // Close closes the WAL's open segment. After Close, all other WAL methods

@@ -36,12 +36,38 @@ import (
 const ControlCommandMarker byte = 0xF0
 
 // Control-command kinds, the second byte of a control-command payload
-// (after ControlCommandMarker). Currently exactly one exists.
+// (after ControlCommandMarker).
 const (
 	// controlKindSetClusterVersion identifies a SetClusterVersionCommand
 	// payload.
 	controlKindSetClusterVersion byte = 1
+	// controlKindAdvanceGCWatermark identifies an
+	// AdvanceGCWatermarkCommand payload (gc.go, docs/v0.6.0-plan.md
+	// §16.1).
 )
+
+// ControlKindSetClusterVersion/ControlKindAdvanceGCWatermark export
+// this package's control-kind byte values so a caller outside this
+// package (internal/node.applyControlEntry) can dispatch to the
+// correct kind-specific decoder without duplicating the byte values or
+// needing this package's own unexported constants.
+const (
+	ControlKindSetClusterVersion  = controlKindSetClusterVersion
+	ControlKindAdvanceGCWatermark = controlKindAdvanceGCWatermark
+)
+
+// ControlKind returns the control-kind byte of a control-command
+// payload (the byte immediately after ControlCommandMarker) — the
+// dispatch key internal/node.applyControlEntry switches on (§16.1: "must
+// switch on the kind byte rather than assume SetClusterVersion"). ok is
+// false if payload is not a control command at all, or is too short to
+// even contain a kind byte.
+func ControlKind(payload []byte) (kind byte, ok bool) {
+	if !IsControlCommand(payload) || len(payload) < 2 {
+		return 0, false
+	}
+	return payload[1], true
+}
 
 // init structurally guarantees ControlCommandMarker/commitTxnCommandVersion's
 // non-collision at process startup, in every build, rather than relying
@@ -203,7 +229,7 @@ func (f *FSM) ApplySetClusterVersion(index uint64, cmd SetClusterVersionCommand)
 // after restoring generation-0 state — docs/upgrades.md). Safe for
 // concurrent use.
 func (f *FSM) ClusterGeneration() uint32 {
-	f.mu.Lock()
-	defer f.mu.Unlock()
+	f.rLock()
+	defer f.rUnlock()
 	return f.clusterGeneration
 }

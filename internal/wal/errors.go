@@ -1,6 +1,11 @@
 package wal
 
-import "errors"
+import (
+	"errors"
+	"fmt"
+
+	"github.com/SamudralaAjaykumarrr/chronicledb/internal/storage"
+)
 
 var (
 	// ErrClosed is returned by any WAL method called after Close.
@@ -48,3 +53,30 @@ var (
 // automatic truncation (last segment) or ErrCorrupt (any earlier
 // segment), and Replay() converts it into a clean end-of-stream signal.
 var errTornTail = errors.New("wal: torn tail (internal sentinel, not surfaced to callers)")
+
+// ErrOutOfSpace classifies a durable-log write/sync/rotate failure caused
+// by disk exhaustion (docs/v0.6.0-plan.md §19.3, DISK-FULL EXPLICITNESS,
+// §27.9): this package's own sentinel, reclassified at this package's
+// boundary from internal/storage.ErrOutOfSpace rather than leaking that
+// package's error type to every caller of internal/wal (internal/node,
+// most importantly, on the Raft durable path — §20.1). errors.Is also
+// still matches the original storage.ErrOutOfSpace and the underlying
+// syscall.ENOSPC through the wrapped chain; ErrOutOfSpace exists so a
+// caller that only imports internal/wal has a name to check.
+var ErrOutOfSpace = errors.New("wal: no space left on device")
+
+// classifyStorageErr reclassifies err into ErrOutOfSpace when it is (or
+// wraps) storage.ErrOutOfSpace, leaving every other error — including nil
+// — untouched. Applied at every point in this package that receives an
+// error directly from an internal/storage call that could plausibly
+// exhaust disk space (docs/v0.6.0-plan.md §19.3 item 1: never let an
+// ENOSPC lose its classification crossing a package boundary).
+func classifyStorageErr(err error) error {
+	if err == nil {
+		return nil
+	}
+	if errors.Is(err, storage.ErrOutOfSpace) {
+		return fmt.Errorf("%w: %w", ErrOutOfSpace, err)
+	}
+	return err
+}

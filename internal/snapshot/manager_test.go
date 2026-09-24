@@ -55,7 +55,15 @@ func TestManagerLoadIgnoresSnapshotNewerThanPointer(t *testing.T) {
 	}
 }
 
-func TestManagerRetainsOnlyLatestAfterNewCreate(t *testing.T) {
+// TestManagerCreateNeverAutoPrunes is SL-8's own regression test at the
+// Manager level: Create must NOT prune any older retained snapshot
+// itself — that used to happen eagerly inside writeDurable and was a
+// real crash-safety hazard (a crash between the new file becoming
+// durable and the caller recording its pointer left the OLD,
+// still-pointer-named file already deleted — see Manager.Prune's own
+// doc comment). Pruning is now the caller's explicit, separately-timed
+// responsibility (Prune), exercised by TestManagerRetainsOnlyLatestAfterExplicitPrune below.
+func TestManagerCreateNeverAutoPrunes(t *testing.T) {
 	m := newManager(t)
 	f1 := buildFSM(t)
 	if _, err := m.Create(Meta{LastIncludedIndex: 3, LastIncludedTerm: 1}, f1, FormatVersion); err != nil {
@@ -67,6 +75,35 @@ func TestManagerRetainsOnlyLatestAfterNewCreate(t *testing.T) {
 	}
 	if _, err := m.Create(Meta{LastIncludedIndex: 10, LastIncludedTerm: 2}, f2, FormatVersion); err != nil {
 		t.Fatalf("Create 2: %v", err)
+	}
+	cands, err := m.candidatesDescending()
+	if err != nil {
+		t.Fatalf("candidatesDescending: %v", err)
+	}
+	if len(cands) != 2 {
+		t.Fatalf("Create must not auto-prune: expected both snapshots (index 3 and 10) still retained, got %+v", cands)
+	}
+}
+
+// TestManagerRetainsOnlyLatestAfterExplicitPrune is
+// TestManagerCreateNeverAutoPrunes's positive counterpart: calling
+// Prune explicitly, as every real caller now must once the durable
+// pointer has moved, reduces retention to the default of 1.
+func TestManagerRetainsOnlyLatestAfterExplicitPrune(t *testing.T) {
+	m := newManager(t)
+	f1 := buildFSM(t)
+	if _, err := m.Create(Meta{LastIncludedIndex: 3, LastIncludedTerm: 1}, f1, FormatVersion); err != nil {
+		t.Fatalf("Create 1: %v", err)
+	}
+	f2 := fsm.New(mvcc.NewStore())
+	if _, err := f2.Apply(1, fsm.CommitTxnCommand{RequestID: "x", Mutations: []mvcc.Mutation{{Key: "z", Value: []byte("v")}}}); err != nil {
+		t.Fatalf("apply: %v", err)
+	}
+	if _, err := m.Create(Meta{LastIncludedIndex: 10, LastIncludedTerm: 2}, f2, FormatVersion); err != nil {
+		t.Fatalf("Create 2: %v", err)
+	}
+	if err := m.Prune(10); err != nil {
+		t.Fatalf("Prune(10): %v", err)
 	}
 	cands, err := m.candidatesDescending()
 	if err != nil {
@@ -196,5 +233,67 @@ func TestManagerCreateLeavesNoTempFileOnSuccess(t *testing.T) {
 	}
 	if len(entries) != 0 {
 		t.Fatalf("expected no leftover temp files, found %d", len(entries))
+	}
+}
+
+// TestManagerSetRetainCountRejectsBelowOne is SL-9's Manager-level
+// negative control: 0 or negative is refused rather than silently
+// clamped, since retaining zero would risk having no valid snapshot on
+// disk at any instant.
+func TestManagerSetRetainCountRejectsBelowOne(t *testing.T) {
+	m := newManager(t)
+	if err := m.SetRetainCount(0); err == nil {
+		t.Fatalf("SetRetainCount(0) succeeded, want an error")
+	}
+	if err := m.SetRetainCount(-1); err == nil {
+		t.Fatalf("SetRetainCount(-1) succeeded, want an error")
+	}
+}
+
+// TestManagerRetainCountKeepsNewestN is §18.2's positive proof: with
+// SetRetainCount(n), the newest n snapshot files survive a further
+// Create and every older one is pruned — generalizing the existing
+// single-retention default (n=1) that TestManagerCreateAndLoad's
+// sibling tests already exercise implicitly.
+func TestManagerRetainCountKeepsNewestN(t *testing.T) {
+	m := newManager(t)
+	if err := m.SetRetainCount(3); err != nil {
+		t.Fatalf("SetRetainCount(3): %v", err)
+	}
+	f := buildFSM(t)
+	for _, idx := range []uint64{1, 2, 3, 4, 5} {
+		if _, err := m.Create(Meta{LastIncludedIndex: idx, LastIncludedTerm: 1}, f, FormatVersion); err != nil {
+			t.Fatalf("Create(%d): %v", idx, err)
+		}
+		// Every real caller (maybeSnapshot, handleInstallSnapshot) calls
+		// Prune explicitly, only after its own durable pointer has moved
+		// to idx — Create itself no longer prunes (see
+		// TestManagerCreateNeverAutoPrunes).
+		if err := m.Prune(idx); err != nil {
+			t.Fatalf("Prune(%d): %v", idx, err)
+		}
+	}
+	cands, err := m.candidatesDescending()
+	if err != nil {
+		t.Fatalf("candidatesDescending: %v", err)
+	}
+	if len(cands) != 3 {
+		t.Fatalf("retained %d snapshot files, want exactly 3", len(cands))
+	}
+	wantIndices := map[uint64]bool{5: true, 4: true, 3: true}
+	for _, c := range cands {
+		if !wantIndices[c.index] {
+			t.Fatalf("retained unexpected old snapshot at index %d; want only {3,4,5}", c.index)
+		}
+	}
+	for _, idx := range []uint64{5, 4, 3} {
+		if _, ok, err := m.Bytes(idx); err != nil || !ok {
+			t.Fatalf("Bytes(%d): ok=%v err=%v, want ok=true", idx, ok, err)
+		}
+	}
+	for _, idx := range []uint64{2, 1} {
+		if _, ok, err := m.Bytes(idx); err != nil || ok {
+			t.Fatalf("Bytes(%d): ok=%v err=%v, want ok=false (pruned)", idx, ok, err)
+		}
 	}
 }

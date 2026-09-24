@@ -99,17 +99,24 @@ func TestHandleUpgradeFinalize_ReportsTheActualAchievedGeneration(t *testing.T) 
 		t.Fatalf("node's own ClusterGeneration = %d, want 1", got)
 	}
 
-	// A second finalize call must be needed (and must succeed) to reach
-	// the true max — proving the first call genuinely only advanced by
-	// one step rather than the response merely being mislabeled.
+	// One further finalize call per remaining generation must be needed
+	// (and must succeed) to reach the true max — proving the first call
+	// genuinely only advanced by one step rather than the response
+	// merely being mislabeled. Looped (not a single hardcoded second
+	// call) because MaxSupportedGeneration has grown across releases
+	// before (1 -> 2 -> 3) and each single finalize call only ever
+	// advances by exactly one step.
 	if version.MaxSupportedGeneration > 1 {
-		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-		defer cancel()
-		if _, _, err := n.FinalizeUpgrade(ctx); err != nil {
-			t.Fatalf("second FinalizeUpgrade call: %v", err)
+		for got := orderedClusterGeneration(t, n); got < version.MaxSupportedGeneration; got = orderedClusterGeneration(t, n) {
+			ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+			_, _, err := n.FinalizeUpgrade(ctx)
+			cancel()
+			if err != nil {
+				t.Fatalf("FinalizeUpgrade call at generation %d: %v", got, err)
+			}
 		}
 		if got := orderedClusterGeneration(t, n); got != version.MaxSupportedGeneration {
-			t.Fatalf("ClusterGeneration after the second finalize = %d, want %d", got, version.MaxSupportedGeneration)
+			t.Fatalf("ClusterGeneration after finalizing to the max = %d, want %d", got, version.MaxSupportedGeneration)
 		}
 	}
 }

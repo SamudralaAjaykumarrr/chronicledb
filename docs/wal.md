@@ -184,6 +184,31 @@ persisted and validated — never before, and never based on an
 in-progress snapshot. See [`docs/snapshots.md`](snapshots.md) §Log
 Truncation.
 
+**Restated (`v0.6.0`) — the reclamation boundary, precisely.** No
+durable WAL segment is deleted before the snapshot that supersedes it
+is fully written, `fsync`'d, recorded in durable WAL metadata
+(`AppendMetadataSnapshot`), and has had `HardState` re-affirmed into
+the current segment (`Reaffirm`, so compaction can never delete the
+only remaining durable copy of it); and nothing above that boundary is
+ever deleted. This is `RECLAMATION BOUNDARY`
+([`docs/invariants.md`](invariants.md)) — `LOG COMPACTION SAFETY`
+restated at the exact ordering level, made explicit because `v0.6.0`
+introduces the retention knob below touching the same code path.
+
+**`-wal-retain-extra-segments` (`v0.6.0`, default `0`).**
+`WAL.CompactBeforeRetaining(uptoIndex, retainExtraSegments)` is
+`CompactBefore`'s retention-aware sibling: it deletes eligible segments
+exactly as `CompactBefore` does, except it stops `retainExtraSegments`
+whole segments short of the compaction boundary, leaving them in place.
+This lets a follower that is lagging, but not lagging past the retained
+segments, catch up by ordinary log replication instead of a full
+`InstallSnapshot` — shrinking the window `chronicledb_snapshot_serve_miss_total`
+measures (see [`docs/snapshots.md`](snapshots.md) §12). The default,
+`0`, reproduces `CompactBefore`'s own exact pre-`v0.6.0` behavior
+byte-for-byte; `internal/node.maybeSnapshot` is the sole caller, and
+calls `CompactBeforeRetaining` in place of the plain `CompactBefore` it
+used through `v0.5.0`.
+
 ## 8. Persistent metadata
 
 `internal/wal`'s `Metadata` record (and the `meta/` directory, see
@@ -428,3 +453,38 @@ never widen tolerance unconditionally. `TestEncodeDecodeMetadata_ClusterGenerati
 `TestDecodeMetadata_RejectsWrongTrailingLength`
 (`internal/wal/generation_test.go`) are the regression pins for exactly
 these two decisions.
+
+## 15. `v0.6.0` decisions (Admission Control / Storage Lifecycle)
+
+`docs/v0.6.0-plan.md` §19/§21, [`docs/storage-lifecycle.md`](storage-lifecycle.md),
+and `ADR-0021` are the full architecture. Three additions, none of
+which touch this package's own record framing (§3) or corruption
+classification (§6):
+
+- **`ENOSPC` classification.** Every write-shaped call in this package
+  that receives an error from `internal/storage` (`appendLocked`,
+  `maybeRotateLocked`, `Sync`, `AppendMetadataSnapshot`,
+  `SetClusterGeneration`, `Open`) passes it through a boundary
+  reclassifier: if the error is (or wraps) `storage.ErrOutOfSpace`, it
+  is re-wrapped as this package's own `wal.ErrOutOfSpace` before being
+  returned. This exists specifically so a caller that only imports
+  `internal/wal` — `internal/node`, on the Raft durable path — never
+  needs to know `internal/storage`'s own error type to recognize "the
+  disk is full," and so the classification cannot silently degrade into
+  a generic `fmt.Errorf("write failed: %w")` at this package boundary —
+  the exact hazard `DISK-FULL EXPLICITNESS`
+  ([`docs/invariants.md`](invariants.md)) names.
+- **`CompactBeforeRetaining`.** See §7 above.
+- **Read-only segment access for scrub.** `internal/storage.OpenSegmentReadOnly`
+  (opened `O_RDONLY`; its `Append`/`Sync`/`Truncate` all return
+  `ErrReadOnlySegment`) is the *only* constructor `internal/wal.Scrub`
+  uses to read segment files — never `OpenSegment`, never a live
+  `*WAL`. `Scrub(dir, onBytesRead)` re-scans `dir`'s segment files
+  independently of any live `WAL` instance (no shared state, no lock),
+  reporting framing/checksum/version/index-ordering problems as
+  findings rather than errors, and treats a torn tail in the
+  highest-numbered (current, still-open) segment as legal — exactly
+  §6.1's own rule — while the identical signature in an earlier segment
+  is corruption. This is `SCRUB NON-DESTRUCTIVE`
+  ([`docs/invariants.md`](invariants.md)), asserted structurally by
+  `TestScrubOnlyOpensReadOnly` rather than left to reviewer discipline.

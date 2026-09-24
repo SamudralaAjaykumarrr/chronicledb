@@ -96,12 +96,12 @@ func TestCrossLayer_SnapshotInstallThenElection(t *testing.T) {
 	awaitCondition(t, 5*time.Second, "new leader applies up to the pre-crash state", func() bool {
 		return uint64(newLeader.Status().AppliedIndex) >= preOutcome.CommitSeq
 	})
-	if v, ok := newLeader.FSM().Store().Visible("pre-key", uint64(newLeader.Status().AppliedIndex)); !ok || string(v) != "pre-val" {
+	if v, ok, _ := newLeader.FSM().Store().Visible("pre-key", uint64(newLeader.Status().AppliedIndex)); !ok || string(v) != "pre-val" {
 		t.Fatalf("new leader lost pre-isolation committed key: got %q,%v", v, ok)
 	}
 	for i := 0; i < 3*threshold; i++ {
 		key := fmt.Sprintf("k%d", i)
-		if _, ok := newLeader.FSM().Store().Visible(key, uint64(newLeader.Status().AppliedIndex)); !ok {
+		if _, ok, _ := newLeader.FSM().Store().Visible(key, uint64(newLeader.Status().AppliedIndex)); !ok {
 			t.Fatalf("new leader lost committed key %s (LEADER-COMPLETENESS violated across a snapshot-install-then-election sequence)", key)
 		}
 	}
@@ -114,7 +114,7 @@ func TestCrossLayer_SnapshotInstallThenElection(t *testing.T) {
 	for _, id := range []raft.NodeID{follower, other} {
 		id := id
 		awaitCondition(t, 5*time.Second, fmt.Sprintf("node %s converges on the post-election write", id), func() bool {
-			v, ok := tc.node(id).FSM().Store().Visible("post-key", outcome.CommitSeq)
+			v, ok, _ := tc.node(id).FSM().Store().Visible("post-key", outcome.CommitSeq)
 			return ok && string(v) == "post-val"
 		})
 	}

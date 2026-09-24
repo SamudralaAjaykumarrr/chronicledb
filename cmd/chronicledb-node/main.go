@@ -24,9 +24,11 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"net"
 	"net/http"
 	"os"
 	"os/signal"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -50,7 +52,15 @@ func main() {
 		allFlag           = flag.String("cluster", "", "comma-separated id list of every cluster member, including this one")
 		dataDir           = flag.String("datadir", "", "durable log directory")
 		snapshotThreshold = flag.Uint64("snapshot-threshold", 0, "log entries since last snapshot before compacting (0 = package default); tests use a small value to force snapshot/compaction chaos quickly")
-		showVersion       = flag.Bool("version", false, "print version information and exit")
+
+		// Retention knobs (docs/v0.6.0-plan.md §17.3, §18.2). Both
+		// default to today's exact v0.5.0 behavior (retain nothing extra)
+		// and are validated below as startup errors when set to a value
+		// that would defeat their own always-at-least-one-valid-snapshot /
+		// never-negative invariant, rather than silently clamped.
+		walRetainExtraSegments = flag.Int("wal-retain-extra-segments", 0, "stop WAL segment compaction this many otherwise-eligible segments early, giving a lagging follower more time to catch up by log replication instead of a full InstallSnapshot (0 = today's exact behavior; must be >= 0)")
+		snapshotRetainCount    = flag.Int("snapshot-retain-count", 1, "how many of the newest snapshot files to retain on disk (must be >= 1; shrinks the window in which a leader can be asked to serve a snapshot index a prune already deleted)")
+		showVersion            = flag.Bool("version", false, "print version information and exit")
 
 		// Security Foundation flags (docs/enterprise-v1-plan.md §5).
 		tlsCertFile     = flag.String("tls-cert", "", "control-plane HTTP TLS certificate file (enables client TLS when set)")
@@ -78,6 +88,71 @@ func main() {
 		// §7): a standalone dry-run against an already-running node's
 		// control plane, never touching -datadir/node.Open.
 		upgradePrecheckAddr = flag.String("upgrade-precheck", "", "dry-run: query an already-running node's HTTP control-plane address (host:port) for /admin/upgrade/precheck and print the result, then exit; does not start a node or touch -datadir (plain HTTP only in this release — see docs/upgrades.md)")
+
+		// Admission control (docs/v0.6.0-plan.md §10.1). The four
+		// "MaxConcurrent"-shaped flags below default to their §10.1
+		// production values, so 0 can only reach node.Config as an
+		// operator's explicit, deliberate override — validated as fatal
+		// below (ADMISSION FAILS CLOSED: there is no "unlimited").
+		maxInflightProposals      = flag.Int("max-inflight-proposals", 256, "Lane B write concurrency, and the event-loop len(waiters) ceiling (BOUNDED ADMITTED WORK); 0 is a startup error, not \"unlimited\"")
+		maxConcurrentReads        = flag.Int("max-concurrent-reads", 512, "Lane B BeginReadIndex concurrency, and the event-loop len(pendingReads) ceiling; 0 is a startup error")
+		maxLiveReadLeases         = flag.Int("max-live-read-leases", 4096, "ceiling on simultaneously live read leases (§9.1a, §15.3); 0 is a startup error")
+		admissionQueueDepth       = flag.Int("admission-queue-depth", 256, "Lane B waiting-room capacity beyond the concurrency limits above (0 = reject immediately, never wait — a legitimate permanent configuration)")
+		admissionMaxWait          = flag.Duration("admission-max-wait", 500*time.Millisecond, "upper bound on queued wait before queue_timeout (0 = bounded only by the caller's own context)")
+		maxAdminConcurrency       = flag.Int("max-admin-concurrency", 2, "Lane A1 (control: membership, upgrade precheck/finalize, TLS reload) concurrency; 0 is a startup error")
+		maxMaintenanceConcurrency = flag.Int("max-maintenance-concurrency", 2, "Lane A2 (maintenance: backup, scrub) concurrency; each kind is additionally single-slot; 0 is a startup error")
+		maxPeerConnections        = flag.Int("max-peer-connections", 64, "bounded accept on the Raft peer listener (0 = unlimited, v0.5.0 behavior)")
+		peerIdleTimeout           = flag.Duration("peer-idle-timeout", 60*time.Second, "read deadline on an inbound peer connection, re-armed per frame (0 = no deadline, v0.5.0 behavior)")
+
+		// MVCC GC (docs/v0.6.0-plan.md §10.2). gcInterval's default (0)
+		// is GC's own "disabled" state (S-12) — not validated as a
+		// startup error, unlike the admission flags above, since 0 is
+		// exactly the intended out-of-the-box value for this release.
+		gcInterval           = flag.Duration("gc-interval", 0, "how often the leader evaluates and, if warranted, proposes a GC watermark advance (0 disables GC entirely)")
+		gcMinRetainSeqs      = flag.Uint64("gc-min-retain-seqs", 1024, "lag floor: the proposed watermark never exceeds appliedCommitSeq minus this")
+		gcMaxVersionsPerPass = flag.Uint64("gc-max-versions-per-pass", 4096, "bound on versions removed by one AdvanceGCWatermark Apply")
+		gcMaxKeysPerPass     = flag.Uint64("gc-max-keys-per-pass", 16384, "bound on keys examined by one AdvanceGCWatermark Apply")
+		gcMinAdvanceSeqs     = flag.Uint64("gc-min-advance-seqs", 256, "do not propose a watermark ADVANCE unless it would advance by at least this much (does not gate a continuation pass at an unchanged watermark)")
+		// -read-lease-max-age is NOT yet wired: the expiry sweep it
+		// requires (docs/v0.6.0-plan.md §15.3, a liveness-only
+		// mechanism — a leaked lease stalls GC but never makes it
+		// unsafe) is tracked as remaining work rather than declared
+		// here as a flag with no effect.
+
+		// Disk/heap pressure + fsync-failure health (docs/v0.6.0-plan.md
+		// §10.1, §10.2, §19, §20). Both threshold flags default to ""
+		// (off, exactly v0.5.0 behavior); -fsync-failure-threshold's
+		// default (3) is the recommended out-of-the-box value, not a
+		// safety floor — 0 (an operator's own explicit, stricter choice)
+		// is refused nowhere.
+		diskPressureThreshold = flag.String("disk-pressure-threshold", "", `free-space floor (absolute "2GiB" or percentage "10%") below which admission tightens (§6.4); "" disables disk-pressure admission entirely`)
+		diskCriticalThreshold = flag.String("disk-critical-threshold", "", "free-space floor below which client writes are refused outright; must be strictly less than -disk-pressure-threshold, and requires it to also be set")
+		maxHeapBytes          = flag.Uint64("max-heap-bytes", 0, "heap ceiling above which admission tightens exactly as disk LowSpace does (§6.3); an admission threshold, never an allocator limit — set GOMEMLIMIT for that; 0 disables it")
+		resourcePollInterval  = flag.Duration("resource-poll-interval", 5*time.Second, "disk/heap pressure sampling cadence (§6.1)")
+		fsyncFailureThreshold = flag.Int("fsync-failure-threshold", 3, "consecutive non-Raft-path (snapshot/backup/audit) fsync failures before this node marks itself storage-unhealthy (§20.2)")
+		scrubBytesPerSec      = flag.Int64("scrub-bytes-per-sec", 64<<20, "POST /admin/storage/scrub's combined WAL+snapshot+audit read-rate cap (§21.4); 0 = unlimited")
+
+		// debugForceExclusiveOutcomeLock exists solely so AC-19's negative
+		// control (docs/v0.6.0-plan.md §31 gate 3, §5.4a) is reachable
+		// against a real OS process, not only internal/fsm's own unit
+		// test: it reverts FSM.mu's read-only accessors from RLock back to
+		// the pre-v0.6.0 exclusive Lock, at startup, so a real-process
+		// integration test can start a second node with it set and observe
+		// raft_message_process_seconds p99 actually regress under the
+		// identical flood that leaves an ordinary node's p99 unaffected.
+		// Never documented in -help's own text as an operator-facing flag
+		// (docs/configuration.md never lists it): it exists only to make a
+		// test-only FSM hook reachable from outside the test binary.
+		debugForceExclusiveOutcomeLock = flag.Bool("debug-force-exclusive-outcome-lock", false, "")
+
+		// HTTP server hardening (docs/v0.6.0-plan.md §10.1, §10.4 — the
+		// one v0.6.0 default-behavior change: on by default, since "no
+		// timeouts at all" was never a behavior worth preserving).
+		maxHTTPConnections    = flag.Int("max-http-connections", 1024, "bounded accept on the control-plane HTTP listener (0 = unlimited)")
+		httpReadHeaderTimeout = flag.Duration("http-read-header-timeout", 5*time.Second, "http.Server ReadHeaderTimeout")
+		httpReadTimeout       = flag.Duration("http-read-timeout", 30*time.Second, "http.Server ReadTimeout")
+		httpWriteTimeout      = flag.Duration("http-write-timeout", 60*time.Second, "http.Server WriteTimeout")
+		httpIdleTimeout       = flag.Duration("http-idle-timeout", 120*time.Second, "http.Server IdleTimeout")
 	)
 	flag.Parse()
 
@@ -178,6 +253,58 @@ func main() {
 		}
 	}
 
+	// ADMISSION FAILS CLOSED (docs/v0.6.0-plan.md §10.1, §27.4): each of
+	// these flags' own default is already its production value (never
+	// 0), so an operator reaching 0 here did so explicitly — refuse to
+	// start rather than silently treat it as "unlimited". node.Config
+	// itself keeps a different, ergonomic "0 = package default"
+	// convention for direct Go-API construction (see Config.setDefaults'
+	// own comment); this is the CLI-specific boundary that rule binds.
+	for _, f := range []struct {
+		name string
+		val  int
+	}{
+		{"max-inflight-proposals", *maxInflightProposals},
+		{"max-concurrent-reads", *maxConcurrentReads},
+		{"max-live-read-leases", *maxLiveReadLeases},
+		{"max-admin-concurrency", *maxAdminConcurrency},
+		{"max-maintenance-concurrency", *maxMaintenanceConcurrency},
+	} {
+		if f.val == 0 {
+			fmt.Fprintf(os.Stderr, "chronicledb-node: -%s must be > 0 (got 0) — there is no \"unlimited\" admission configuration\n", f.name)
+			os.Exit(2)
+		}
+	}
+
+	// The administrative audit log is opened exactly once per process,
+	// unconditionally — regardless of -auth-mode (docs/v0.6.0-plan.md
+	// §20.3: every §19.1/§20.2 node-health transition is an audit
+	// record, and that obligation does not depend on client
+	// authentication being configured at all). It is shared between
+	// this node's own health-transition auditing (Config.AuditLog) and
+	// newSecurity's request-level admin-action auditing below — two
+	// independent *audit.Log instances Appending to the same on-disk
+	// hash chain would corrupt it, so there must be exactly one.
+	auditLog, err := audit.Open(secFlags.auditLogDir)
+	if err != nil {
+		logger.Fatalf("opening audit log at %s: %v", secFlags.auditLogDir, err)
+	}
+	defer auditLog.Close()
+
+	// Retention knobs (docs/v0.6.0-plan.md §33 slice 10, SL-9): a
+	// negative -wal-retain-extra-segments and a
+	// -snapshot-retain-count below 1 are both refused at startup rather
+	// than silently clamped — the latter would otherwise risk having
+	// zero valid snapshots on disk (Manager.SetRetainCount's own floor).
+	if *walRetainExtraSegments < 0 {
+		fmt.Fprintf(os.Stderr, "chronicledb-node: -wal-retain-extra-segments must be >= 0 (got %d)\n", *walRetainExtraSegments)
+		os.Exit(2)
+	}
+	if *snapshotRetainCount < 1 {
+		fmt.Fprintf(os.Stderr, "chronicledb-node: -snapshot-retain-count must be >= 1 (got %d)\n", *snapshotRetainCount)
+		os.Exit(2)
+	}
+
 	cfg := node.Config{
 		ID:                         raft.NodeID(*id),
 		Peers:                      peers,
@@ -193,19 +320,57 @@ func main() {
 		PeerTLSCertFile:            secFlags.peerTLSCertFile,
 		PeerTLSKeyFile:             secFlags.peerTLSKeyFile,
 		PeerTLSCAFile:              secFlags.peerTLSCAFile,
+
+		MaxInflightProposals:      *maxInflightProposals,
+		MaxConcurrentReads:        *maxConcurrentReads,
+		MaxLiveReadLeases:         *maxLiveReadLeases,
+		AdmissionQueueDepth:       *admissionQueueDepth,
+		AdmissionMaxWait:          *admissionMaxWait,
+		MaxAdminConcurrency:       *maxAdminConcurrency,
+		MaxMaintenanceConcurrency: *maxMaintenanceConcurrency,
+		MaxPeerConnections:        *maxPeerConnections,
+		PeerIdleTimeout:           *peerIdleTimeout,
+
+		GCInterval:           *gcInterval,
+		GCMinRetainSeqs:      *gcMinRetainSeqs,
+		GCMinAdvanceSeqs:     *gcMinAdvanceSeqs,
+		GCMaxVersionsPerPass: uint32(*gcMaxVersionsPerPass),
+		GCMaxKeysPerPass:     uint32(*gcMaxKeysPerPass),
+
+		WALRetainExtraSegments: *walRetainExtraSegments,
+		SnapshotRetainCount:    *snapshotRetainCount,
+
+		DiskPressureThreshold: *diskPressureThreshold,
+		DiskCriticalThreshold: *diskCriticalThreshold,
+		MaxHeapBytes:          *maxHeapBytes,
+		ResourcePollInterval:  *resourcePollInterval,
+		FsyncFailureThreshold: *fsyncFailureThreshold,
+		AuditLog:              auditLog,
+		AuditLogDir:           secFlags.auditLogDir,
+		ScrubBytesPerSec:      *scrubBytesPerSec,
 	}
 
 	n, err := node.Open(cfg)
 	if err != nil {
 		logger.Fatalf("opening node: %v", err)
 	}
+	if *debugForceExclusiveOutcomeLock {
+		n.FSM().SetExclusiveOutcomeLockForTest(true)
+	}
 
-	sec, err := newSecurity(secFlags, authModeValue, logger)
+	sec, err := newSecurity(secFlags, authModeValue, logger, auditLog)
 	if err != nil {
 		n.Stop()
 		logger.Fatalf("initializing security (auth/RBAC/audit): %v", err)
 	}
-	defer sec.Close()
+	if sec != nil {
+		// §20.2: every request-level audit write this process makes
+		// (sec.wrap's per-call allow/deny record) feeds the same
+		// storage-health tracking as this node's own health-transition
+		// audit writes (Config.AuditLog above) — both Append to the one
+		// shared audit chain.
+		sec.onAuditResult = n.NoteAuditWriteResult
+	}
 
 	var clientTLSHolder *identity.Holder
 	insecure := secFlags.tlsCertFile == "" || authModeValue == authModeNone
@@ -218,7 +383,31 @@ func main() {
 	}
 
 	srv := newControlServer(n, logger, sec, clientTLSHolder, secFlags.enableFault, *allFlag)
-	httpSrv := &http.Server{Addr: *httpAddr, Handler: srv}
+	httpSrv := &http.Server{
+		Addr:    *httpAddr,
+		Handler: srv,
+		// docs/v0.6.0-plan.md §10.4: the one v0.6.0 default-behavior
+		// change — "no timeouts at all" was never a behavior worth
+		// preserving compatibility with. A client holding an idle
+		// connection longer than -http-idle-timeout, or streaming a
+		// request body for longer than -http-read-timeout, is now
+		// disconnected.
+		ReadHeaderTimeout: *httpReadHeaderTimeout,
+		ReadTimeout:       *httpReadTimeout,
+		WriteTimeout:      *httpWriteTimeout,
+		IdleTimeout:       *httpIdleTimeout,
+	}
+
+	// -max-http-connections (§10.1): a manually constructed, wrapped
+	// listener rather than ListenAndServe(TLS)'s own internal one, so
+	// the connection cap applies before TLS handshake overhead for a
+	// TLS-configured node too.
+	httpLn, err := net.Listen("tcp", *httpAddr)
+	if err != nil {
+		n.Stop()
+		logger.Fatalf("control-plane listener: %v", err)
+	}
+	limitedLn := newLimitListener(httpLn, *maxHTTPConnections)
 
 	if clientTLSHolder != nil {
 		clientAuth := tls.NoClientCert
@@ -229,14 +418,15 @@ func main() {
 			clientAuth = tls.VerifyClientCertIfGiven
 		}
 		httpSrv.TLSConfig = buildTLSConfig(clientTLSHolder, clientAuth)
+		tlsLn := tls.NewListener(limitedLn, httpSrv.TLSConfig)
 		go func() {
-			if err := httpSrv.ListenAndServeTLS("", ""); err != nil && err != http.ErrServerClosed {
+			if err := httpSrv.Serve(tlsLn); err != nil && err != http.ErrServerClosed {
 				logger.Fatalf("control-plane HTTPS server: %v", err)
 			}
 		}()
 	} else {
 		go func() {
-			if err := httpSrv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			if err := httpSrv.Serve(limitedLn); err != nil && err != http.ErrServerClosed {
 				logger.Fatalf("control-plane HTTP server: %v", err)
 			}
 		}()
@@ -339,6 +529,8 @@ func newControlServer(n *node.Node, logger *log.Logger, sec *security, clientTLS
 	s.mux.HandleFunc("/admin/membership/promote", sec.wrap(authz.EndpointMembershipPromote, s.handleMembershipPromote))
 	s.mux.HandleFunc("/admin/membership/remove", sec.wrap(authz.EndpointMembershipRemove, s.handleMembershipRemove))
 	s.mux.HandleFunc("/admin/membership/status", sec.wrap(authz.EndpointMembershipStatus, s.handleMembershipStatus))
+	s.mux.HandleFunc("/admin/storage/scrub", sec.wrap(authz.EndpointStorageScrub, s.handleStorageScrub))
+	s.mux.HandleFunc("/admin/storage/status", sec.wrap(authz.EndpointStorageStatus, s.handleStorageStatus))
 	if enableFault {
 		s.mux.HandleFunc("/fault", sec.wrap(authz.EndpointFault, s.handleFault))
 	}
@@ -380,6 +572,50 @@ func (s *controlServer) handleMetrics(w http.ResponseWriter, r *http.Request) {
 	line("chronicledb_requestid_duplicates_total", "Propose calls resolved as a known-RequestID retry without a fresh Raft round", "counter", float64(m.RequestIDDuplicatesTotal))
 	line("chronicledb_snapshots_created_total", "local snapshots this node has created", "counter", float64(m.SnapshotsCreatedTotal))
 	line("chronicledb_snapshots_installed_total", "peer snapshots this node has installed", "counter", float64(m.SnapshotsInstalledTotal))
+
+	// Disk/heap pressure + fsync-failure health (docs/v0.6.0-plan.md
+	// §19, §20, §25).
+	storageHealthValue := 0.0
+	if !st.StorageHealthy {
+		storageHealthValue = 1.0
+	}
+	line("chronicledb_storage_health", "0 = healthy, 1 = unhealthy (§20.2's consecutive non-Raft fsync-failure threshold reached)", "gauge", storageHealthValue)
+	line("chronicledb_disk_probe_failures_total", "PressureMonitor samples whose disk-usage probe itself errored", "counter", float64(m.DiskProbeFailuresTotal))
+	fsyncFailures := s.n.FsyncFailuresTotal()
+	fmt.Fprintf(w, "# HELP %s %s\n# TYPE %s %s\n", "chronicledb_fsync_failures_total", "durable-write failures by path", "chronicledb_fsync_failures_total", "counter")
+	for _, p := range []node.FsyncPath{node.FsyncPathRaft, node.FsyncPathSnapshot, node.FsyncPathBackup, node.FsyncPathAudit} {
+		fmt.Fprintf(w, "chronicledb_fsync_failures_total{path=%q} %d\n", string(p), fsyncFailures[p])
+	}
+
+	// Storage integrity verification (docs/v0.6.0-plan.md §21, §25).
+	line("chronicledb_scrub_runs_total", "completed Node.Scrub calls", "counter", float64(m.ScrubRunsTotal))
+	line("chronicledb_scrub_findings_total", "findings across every scrub run", "counter", float64(m.ScrubFindingsTotal))
+	line("chronicledb_scrub_last_duration_seconds", "the most recent scrub run's wall-clock duration", "gauge", float64(m.ScrubLastDurationMillis)/1000)
+
+	// MVCC GC (docs/v0.6.0-plan.md §25). GC's own versions-reclaimed/
+	// proposals-total/apply-seconds metrics are not yet wired here —
+	// gcWatermark/gcPasses (fsm.FSM's own replicated state) and the
+	// live key/version counts (internal/mvcc.Store.Stats) are cheap,
+	// already-tracked reads with no new counter plumbing required.
+	fsmState := s.n.FSM()
+	keys, versions := fsmState.Store().Stats()
+	line("chronicledb_mvcc_keys", "distinct keys with a live chain", "gauge", float64(keys))
+	line("chronicledb_mvcc_versions", "total versions across all chains — the number GC is supposed to bound", "gauge", float64(versions))
+	line("chronicledb_mvcc_gc_watermark", "applied GC watermark", "gauge", float64(fsmState.GCWatermark()))
+	line("chronicledb_mvcc_gc_passes_total", "completed full-keyspace GC walks", "counter", float64(fsmState.GCPasses()))
+	m.GCApplySeconds.WriteProm(w, "chronicledb_mvcc_gc_apply_seconds", "§14.4's live service-time histogram for one committed AdvanceGCWatermark apply — the running counterpart to SL-2b's benchmark-backed flat-in-key-count proof")
+	line("chronicledb_requestid_outcomes", "distinct CommitTxn RequestIDs ever recorded — unbounded by design (§28.2), measured honestly rather than claimed stable", "gauge", float64(fsmState.OutcomesCount()))
+
+	// Admission control (docs/v0.6.0-plan.md §11.2). §5.3/§9.1a's two
+	// event-loop ceilings: a normal operating signal under client
+	// cancellation, not a bug signal — see docs/admission-control.md §4.
+	fmt.Fprintf(w, "# HELP %s %s\n# TYPE %s %s\n", "chronicledb_admission_defense_rejections_total", "an event-loop ceiling (not the admission gate itself) rejected a caller", "chronicledb_admission_defense_rejections_total", "counter")
+	fmt.Fprintf(w, "chronicledb_admission_defense_rejections_total{ceiling=\"waiters\"} %d\n", m.AdmissionDefenseRejectionsWaitersTotal)
+	fmt.Fprintf(w, "chronicledb_admission_defense_rejections_total{ceiling=\"pending_reads\"} %d\n", m.AdmissionDefenseRejectionsPendingReadsTotal)
+	line("chronicledb_node_waiters", "len(n.waiters) — the authoritative BOUNDED ADMITTED WORK ceiling for client writes", "gauge", float64(m.WaitersGauge))
+	line("chronicledb_node_pending_reads", "len(n.pendingReads) — the authoritative ceiling for pending BeginReadIndex calls", "gauge", float64(m.PendingReadsGauge))
+	line("chronicledb_read_leases_active", "currently live read leases (§15.3)", "gauge", float64(m.ReadLeasesActiveGauge))
+	m.RaftMessageProcessSeconds.WriteProm(w, "chronicledb_raft_message_process_seconds", "Lane K's own per-message service-time histogram — the CONTROL-PLANE NON-STARVATION proof metric, unaffected by admission state by construction")
 
 	// Compatibility / Rolling Upgrades metrics (docs/enterprise-v1-plan.md
 	// §7 Observability: "cluster version gauge, per-node reported-version
@@ -434,7 +670,15 @@ type healthResponse struct {
 	Role            string `json:"role"`
 	LeaderKnown     bool   `json:"leaderKnown"`
 	Leader          string `json:"leader,omitempty"`
-	Note            string `json:"note"`
+	// Ready is docs/v0.6.0-plan.md §11.3's readiness rule: false iff
+	// this node is in disk-pressure Critical or storage-unhealthy
+	// (§20.2) — the Kubernetes-shaped live-but-not-ready distinction. A
+	// node in disk LowSpace is still Ready (Warning is set instead).
+	Ready          bool   `json:"ready"`
+	DiskPressure   string `json:"diskPressure"`
+	StorageHealthy bool   `json:"storageHealthy"`
+	Warning        string `json:"warning,omitempty"`
+	Note           string `json:"note"`
 }
 
 func (s *controlServer) handleHealth(w http.ResponseWriter, r *http.Request) {
@@ -447,9 +691,19 @@ func (s *controlServer) handleHealth(w http.ResponseWriter, r *http.Request) {
 		Role:            st.Role.String(),
 		LeaderKnown:     st.Leader != "",
 		Leader:          string(st.Leader),
+		Ready:           st.Ready,
+		DiskPressure:    st.DiskPressure,
+		StorageHealthy:  st.StorageHealthy,
 		Note:            "quorum availability is not reported: a Follower/Candidate cannot reliably know it, and a Leader only knows it as of its last successful heartbeat round",
 	}
-	writeJSON(w, http.StatusOK, resp)
+	if st.DiskPressure == "low" {
+		resp.Warning = "disk headroom is below -disk-pressure-threshold: client writes are tightened (still ready)"
+	}
+	code := http.StatusOK
+	if !resp.Ready {
+		code = http.StatusServiceUnavailable
+	}
+	writeJSON(w, code, resp)
 }
 
 // handleFault is Phase 7's minimal real-process fault-injection hook
@@ -471,12 +725,25 @@ func (s *controlServer) handleFault(w http.ResponseWriter, r *http.Request) {
 	action := r.URL.Query().Get("action")
 
 	// Node-scoped actions, checked before the peer requirement below:
-	// unlike the transport faults, these name no peer. They hold and
-	// release dynamic-membership plan §11's post-election not-ready
-	// boundary (internal/node.HoldElectionNoOpForTest), which no
-	// transport fault can express — the election and the no-op commit
-	// need the same majority of the same voters, so any block that
-	// stalls the no-op also prevents the election before it.
+	// unlike the transport faults, these name no peer.
+	//
+	// holdelectionnoop/releaseelectionnoop hold and release dynamic-
+	// membership plan §11's post-election not-ready boundary
+	// (internal/node.HoldElectionNoOpForTest), which no transport fault
+	// can express — the election and the no-op commit need the same
+	// majority of the same voters, so any block that stalls the no-op
+	// also prevents the election before it.
+	//
+	// armoutcomereadrendezvous/outcomereadrendezvousresult are AC-19's
+	// real-process negative control (docs/v0.6.0-plan.md §5.4a, §31
+	// gate 3): they arm, and then read back, the one-shot barrier
+	// internal/fsm/readrendezvous.go places inside GetOutcome's
+	// critical section, which counts how many /outcome requests are
+	// simultaneously inside it. That count — unbounded under the
+	// RWMutex, exactly one under the exclusive mutex
+	// -debug-force-exclusive-outcome-lock reverts to — is the only
+	// observable that discriminates the two at all; see that file's
+	// header for why latency cannot.
 	switch action {
 	case "holdelectionnoop":
 		s.n.HoldElectionNoOpForTest()
@@ -485,6 +752,23 @@ func (s *controlServer) handleFault(w http.ResponseWriter, r *http.Request) {
 	case "releaseelectionnoop":
 		s.n.ReleaseElectionNoOpForTest()
 		w.WriteHeader(http.StatusOK)
+		return
+	case "armoutcomereadrendezvous":
+		want, err := strconv.Atoi(r.URL.Query().Get("n"))
+		if err != nil {
+			http.Error(w, "n must be an integer (<= 0 disarms)", http.StatusBadRequest)
+			return
+		}
+		timeoutMs, err := strconv.Atoi(r.URL.Query().Get("timeoutMs"))
+		if err != nil || timeoutMs < 0 {
+			http.Error(w, "timeoutMs must be a non-negative integer", http.StatusBadRequest)
+			return
+		}
+		s.n.FSM().ArmReadRendezvousForTest(want, time.Duration(timeoutMs)*time.Millisecond)
+		w.WriteHeader(http.StatusOK)
+		return
+	case "outcomereadrendezvousresult":
+		writeJSON(w, http.StatusOK, s.n.FSM().ReadRendezvousResultForTest())
 		return
 	}
 
@@ -567,6 +851,13 @@ func (s *controlServer) handlePropose(w http.ResponseWriter, r *http.Request) {
 	defer cancel()
 	outcome, err := s.n.Propose(ctx, cmd)
 	if err != nil {
+		// Overload/capacity is always 503, distinct from every
+		// correctness outcome (docs/v0.6.0-plan.md §8.3's table) —
+		// checked first, before the not-leader/409 case below.
+		if rej, ok := asAdmissionRejection(err); ok {
+			writeAdmissionRejection(w, rej)
+			return
+		}
 		var nle *node.NotLeaderError
 		resp := proposeResponse{Error: err.Error()}
 		if errors.As(err, &nle) {

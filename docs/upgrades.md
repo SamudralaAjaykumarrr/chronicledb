@@ -264,6 +264,70 @@ then 1 -> 2) — an operator or test driving finalize to "this binary's
 max" should call it repeatedly until it reports `ErrAlreadyFinalized`,
 not assume one call suffices.
 
+## 8b. Generation 3 (`v0.6.0`, Admission Control / Storage Lifecycle)
+
+`MaxSupportedGeneration` bumps `2` -> `3` as part of implementing MVCC
+GC (`docs/storage-lifecycle.md`, [`ADR-0020`](adr/0020-mvcc-gc-replicated-watermark.md)).
+Generation 3 means: this binary understands the `AdvanceGCWatermark`
+FSM control command (`fsm.ControlKindAdvanceGCWatermark`, discriminator
+`2`) and the generation-3 trailing block in `EncodeState`/`DecodeState`
+(the replicated `gcWatermark`/`gcCursor`/`gcPassSeq` fields, appended
+only once GC has actually run, following the same "byte-identical to a
+lower generation until first genuinely used" discipline §2 point 4
+already established for generation 1). No `AdvanceGCWatermark` command
+may be proposed or applied below this generation — enforced
+independently on both sides, exactly like generation 2's membership
+gate: `internal/node`'s leader-side proposer (`maybeProposeGC`) checks
+`n.clusterGeneration < 3` before ever calling `Step`, and the
+follower/apply-side gate (`applyAdvanceGCWatermarkEntry`) checks the
+identical condition again before calling `ApplyAdvanceGCWatermark` —
+so no replica's correctness depends on the leader having checked
+correctly, matching every other two-sided generation gate in this
+document.
+
+Unlike generation 2, reaching generation 3 needs **three** consecutive
+finalize calls from a fresh cluster (0 -> 1 -> 2 -> 3); the same
+"call finalize repeatedly until `ErrAlreadyFinalized`" operator
+guidance from §8a applies unchanged.
+
+**Rollback boundary**: identical in kind to §5's general rule, proven
+directly against a real `v0.5.0` binary (the last release before
+generation 3 existed at all) rather than merely asserted:
+`cmd/chronicledb-node/sl17_mixed_binary_test.go`'s
+`TestSL17_OldBinaryFailsClosedOnGeneration3Snapshot` shows a `v0.5.0`
+binary refuses to open a generation-3 data directory
+(`wal.Open`'s `ErrUnsupportedGeneration` check, exactly §5's
+before-touching-Raft-at-all failure mode), and
+`TestSL17_OldBinaryFailsClosedRestoringGeneration3Backup` shows the
+identical refusal restoring a generation-3 backup via `-restore-from`.
+Both fail with an error naming "generation" explicitly, not a generic
+decode failure.
+
+GC's own watermark/cursor/pass-sequence state survives an ordinary
+backup/restore round-trip exactly (not merely "some watermark value" —
+the precise value at backup time), proven by
+`cmd/chronicledb-node/sl18_test.go`'s
+`TestSL18_BackupRestoreCarriesGCStateAndHorizonHoldsImmediately`; see
+`docs/backup.md` §5.
+
+## 8c. The one default-behavior change (`v0.6.0`)
+
+Unrelated to cluster generations, but the kind of thing an operator
+upgrading a live deployment needs to know before rolling: `v0.6.0`
+turns HTTP server timeouts and connection caps **on by default**
+(`-http-read-header-timeout`, `-http-read-timeout`, `-http-write-timeout`,
+`-http-idle-timeout`, `-max-http-connections`, `-max-peer-connections`
+— see `docs/admission-control.md` §10.1/§10.4 for the exact defaults
+and reasoning). This is the **only** default-behavior change this
+release makes; every other new flag defaults to exactly `v0.5.0`'s
+observable behavior. A client holding an idle connection open longer
+than `-http-idle-timeout`, or streaming a request body longer than
+`-http-read-timeout`, is now disconnected — previously never enforced
+at all. This requires no coordinated rollout step (it takes effect
+node-by-node as each is upgraded, like every other `v0.6.0` flag) but
+is worth checking against any long-lived client connection pattern
+before upgrading.
+
 ## 9. Related documents
 
 [`docs/enterprise-v1-plan.md`](enterprise-v1-plan.md) §7 (the original

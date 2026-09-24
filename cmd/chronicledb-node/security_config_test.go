@@ -237,7 +237,7 @@ func TestDefaultInsecureStartup_PlaintextModeFunctional(t *testing.T) {
 	if err != nil {
 		t.Fatalf("validateSecurityFlags(defaults): %v", err)
 	}
-	sec, err := newSecurity(defaults, mode, nil)
+	sec, err := newSecurity(defaults, mode, nil, nil)
 	if err != nil {
 		t.Fatalf("newSecurity(defaults): %v", err)
 	}

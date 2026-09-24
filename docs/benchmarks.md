@@ -486,3 +486,123 @@ All green — see the Phase 9 completion report for the exact run log.
 - These numbers describe *this specific environment and commit* — see
   §2's WSL2 caveat specifically. Do not quote them as ChronicleDB's
   general performance.
+
+## 12. `v0.6.0`: GC rate-flag derivation and the §14.4 index cost
+
+Everything above this section is Phase 9 (`v0.5.0`)'s original
+benchmarking pass, left unchanged. This section is new for `v0.6.0`,
+measured on the same machine described in §2 (WSL2, same caveat
+applies), `go version go1.26.5 linux/amd64`, date measured 2026-09-21.
+It exists to satisfy `docs/v0.6.0-plan.md` §31 gate 6, which two of
+`docs/storage-lifecycle.md`'s defaults point back to.
+
+### 12.1 SL-19 workload version-creation rate
+
+`TestSL19_LongRunningBoundedKeySetGCStabilizesVersions`
+(`cmd/chronicledb-node/sl19_test.go`) is a single client issuing
+single-key commits as fast as a real HTTP round trip to a real 3-node
+cluster allows, cycling through 20 bounded keys — this *is* "SL-19's own
+workload" gate 6 names. Two independent runs, at different durations,
+against a real cluster on this machine:
+
+```
+go test -tags=integration ./cmd/chronicledb-node/... \
+    -run TestSL19_LongRunningBoundedKeySetGCStabilizesVersions -v
+```
+
+| `CHRONICLEDB_SL19_DURATION` | Writes | Measured rate |
+|---|---:|---:|
+| 10s | 1,085 | 108.5 versions/sec |
+| 20s | 2,142 | 107.1 versions/sec |
+
+Both runs are single-mutation-per-commit, so writes/sec ==
+versions-created/sec exactly. Taking the higher of the two as the
+reference rate (the conservative choice — GC must clear the *worse*
+case): **measured_rate = 108.5 versions/sec.**
+
+This is a single, sequential, un-pipelined client — a realistic
+multi-client or pipelined workload could exceed it. It is the rate gate
+6 explicitly names, not a claimed ceiling on what ChronicleDB can
+accept; a deployment with a materially higher sustained write rate must
+re-run this measurement against its own shape before trusting the
+triple below.
+
+### 12.2 The derived triple and its margin
+
+From `docs/storage-lifecycle.md` §2:
+
+```
+reclaim_rate ≈ gc-max-versions-per-pass ÷ max(gc-interval, time to commit gc-min-advance-seqs entries)
+```
+
+`-gc-interval` stays `0` (disabled) by default — that default is
+justified separately, by gate 9 (GC off by default, byte-identical
+`v0.5.0` behavior), not by this section. This section justifies the
+other two defaults an operator inherits the moment they set a nonzero
+`-gc-interval`, plus a recommended starting interval:
+
+- `-gc-min-advance-seqs` default `256`: at measured_rate, reaching 256
+  committed sequence numbers takes 256 / 108.5 ≈ **2.36s**.
+- `-gc-max-versions-per-pass` default `4096`.
+- Recommended starting `-gc-interval` for a workload in this rate class:
+  **`1s`** — smaller than the 2.36s accumulation time above, so the
+  `max(...)` term is dominated by accumulation, not by the timer:
+
+```
+reclaim_rate = 4096 / max(1s, 2.36s) = 4096 / 2.36s ≈ 1,736 versions/sec
+margin = 1,736 / 108.5 ≈ 16x
+```
+
+1,736 versions/sec clears the measured 108.5 versions/sec with a 16x
+margin — comfortably above 1x, with headroom for the caveat in §12.1
+(a heavier client shape than SL-19's own single-sequential-client
+workload). A triple whose computed `reclaim_rate` fell below
+measured_rate would be a gate-6 failure and would need either a smaller
+`-gc-interval`, a smaller `-gc-min-advance-seqs`, or a larger
+`-gc-max-versions-per-pass` — not a documentation change.
+
+`-gc-max-keys-per-pass`'s default (`16384`) is, per
+`docs/storage-lifecycle.md` §2, a pure work bound rather than a rate
+bound, so it does not enter this derivation.
+
+### 12.3 The §14.4 ordered key index's cost on `ApplyCommit`
+
+`insertOrderedKeyLocked` (`internal/mvcc/mvcc.go`) keeps
+`Store.orderedKeys` sorted via a binary search plus a shifting slice
+insert, paid once per **new** key (an overwrite of an existing key never
+touches it). That insert is `O(existing keys)`, not `O(log n)` — the
+binary search is cheap, the shift is not.
+`BenchmarkApplyCommitFirstWriteByKeyCount`
+(`internal/mvcc/bench_test.go`) isolates exactly this cost, forcing every
+inserted key to land at position 0 (the worst case: the entire existing
+slice must shift), rather than the common case of monotonically
+increasing keys landing at the tail for near-zero shift cost:
+
+```
+go test ./internal/mvcc/... -run '^$' \
+    -bench BenchmarkApplyCommitFirstWriteByKeyCount -benchtime=800x -benchmem
+```
+
+| Existing keys | ns/op | B/op | allocs/op |
+|---:|---:|---:|---:|
+| 100 | 520 | 338 | 3 |
+| 1,000 | 992 | 279 | 3 |
+| 10,000 | 3,243 | 74 | 3 |
+| 100,000 | 253,603 | 74 | 3 |
+
+The cost is flat-to-modest through 10,000 existing keys (a few
+microseconds) but grows sharply — worse than the O(n) the shifting copy
+alone predicts — between 10,000 and 100,000 (roughly 78x for a 10x key
+increase). This is consistent with the underlying `[]string` shift
+crossing from cache-resident to memory-bandwidth-bound at that size
+(each shift moves 16-byte string headers across an increasingly large
+span). **Implication for operators**: this cost only matters for
+workloads whose live, GC-uncollected key population grows into the
+hundreds of thousands *and* whose new keys arrive in an order adversarial
+to append-mostly (monotonically increasing) key schemes — SL-19's own
+20-key bounded workload never approaches this regime. No code change is
+justified by this number alone; it is recorded because gate 6 requires
+it measured, not because it identifies a defect. A future workload with
+a very large, non-monotonic keyspace is the concrete trigger for
+revisiting `orderedKeys`'s data structure (e.g., a B-tree or skip list)
+if this cost becomes load-bearing in practice.

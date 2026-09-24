@@ -568,6 +568,55 @@ Advancing a maturity claim without its evidence gate is itself a
 documentation defect and must be corrected on discovery — see
 [`docs/vision.md`](vision.md) §Guiding principle.
 
+## `v0.6.0`: Admission Control / Resource Protection and Storage Lifecycle
+
+Implements `docs/enterprise-v1-plan.md` §9-§10: bounded admission
+control (four lanes, disk/heap pressure, the `503` contract — see
+[`docs/admission-control.md`](admission-control.md)) and MVCC storage
+lifecycle (replicated GC watermark, retention knobs, the disk-full
+state machine, fsync-failure health, storage-integrity scrub — see
+[`docs/storage-lifecycle.md`](storage-lifecycle.md)). At the time of
+this writing, implementation and its full proof obligations are
+complete on the `v0.6.0-implementation` branch; **this is not yet a
+tagged/published release** — `v0.5.0` remains the current actual
+published, tagged release per the Maturity Model table above, and this
+entry does not itself advance any maturity-level claim (gate 15: no
+maturity-level change, `ENTERPRISE-GRADE` language, or "current
+release" claim gets made until an actual tag exists).
+
+### Deferred to `v1.0.0` (three named items, each with an owner gate)
+
+Recorded here **and** in the relevant operator doc — `docs/non-goals.md`
+alone would name no owner release, which is precisely how a
+requirement gets deferred forever (`docs/v0.6.0-plan.md` §31 gate 13):
+
+1. **GC enabled by default.** `v0.6.0` ships MVCC GC disabled
+   (`-gc-interval=0`) — implemented and proven, but not yet the
+   out-of-the-box default. Owner: `enterprise-v1-plan.md` §17.1 item 3.
+   See [`docs/storage-lifecycle.md`](storage-lifecycle.md) and
+   [`docs/non-goals.md`](non-goals.md)'s MVCC GC entry.
+2. **Snapshot/backup off the event loop.** Both `maybeSnapshot`
+   (local snapshot creation) and `Node.Backup` still run synchronously
+   on the single event-loop goroutine in `v0.6.0` — a known,
+   documented latency exposure (`docs/admission-control.md` §4.4),
+   not a bug. Owner: `enterprise-v1-plan.md` §9's `CONTROL-PLANE
+   NON-STARVATION` §4.4/§36 residual-exposure note.
+3. **`RequestID` outcome-table retention, or a formal rescoping of
+   `enterprise-v1-plan.md` §17.1 item 3's "stable disk usage" wording.**
+   `chronicledb_requestid_outcomes` (`docs/observability.md` §2.1a)
+   grows with every distinct `RequestID` a client ever sends,
+   regardless of GC — `v0.6.0` deliberately does not touch this table
+   (pruning it would weaken `IDEMPOTENCY`), so §17.1 item 3's literal
+   "stable disk usage" claim is unsatisfiable as worded until one of
+   these two things happens. Owner: `enterprise-v1-plan.md` §17.1
+   item 3, resolved either by a retention/expiry design (its own ADR)
+   or by the `v1.0.0`-preparing maintainer formally narrowing that
+   claim's wording, with the same evidence discipline §17.4 requires.
+   See [`docs/non-goals.md`](non-goals.md)'s `RequestID` outcome
+   garbage collection entry (the mutual cross-reference this item's
+   own gate requires) and `docs/v0.6.0-plan.md` §24.4a for the full
+   argument.
+
 ## Observability (implemented in Phase 9)
 
 Implemented — see [`docs/observability.md`](observability.md) for the

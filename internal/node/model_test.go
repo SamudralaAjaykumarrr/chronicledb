@@ -404,7 +404,8 @@ func runModelHistory(t *testing.T, seed int64, steps, keyspace int) {
 		})
 		n := tc.node(id)
 		gotDigest := oracle.CanonicalKVDigest(keys, func(k string) ([]byte, bool) {
-			return n.FSM().Store().Visible(k, uint64(n.Status().AppliedIndex))
+			v, ok, _ := n.FSM().Store().Visible(k, uint64(n.Status().AppliedIndex))
+			return v, ok
 		})
 		if gotDigest != wantDigest {
 			fail("seed %d: node %s final committed-state digest %s != oracle model digest %s (STATE-MACHINE-SAFETY / model divergence)",

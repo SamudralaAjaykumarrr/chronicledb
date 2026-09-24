@@ -101,6 +101,13 @@ For any key `K`, `T`'s read of `K` is defined as:
    visible to `T` under any circumstance. `T` only ever sees versions
    that exist in the committed version chain (step 2) or in its own
    local write set (step 1). There is no "read uncommitted" mode.
+5. (`v0.6.0`, replicated mode) If `S` is below the applied MVCC GC
+   watermark (§6), `T`'s read is refused outright
+   (`ErrSnapshotTooOld`) rather than answered from whatever happens to
+   survive in the chain — a version this rule would otherwise return
+   may already have been reclaimed. See §6 and
+   [`docs/storage-lifecycle.md`](storage-lifecycle.md) for the horizon
+   guard's exact placement and proof obligations.
 
 ### 3.1 Own-write visibility examples
 
@@ -177,11 +184,17 @@ deterministic state-machine operation:
   is defined to be all-or-nothing per invocation — see
   [`docs/transactions.md`](transactions.md) §Atomicity Mechanism).
 
-## 6. MVCC Garbage Collection (not implemented in V1; rule defined now)
+## 6. MVCC Garbage Collection (implemented in `v0.6.0` for replicated mode, see [`docs/storage-lifecycle.md`](storage-lifecycle.md))
 
-ChronicleDB does not implement version garbage collection in V1.
-Old versions accumulate. The future safe rule is defined now so the
-data model does not need to change shape later:
+Through `v0.5.0`, ChronicleDB did not implement version garbage
+collection; old versions accumulated for the process's lifetime. As of
+`v0.6.0`, replicated mode implements it exactly per the rule below,
+unchanged from how it was originally specified — see
+[`docs/storage-lifecycle.md`](storage-lifecycle.md) for the full
+mechanism (replicated watermark, bounded `Apply`, read leases,
+`ADR-0020`) and §9 below for the resolved implementation decisions.
+Standalone mode does not implement GC (§9). The rule, defined here
+before implementation and left unchanged by it:
 
 - Define `GCWatermark` = the smallest `StartSeq` among all currently
   active (not yet committed/aborted) transactions' snapshots, or, if
@@ -243,6 +256,48 @@ data model does not need to change shape later:
   (all writes funneled through `internal/txn.Manager`'s single
   serialization point) this precondition can never actually fail; it
   exists as a defensive invariant check, not an expected runtime path.
-- **`GCWatermark`/version GC**: not implemented, per §6 and
+- **`GCWatermark`/version GC**: not implemented in Phase 2, per §6 and
   `docs/non-goals.md` §MVCC version garbage collection — every version
-  ever committed is retained for the lifetime of the process.
+  ever committed is retained for the lifetime of the process. See §9
+  below for the `v0.6.0` implementation.
+
+## 9. `v0.6.0` resolved decisions (MVCC GC)
+
+- **Replicated watermark, not local GC.** `GCWatermark` (§6) is
+  computed once, by the leader, and advances only via a replicated
+  `AdvanceGCWatermarkCommand` applied identically by every replica
+  inside `fsm.Apply` — never a per-node background process mutating
+  `internal/mvcc.Store` on its own initiative. A local, unreplicated GC
+  process would let two replicas reclaim different versions from the
+  identical committed history, depending on each node's own,
+  independently-timed disk-pressure/heap readings — a direct violation
+  of `DETERMINISM BOUNDARY` and `STATE MACHINE SAFETY`
+  ([`docs/invariants.md`](invariants.md)). See `ADR-0020` for the full
+  argument and the rejected alternative.
+- **Bounded `Apply`.** One `AdvanceGCWatermarkCommand` Apply examines at
+  most `-gc-max-keys-per-pass` keys and removes at most
+  `-gc-max-versions-per-pass` versions, both carried in the replicated
+  command itself (not read from each replica's own local flags), so a
+  full keyspace walk proceeds as a series of bounded, resumable
+  continuation passes (tracked by a durable cursor) rather than one
+  unbounded `Apply` call. See
+  [`docs/storage-lifecycle.md`](storage-lifecycle.md) for the
+  continuation-pass mechanism.
+- **Standalone-mode exclusion.** GC is not implemented in standalone
+  mode: `internal/txn` and `internal/sql`'s standalone engine never
+  propose an `AdvanceGCWatermarkCommand` — there is no Raft log for it
+  to travel through, and no replicated-mode determinism argument to
+  lean on. A standalone deployment's `GCWatermark` therefore stays at 0
+  forever; every version ever committed is retained for the process's
+  lifetime, exactly as before `v0.6.0`. This is a deliberate scope
+  exclusion, not a gap: see `ADR-0020`.
+- **Final-tombstone deferral.** `internal/mvcc.Store.ReclaimKey` never
+  removes a key's single newest version, even when it is a tombstone
+  (there is nothing newer to make it redundant, per §6's rule) and
+  even when every reader that could still need it is long gone. A
+  fully-deleted key's storage footprint is therefore never fully
+  reclaimed by `v0.6.0`'s GC — reclaiming the final tombstone needs a
+  "key is fully and permanently absent" notion this data model does not
+  yet have (§7). Deferred, measured via `chronicledb_mvcc_keys`, and
+  tracked as a named limit rather than a silent gap — see
+  [`docs/storage-lifecycle.md`](storage-lifecycle.md).

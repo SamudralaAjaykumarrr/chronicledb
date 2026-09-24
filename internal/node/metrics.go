@@ -54,6 +54,16 @@ type Metrics struct {
 	// peer-provided snapshot that actually advanced this node's state
 	// (handleInstallSnapshot).
 	SnapshotsInstalledTotal metrics.Counter
+	// SnapshotServeMissTotal counts every time this node, as leader, was
+	// asked by processOutput to fill a MsgInstallSnapshotRequest's bytes
+	// for an index its own snapMgr no longer retains (docs/v0.6.0-plan.md
+	// §18.1's self-healing race: a snapshot created between Core
+	// deciding a follower needs index X and the message actually being
+	// filled can prune X away first). Nonzero is an expected, bounded
+	// operating signal — Core re-derives a request for the newer index
+	// on the next heartbeat — not a bug signal by itself; SL-11 is what
+	// proves the follower still converges via retry.
+	SnapshotServeMissTotal metrics.Counter
 
 	// RaftMessagesSentTotal/RaftMessagesReceivedTotal count outbound
 	// and inbound internal/raft protocol messages processed by this
@@ -75,6 +85,77 @@ type Metrics struct {
 	UpgradePrecheckTotal       metrics.Counter
 	UpgradeFinalizeTotal       metrics.Counter
 	UpgradeFinalizeFailedTotal metrics.Counter
+
+	// AdmissionDefenseRejectionsWaitersTotal/
+	// AdmissionDefenseRejectionsPendingReadsTotal count every rejection
+	// from the two event-loop ceilings docs/v0.6.0-plan.md §5.3/§9.1a
+	// add — chronicledb_admission_defense_rejections_total{ceiling=
+	// "waiters"|"pending_reads"}. Nonzero is a **normal operating
+	// signal under client cancellation**, not a bug signal (§5.3): a
+	// caller that cancels its context frees its admission.Gate slot
+	// while its waiter/pendingRead entry survives until it resolves,
+	// so a new caller is admitted through the gate while the ceiling
+	// is what actually bounds BOUNDED ADMITTED WORK.
+	AdmissionDefenseRejectionsWaitersTotal      metrics.Counter
+	AdmissionDefenseRejectionsPendingReadsTotal metrics.Counter
+
+	// WaitersGauge/PendingReadsGauge mirror len(n.waiters)/
+	// len(n.pendingReads) (docs/v0.6.0-plan.md §5.3/§9.1a's authoritative
+	// BOUNDED ADMITTED WORK ceilings), updated on run()'s own goroutine
+	// at every mutation site so a concurrent reader never races the map/
+	// slice itself — chronicledb_node_waiters / chronicledb_node_pending_reads.
+	WaitersGauge      metrics.Gauge
+	PendingReadsGauge metrics.Gauge
+
+	// ReadLeasesActiveGauge mirrors n.leases.Len() (docs/v0.6.0-plan.md
+	// §9.1a/§15.3/§25's chronicledb_read_leases_active), refreshed
+	// alongside WaitersGauge/PendingReadsGauge.
+	ReadLeasesActiveGauge metrics.Gauge
+
+	// GCProposalsTotal/GCProposalsFailedTotal count every leader-side
+	// AdvanceGCWatermark proposal attempt (docs/v0.6.0-plan.md §25's
+	// chronicledb_mvcc_gc_proposals_total/_failed_total): Total on
+	// InputPropose acceptance, FailedTotal when Core rejected it
+	// outright (e.g. a leadership change raced the proposal).
+	GCProposalsTotal       metrics.Counter
+	GCProposalsFailedTotal metrics.Counter
+
+	// RaftMessageProcessSeconds is Lane K's own service-time histogram
+	// (docs/v0.6.0-plan.md §4.3, §11.2's chronicledb_raft_message_
+	// process_seconds — the A-8 CONTROL-PLANE NON-STARVATION proof
+	// metric): one observation per inbound raft.Message processed by
+	// step(), regardless of client admission-queue depth, concurrency,
+	// or rejection rate. Not a Counter/Gauge, so it is a pointer,
+	// explicitly constructed by Open (metrics.Histogram's zero value is
+	// not valid — see its own doc comment).
+	RaftMessageProcessSeconds *metrics.Histogram
+
+	// GCApplySeconds is §14.4's own service-time histogram
+	// (chronicledb_mvcc_gc_apply_seconds, docs/v0.6.0-plan.md §30.3 step
+	// 4): one observation per committed AdvanceGCWatermark entry this
+	// node applies, covering the whole ApplyAdvanceGCWatermark call —
+	// the live counterpart to SL-2b's benchmark-backed flatness proof,
+	// letting an operator (or a real-process test) confirm the same
+	// "flat in total key count" property holds on an actual running
+	// node, not only in a microbenchmark.
+	GCApplySeconds *metrics.Histogram
+
+	// DiskProbeFailuresTotal counts every PressureMonitor sample whose
+	// DiskUsage call itself errored (docs/v0.6.0-plan.md §6.2's
+	// fail-safe direction) — chronicledb_disk_probe_failures_total.
+	DiskProbeFailuresTotal metrics.Counter
+
+	// ScrubRunsTotal/ScrubFindingsTotal/ScrubLastDurationMillis are
+	// §25's scrub observability triple (chronicledb_scrub_runs_total,
+	// _findings_total, _last_duration_seconds — the last one rendered
+	// from this millisecond gauge at the /metrics layer, matching every
+	// other latency figure in this codebase). ScrubFindingsTotal counts
+	// every finding across every run (cumulative, like every other
+	// _total); ScrubLastDurationMillis is a gauge (the most recent run
+	// only), unlike the two counters.
+	ScrubRunsTotal          metrics.Counter
+	ScrubFindingsTotal      metrics.Counter
+	ScrubLastDurationMillis metrics.Gauge
 }
 
 // MetricsSnapshot is a point-in-time, safe-to-read-anywhere copy of a
@@ -90,6 +171,7 @@ type MetricsSnapshot struct {
 	RequestIDDuplicatesTotal   uint64
 	SnapshotsCreatedTotal      uint64
 	SnapshotsInstalledTotal    uint64
+	SnapshotServeMissTotal     uint64
 	RaftMessagesSentTotal      uint64
 	RaftMessagesReceivedTotal  uint64
 	BackupsTotal               uint64
@@ -97,6 +179,26 @@ type MetricsSnapshot struct {
 	UpgradePrecheckTotal       uint64
 	UpgradeFinalizeTotal       uint64
 	UpgradeFinalizeFailedTotal uint64
+
+	AdmissionDefenseRejectionsWaitersTotal      uint64
+	AdmissionDefenseRejectionsPendingReadsTotal uint64
+
+	WaitersGauge      int64
+	PendingReadsGauge int64
+
+	ReadLeasesActiveGauge int64
+
+	GCProposalsTotal       uint64
+	GCProposalsFailedTotal uint64
+
+	RaftMessageProcessSeconds metrics.HistogramSnapshot
+	GCApplySeconds            metrics.HistogramSnapshot
+
+	DiskProbeFailuresTotal uint64
+
+	ScrubRunsTotal          uint64
+	ScrubFindingsTotal      uint64
+	ScrubLastDurationMillis int64
 }
 
 // Metrics returns a snapshot of this node's current diagnostic
@@ -114,6 +216,7 @@ func (n *Node) Metrics() MetricsSnapshot {
 		RequestIDDuplicatesTotal:   m.RequestIDDuplicatesTotal.Value(),
 		SnapshotsCreatedTotal:      m.SnapshotsCreatedTotal.Value(),
 		SnapshotsInstalledTotal:    m.SnapshotsInstalledTotal.Value(),
+		SnapshotServeMissTotal:     m.SnapshotServeMissTotal.Value(),
 		RaftMessagesSentTotal:      m.RaftMessagesSentTotal.Value(),
 		RaftMessagesReceivedTotal:  m.RaftMessagesReceivedTotal.Value(),
 		BackupsTotal:               m.BackupsTotal.Value(),
@@ -121,5 +224,36 @@ func (n *Node) Metrics() MetricsSnapshot {
 		UpgradePrecheckTotal:       m.UpgradePrecheckTotal.Value(),
 		UpgradeFinalizeTotal:       m.UpgradeFinalizeTotal.Value(),
 		UpgradeFinalizeFailedTotal: m.UpgradeFinalizeFailedTotal.Value(),
+
+		AdmissionDefenseRejectionsWaitersTotal:      m.AdmissionDefenseRejectionsWaitersTotal.Value(),
+		AdmissionDefenseRejectionsPendingReadsTotal: m.AdmissionDefenseRejectionsPendingReadsTotal.Value(),
+
+		WaitersGauge:      m.WaitersGauge.Value(),
+		PendingReadsGauge: m.PendingReadsGauge.Value(),
+
+		ReadLeasesActiveGauge: m.ReadLeasesActiveGauge.Value(),
+
+		GCProposalsTotal:       m.GCProposalsTotal.Value(),
+		GCProposalsFailedTotal: m.GCProposalsFailedTotal.Value(),
+
+		RaftMessageProcessSeconds: m.RaftMessageProcessSeconds.Snapshot(),
+		GCApplySeconds:            m.GCApplySeconds.Snapshot(),
+
+		DiskProbeFailuresTotal: m.DiskProbeFailuresTotal.Value(),
+
+		ScrubRunsTotal:          m.ScrubRunsTotal.Value(),
+		ScrubFindingsTotal:      m.ScrubFindingsTotal.Value(),
+		ScrubLastDurationMillis: m.ScrubLastDurationMillis.Value(),
 	}
+}
+
+// FsyncFailuresTotal returns a point-in-time snapshot of
+// chronicledb_fsync_failures_total, keyed by FsyncPath
+// (docs/v0.6.0-plan.md §20, §25). Safe to call from any goroutine.
+func (n *Node) FsyncFailuresTotal() map[FsyncPath]uint64 {
+	out := make(map[FsyncPath]uint64, len(n.fsyncFailuresTotal))
+	for p, c := range n.fsyncFailuresTotal {
+		out[p] = c.Value()
+	}
+	return out
 }

@@ -34,6 +34,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/SamudralaAjaykumarrr/chronicledb/internal/metrics"
 	"github.com/SamudralaAjaykumarrr/chronicledb/internal/raft"
 )
 
@@ -115,6 +116,19 @@ type Transport struct {
 	// and outbound, with no plaintext fallback (docs/enterprise-v1-plan.md
 	// §5 "NO PLAINTEXT PEER REPLICATION").
 	tlsSrc TLSMaterialSource
+
+	// maxPeerConnections bounds concurrent inbound peer connections
+	// (docs/v0.6.0-plan.md §10.1 -max-peer-connections). 0 (the
+	// default, set by New/NewTLS) means unlimited — v0.5.0 behavior
+	// exactly; SetMaxPeerConnections opts in.
+	maxPeerConnections int
+	// peerIdleTimeout is the read deadline applied to an inbound peer
+	// connection (docs/v0.6.0-plan.md §10.1 -peer-idle-timeout),
+	// re-armed after every successfully read frame. 0 (the default)
+	// means no deadline — v0.5.0 behavior exactly.
+	peerIdleTimeout time.Duration
+
+	peerConnectionsRejectedTotal metrics.Counter
 }
 
 // New creates a Transport for node id, listening on listenAddr, with
@@ -160,6 +174,41 @@ func newTransport(id raft.NodeID, ln net.Listener, peerAddrs map[raft.NodeID]str
 // Addr returns the transport's actual listen address (useful when
 // listenAddr was ":0", letting the OS choose a port, e.g. in tests).
 func (t *Transport) Addr() string { return t.ln.Addr().String() }
+
+// SetMaxPeerConnections bounds concurrent inbound peer connections
+// (docs/v0.6.0-plan.md §10.1). 0 means unlimited. Safe to call at any
+// time; acceptLoop reads it fresh on every Accept.
+func (t *Transport) SetMaxPeerConnections(n int) {
+	t.mu.Lock()
+	t.maxPeerConnections = n
+	t.mu.Unlock()
+}
+
+// SetPeerIdleTimeout sets the read deadline applied to every inbound
+// peer connection, re-armed after each successfully read frame
+// (docs/v0.6.0-plan.md §10.1). 0 means no deadline. Takes effect on the
+// next frame read of each connection already open, and on every
+// connection accepted after this call.
+func (t *Transport) SetPeerIdleTimeout(d time.Duration) {
+	t.mu.Lock()
+	t.peerIdleTimeout = d
+	t.mu.Unlock()
+}
+
+// PeerConnections returns the current number of accepted inbound peer
+// connections (chronicledb_peer_connections, docs/v0.6.0-plan.md §11.2).
+func (t *Transport) PeerConnections() int {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return len(t.inbound)
+}
+
+// PeerConnectionsRejectedTotal returns the count of inbound connections
+// refused because -max-peer-connections was already reached
+// (chronicledb_peer_connections_rejected_total, docs/v0.6.0-plan.md §11.2).
+func (t *Transport) PeerConnectionsRejectedTotal() uint64 {
+	return t.peerConnectionsRejectedTotal.Value()
+}
 
 // Recv returns the channel on which received messages arrive. The
 // channel is closed after Close.
@@ -278,6 +327,12 @@ func (t *Transport) acceptLoop() {
 			conn.Close()
 			continue
 		}
+		if t.maxPeerConnections > 0 && len(t.inbound) >= t.maxPeerConnections {
+			t.mu.Unlock()
+			t.peerConnectionsRejectedTotal.Inc()
+			conn.Close()
+			continue
+		}
 		t.inbound[conn] = struct{}{}
 		t.mu.Unlock()
 		t.wg.Add(1)
@@ -331,6 +386,18 @@ func (t *Transport) readLoop(conn net.Conn) {
 
 	r := bufio.NewReader(conn)
 	for {
+		t.mu.Lock()
+		idleTimeout := t.peerIdleTimeout
+		t.mu.Unlock()
+		if idleTimeout > 0 {
+			// Re-armed every iteration (docs/v0.6.0-plan.md §10.1): a
+			// connection that has delivered at least one frame within
+			// the last idleTimeout stays open indefinitely; one that
+			// goes silent longer than that is presumed dead and closed
+			// — a dead TCP connection no longer retains its readLoop
+			// goroutine forever (fact enumerated in §2.2 item 4).
+			_ = conn.SetReadDeadline(time.Now().Add(idleTimeout))
+		}
 		msg, err := readFrame(r)
 		if err != nil {
 			return

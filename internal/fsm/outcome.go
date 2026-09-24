@@ -18,6 +18,13 @@ const (
 	// (ConflictKey/ConflictLatestSeq describe it) or a malformed/
 	// rejected command.
 	StatusAborted
+	// StatusAbortedStale means the command's StartSeq was below the
+	// applied GC watermark at Apply time (docs/v0.6.0-plan.md §15.4,
+	// §15.6): the snapshot it read from may already have had a version
+	// it needed reclaimed. Producible only when gcWatermark > 0, which
+	// requires generation >= 3 — a v0.5.0 binary can never legitimately
+	// observe this value (see DecodeState's decoder hardening).
+	StatusAbortedStale
 )
 
 func (s Status) String() string {
@@ -26,6 +33,8 @@ func (s Status) String() string {
 		return "committed"
 	case StatusAborted:
 		return "aborted"
+	case StatusAbortedStale:
+		return "aborted_stale"
 	default:
 		return fmt.Sprintf("unknown(%d)", int(s))
 	}

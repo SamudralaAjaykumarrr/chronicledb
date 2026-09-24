@@ -16,11 +16,34 @@ import (
 	"sort"
 	"strings"
 
+	"github.com/SamudralaAjaykumarrr/chronicledb/internal/admission"
 	"github.com/SamudralaAjaykumarrr/chronicledb/internal/fsm"
 	"github.com/SamudralaAjaykumarrr/chronicledb/internal/mvcc"
 	"github.com/SamudralaAjaykumarrr/chronicledb/internal/node"
 	"github.com/SamudralaAjaykumarrr/chronicledb/internal/txn"
 )
+
+// defaultMaxConcurrentSQLStatements is docs/v0.6.0-plan.md §10.1's
+// -max-concurrent-sql-statements default. internal/sql has no CLI flag
+// surface of its own (docs/sql.md §8: it is a Go-library surface, not a
+// deployed binary — cmd/chronicledb-node does not use this package at
+// all), so this is simply the constructor default; an embedder that
+// wants a different limit constructs its own Engine-wrapping gate at a
+// future extension point rather than one this release adds.
+const defaultMaxConcurrentSQLStatements = 256
+
+// newSQLGate returns the per-Engine statement-admission gate
+// (docs/v0.6.0-plan.md §9.2): bounds parser/planner/scan work, which is
+// work internal/node's own gates never see. Panics only if
+// defaultMaxConcurrentSQLStatements were ever misconfigured to <= 0,
+// which it never is.
+func newSQLGate() *admission.Gate {
+	g, err := admission.NewGate("sql", admission.Limits{MaxConcurrent: defaultMaxConcurrentSQLStatements})
+	if err != nil {
+		panic(fmt.Sprintf("sql: constructing the statement admission gate: %v", err))
+	}
+	return g
+}
 
 // KV is one key/value pair returned by Txn.ScanPrefix.
 type KV struct {
@@ -97,16 +120,50 @@ type Engine interface {
 	// (docs/transactions.md §7's GetRequestOutcome). found is false if
 	// requestID has never completed.
 	LookupOutcome(requestID string) (outcome RequestOutcome, found bool)
+	// sqlGate returns this Engine's shared statement-admission gate
+	// (docs/v0.6.0-plan.md §9.2), acquired by Session.ExecuteStatement
+	// once per statement. Unexported: only this package's own two
+	// Engine implementations supply one, and internal/admission stays
+	// out of Engine's public API — the gate is this package's
+	// implementation detail, not something an embedder configures
+	// through this interface.
+	sqlGate() *admission.Gate
 }
 
 // --- Standalone adapter (internal/txn.Manager) ---
 
-type standaloneEngine struct{ mgr *txn.Manager }
+type standaloneEngine struct {
+	mgr  *txn.Manager
+	gate *admission.Gate
+}
 
 // NewStandaloneEngine adapts an already-open internal/txn.Manager
 // (standalone, pre-Raft mode — docs/architecture.md §1's "before Raft
 // exists" engine) into an Engine.
-func NewStandaloneEngine(mgr *txn.Manager) Engine { return &standaloneEngine{mgr: mgr} }
+//
+// In standalone mode, this Engine's statement gate is the ONLY
+// admission protection that exists (docs/v0.6.0-plan.md §9.2):
+// standalone mode has no internal/node.Node and therefore none of its
+// Lane B/A gates. A library user embedding ChronicleDB in standalone
+// mode must not assume node-level protection they do not have — see
+// docs/admission-control.md.
+func NewStandaloneEngine(mgr *txn.Manager) Engine {
+	return &standaloneEngine{mgr: mgr, gate: newSQLGate()}
+}
+
+func (e *standaloneEngine) sqlGate() *admission.Gate { return e.gate }
+
+// newStandaloneEngineWithGateLimitForTest is a test-only constructor
+// exposing a smaller-than-default statement gate, so admission-
+// saturation tests do not need 257 concurrent goroutines to exercise
+// the default 256-statement ceiling.
+func newStandaloneEngineWithGateLimitForTest(mgr *txn.Manager, limit int) Engine {
+	g, err := admission.NewGate("sql", admission.Limits{MaxConcurrent: limit})
+	if err != nil {
+		panic(err)
+	}
+	return &standaloneEngine{mgr: mgr, gate: g}
+}
 
 func (e *standaloneEngine) Begin(ctx context.Context) (Txn, error) {
 	return &standaloneTxn{t: e.mgr.Begin(), mgr: e.mgr}, nil
@@ -152,12 +209,19 @@ func (s *standaloneTxn) Commit(requestID string) (uint64, error) {
 func (s *standaloneTxn) Abort() error { return s.t.Abort() }
 
 func (s *standaloneTxn) ScanPrefix(prefix string) ([]KV, error) {
-	return mergeScan(prefix, s.t.StartSeq(), s.mgr.Store(), s.t.LocalWrites()), nil
+	committed, err := s.mgr.Store().ScanVisible(prefix, s.t.StartSeq())
+	if err != nil {
+		return nil, err
+	}
+	return mergeLocalWrites(prefix, committed, s.t.LocalWrites()), nil
 }
 
 // --- Replicated adapter (internal/node.Node) ---
 
-type replicatedEngine struct{ n *node.Node }
+type replicatedEngine struct {
+	n    *node.Node
+	gate *admission.Gate
+}
 
 // NewReplicatedEngine adapts an already-open internal/node.Node
 // (replicated, real Raft/TCP/WAL mode — docs/roadmap.md Phase 5) into
@@ -165,14 +229,24 @@ type replicatedEngine struct{ n *node.Node }
 // cluster leader for a Begin that will go on to Commit any mutation;
 // Begin itself (via internal/node.Node.BeginReadIndex) fails with
 // *node.NotLeaderError if n is not leader.
-func NewReplicatedEngine(n *node.Node) Engine { return &replicatedEngine{n: n} }
+//
+// In replicated mode this Engine's statement gate is IN ADDITION to
+// n's own Lane B gates, and that is intentional (docs/v0.6.0-plan.md
+// §9.2): this gate bounds parser/planner/scan work, which n never sees;
+// n's own gates bound Raft work. Nested acquisition across the two
+// cannot deadlock because the order is always sql -> node and never
+// the reverse (ExecuteStatement acquires this gate first, then calls
+// into n.BeginReadIndex/n.Propose, which acquire n's own gates).
+func NewReplicatedEngine(n *node.Node) Engine { return &replicatedEngine{n: n, gate: newSQLGate()} }
+
+func (e *replicatedEngine) sqlGate() *admission.Gate { return e.gate }
 
 func (e *replicatedEngine) Begin(ctx context.Context) (Txn, error) {
-	startSeq, err := e.n.BeginReadIndex(ctx)
+	startSeq, lease, err := e.n.BeginReadIndex(ctx)
 	if err != nil {
 		return nil, err
 	}
-	return &replicatedTxn{ctx: ctx, node: e.n, startSeq: startSeq, writes: make(map[string]mvcc.Mutation)}, nil
+	return &replicatedTxn{ctx: ctx, node: e.n, startSeq: startSeq, lease: lease, writes: make(map[string]mvcc.Mutation)}, nil
 }
 
 func (e *replicatedEngine) LookupOutcome(requestID string) (RequestOutcome, bool) {
@@ -198,6 +272,11 @@ type replicatedTxn struct {
 	ctx      context.Context
 	node     *node.Node
 	startSeq uint64
+	// lease bounds the leader's proposed GC watermark for as long as
+	// this transaction is open (docs/v0.6.0-plan.md §15.3): released on
+	// every exit path (Commit, Abort) below. Release is idempotent, so
+	// it is safe to defer unconditionally regardless of outcome.
+	lease *node.ReadLease
 
 	writes map[string]mvcc.Mutation
 	order  []string
@@ -212,8 +291,7 @@ func (r *replicatedTxn) Read(key string) ([]byte, bool, error) {
 		}
 		return m.Value, true, nil
 	}
-	v, ok := r.node.FSM().Store().Visible(key, r.startSeq)
-	return v, ok, nil
+	return r.node.FSM().Store().Visible(key, r.startSeq)
 }
 
 func (r *replicatedTxn) recordWrite(key string, value []byte, tombstone bool) {
@@ -238,7 +316,11 @@ func (r *replicatedTxn) ScanPrefix(prefix string) ([]KV, error) {
 	for _, k := range r.order {
 		local = append(local, r.writes[k])
 	}
-	return mergeScan(prefix, r.startSeq, r.node.FSM().Store(), local), nil
+	committed, err := r.node.FSM().Store().ScanVisible(prefix, r.startSeq)
+	if err != nil {
+		return nil, err
+	}
+	return mergeLocalWrites(prefix, committed, local), nil
 }
 
 // txnIDFromRequestID deterministically derives a CommitTxnCommand's
@@ -263,6 +345,7 @@ func txnIDFromRequestID(requestID string) uint64 {
 }
 
 func (r *replicatedTxn) Commit(requestID string) (uint64, error) {
+	defer r.lease.Release()
 	mutations := make([]mvcc.Mutation, 0, len(r.order))
 	for _, k := range r.order {
 		mutations = append(mutations, r.writes[k])
@@ -290,29 +373,30 @@ func (r *replicatedTxn) Commit(requestID string) (uint64, error) {
 }
 
 func (r *replicatedTxn) Abort() error {
+	defer r.lease.Release()
 	r.writes = nil
 	r.order = nil
 	return nil
 }
 
-// mergeScan implements the committed-data half of ScanPrefix
-// (docs/mvcc.md §3 applied to a whole key-prefix rather than one key)
-// merged with a transaction's own local writes, deterministically
-// (sorted ascending by key). store.Export (docs/mvcc.md's own doc
-// comment on Export) already returns every key's full version chain,
-// deep-copied and sorted by key — this is a full scan of the entire
-// store, filtered down to prefix, not an indexed range scan; see
-// docs/sql.md §5.2 for why that is an accepted, documented limitation
-// of this constrained subset rather than an oversight.
-func mergeScan(prefix string, startSeq uint64, store *mvcc.Store, local []mvcc.Mutation) []KV {
-	present := make(map[string][]byte)
-	for _, kc := range store.Export() {
-		if !strings.HasPrefix(kc.Key, prefix) {
-			continue
-		}
-		if v, ok := visibleInChain(kc.Versions, startSeq); ok {
-			present[kc.Key] = v
-		}
+// mergeLocalWrites merges committed (already visibility-filtered and
+// horizon-checked by mvcc.Store.ScanVisible — docs/v0.6.0-plan.md
+// §15.2a) with a transaction's own local write set, deterministically
+// (sorted ascending by key): own writes always shadow committed data
+// (a local write present) or shadow it into absence (a local
+// tombstone), regardless of what ScanVisible returned. This is the
+// merge half of ScanPrefix that stays in internal/sql, where it
+// belongs — the committed-data half (the visibility rule itself, and
+// now the horizon check) lives entirely inside internal/mvcc, in the
+// one place every committed read passes through. There is no local
+// re-implementation of the visibility rule here anymore: the bypass
+// that made that possible (mergeScan reading mvcc.Store.Export
+// directly) is gone, and TestExportOnlyCalledFromSnapshotEncoding
+// keeps it from reappearing.
+func mergeLocalWrites(prefix string, committed []mvcc.KV, local []mvcc.Mutation) []KV {
+	present := make(map[string][]byte, len(committed))
+	for _, kv := range committed {
+		present[kv.Key] = kv.Value
 	}
 	for _, m := range local {
 		if !strings.HasPrefix(m.Key, prefix) {
@@ -334,21 +418,4 @@ func mergeScan(prefix string, startSeq uint64, store *mvcc.Store, local []mvcc.M
 		out[i] = KV{Key: k, Value: present[k]}
 	}
 	return out
-}
-
-// visibleInChain mirrors mvcc.Store.Visible's own binary-search
-// visibility rule (docs/mvcc.md §3), applied to an already-exported
-// version chain (mvcc.Store.Export, which maintains the same
-// ascending-by-CommitSeq ordering Visible relies on) rather than a
-// fresh live lookup.
-func visibleInChain(chain []mvcc.Version, startSeq uint64) (value []byte, found bool) {
-	idx := sort.Search(len(chain), func(i int) bool { return chain[i].CommitSeq > startSeq }) - 1
-	if idx < 0 {
-		return nil, false
-	}
-	v := chain[idx]
-	if v.Tombstone {
-		return nil, false
-	}
-	return v.Value, true
 }

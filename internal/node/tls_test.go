@@ -241,14 +241,14 @@ func TestPeerMTLS_PartitionHealAcrossLeadersRecovers(t *testing.T) {
 		for _, id := range tc.ids {
 			id := id
 			awaitCondition(t, 10*time.Second, fmt.Sprintf("cycle %d: node %s converges over mTLS after heal", cycle, id), func() bool {
-				v, ok := tc.node(id).FSM().Store().Visible(midKey, midOutcome.CommitSeq)
+				v, ok, _ := tc.node(id).FSM().Store().Visible(midKey, midOutcome.CommitSeq)
 				return ok && string(v) == midVal
 			})
 		}
 
 		for _, id := range tc.ids {
 			for k, f := range oracle {
-				v, ok := tc.node(id).FSM().Store().Visible(k, f.commitSeq)
+				v, ok, _ := tc.node(id).FSM().Store().Visible(k, f.commitSeq)
 				if !ok || string(v) != f.value {
 					t.Fatalf("cycle %d: node %s lost or altered earlier fact %s=%s over mTLS (got ok=%v v=%q)", cycle, id, k, f.value, ok, v)
 				}
@@ -317,7 +317,7 @@ func TestPeerMTLS_FollowerCatchesUpViaSnapshotAfterLeaderCompaction(t *testing.T
 	}
 	for i := 0; i < numKeys; i++ {
 		key := fmt.Sprintf("k%d", i)
-		if v, ok := fnode.FSM().Store().Visible(key, last); !ok || string(v) != "v" {
+		if v, ok, _ := fnode.FSM().Store().Visible(key, last); !ok || string(v) != "v" {
 			t.Fatalf("follower missing/wrong key %s after mTLS snapshot catch-up: ok=%v v=%q", key, ok, v)
 		}
 	}
@@ -362,4 +362,37 @@ func TestOpen_PartialPeerTLSConfigurationRejected(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected Open to reject a partially-configured peer TLS setup")
 	}
+}
+
+// TestOpen_NegativeRetentionKnobsRejected is SL-9's Config-level
+// negative control (docs/v0.6.0-plan.md §17.3, §18.2): Open refuses a
+// negative WALRetainExtraSegments or a negative SnapshotRetainCount
+// rather than silently clamping either. cmd/chronicledb-node's own CLI
+// additionally refuses -snapshot-retain-count=0 (its flag defaults to
+// 1, so an operator reaching 0 did so explicitly — see main.go's own
+// validation loop, the same CLI-specific boundary already established
+// for the admission flags); Config itself keeps the more permissive
+// "0 means unset, use Manager's own default of 1" convention for a
+// direct Go-API caller, so this test covers exactly what Open itself
+// enforces, not the CLI's stricter surface.
+func TestOpen_NegativeRetentionKnobsRejected(t *testing.T) {
+	base := func(t *testing.T) Config {
+		addrs := freeAddrs(t, 1)
+		return Config{ID: "n1", Peers: []raft.NodeID{"n1"}, ListenAddr: addrs[0], DataDir: t.TempDir()}
+	}
+
+	t.Run("negative_wal_retain_extra_segments", func(t *testing.T) {
+		cfg := base(t)
+		cfg.WALRetainExtraSegments = -1
+		if _, err := Open(cfg); err == nil {
+			t.Fatal("expected Open to reject Config.WALRetainExtraSegments = -1")
+		}
+	})
+	t.Run("negative_snapshot_retain_count", func(t *testing.T) {
+		cfg := base(t)
+		cfg.SnapshotRetainCount = -1
+		if _, err := Open(cfg); err == nil {
+			t.Fatal("expected Open to reject Config.SnapshotRetainCount = -1")
+		}
+	})
 }

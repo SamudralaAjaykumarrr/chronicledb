@@ -372,8 +372,7 @@ func (t *Txn) Read(key string) (value []byte, found bool, err error) {
 		}
 		return m.Value, true, nil
 	}
-	v, ok := t.mgr.fsm.Store().Visible(key, t.startSeq)
-	return v, ok, nil
+	return t.mgr.fsm.Store().Visible(key, t.startSeq)
 }
 
 // LocalWrites returns a snapshot of the transaction's own uncommitted

@@ -49,6 +49,61 @@ already-decided outcome — never a value any `if` branch reads back.
 | `SnapshotsCreatedTotal` | `chronicledb_snapshots_created_total` | Local snapshots this node has created (and compacted its log against). |
 | `SnapshotsInstalledTotal` | `chronicledb_snapshots_installed_total` | Peer-provided snapshots this node has installed (and that actually advanced its state). |
 
+### 2.1a `v0.6.0` additions
+
+| Field (`MetricsSnapshot`) | Metric name (`/metrics`) | What it counts |
+|---|---|---|
+| `DiskProbeFailuresTotal` | `chronicledb_disk_probe_failures_total` | `PressureMonitor` samples whose disk-usage probe itself errored (`docs/admission-control.md` §6.2's fail-safe direction). |
+| `ScrubRunsTotal` | `chronicledb_scrub_runs_total` | Completed `Node.Scrub` calls. |
+| `ScrubFindingsTotal` | `chronicledb_scrub_findings_total` | Findings across every scrub run (cumulative). |
+| `ScrubLastDurationMillis` | `chronicledb_scrub_last_duration_seconds` | The most recent scrub run's wall-clock duration — a gauge (last value only), unlike the two counters above. |
+
+Plus three gauges read directly from `Node.FSM()` at scrape time rather
+than from `MetricsSnapshot` (they are `internal/fsm.FSM`'s own
+replicated state, not node-local counters):
+`chronicledb_mvcc_keys`, `chronicledb_mvcc_versions` (distinct keys and
+total versions across all chains — the number GC is supposed to
+bound, `docs/storage-lifecycle.md`), `chronicledb_mvcc_gc_watermark`
+(applied GC watermark), `chronicledb_mvcc_gc_passes_total` (completed
+full-keyspace GC walks), and `chronicledb_requestid_outcomes` (distinct
+`CommitTxn` `RequestID`s ever recorded — deliberately unbounded by
+design, §28.2/D6, and reported honestly as such rather than implied
+stable).
+
+One gauge is derived rather than a direct counter passthrough:
+`chronicledb_storage_health` (`0` = healthy, `1` = unhealthy —
+`docs/storage-lifecycle.md` §20.2's consecutive non-Raft fsync-failure
+threshold).
+
+One metric carries `v0.6.0`'s only label, a deliberate, narrow
+exception to §9's "no labels" design constraint below:
+`chronicledb_fsync_failures_total{path="raft"|"snapshot"|"backup"|"audit"}`
+— durable-write failures by path. `path`'s value set is exactly these
+four strings, fixed at compile time (`internal/node.FsyncPath`'s own
+closed constant set, `internal/node/pressure.go`), satisfying
+`docs/v0.6.0-plan.md` §11.1's amended label-policy rule (a label's
+value set must be fixed at compile time and bounded) — see §9.
+
+**Not currently exposed via `/metrics`, despite being tracked
+internally and named in `docs/v0.6.0-plan.md` §11.2/§25's catalogs**:
+the per-gate `internal/admission.Gate` statistics (in-flight/queued/
+capacity per lane, `chronicledb_admission_defense_rejections_total`),
+`chronicledb_node_waiters`/`chronicledb_node_pending_reads`/
+`chronicledb_read_leases_active` (tracked as `Node.Metrics()`'s
+`WaitersGauge`/`PendingReadsGauge`/`ReadLeasesActiveGauge`), and
+`chronicledb_raft_message_process_seconds` itself — `internal/metrics.
+HistogramSnapshot.WriteProm` (§5) exists and is unit-tested, but
+`cmd/chronicledb-node/main.go`'s `handleMetrics` never calls it. `Node`
+also currently has no exported accessor for its admission gates at all
+(`admission *admissionGates` is unexported). None of this is a
+correctness gap — every property these metrics would surface (AC-3,
+AC-19's p99-within-baseline, SL-23's lease-leak-freedom, and so on) is
+proved directly against the in-process `Node` API in
+`internal/node`'s own test suite, not by scraping `/metrics` — but it
+is an observability gap an operator relying on `/metrics` alone would
+not be able to see. Left for a follow-up slice rather than silently
+implied complete here.
+
 `Status()`'s existing fields (`ID`, `Role`, `Term`, `Leader`,
 `CommitIndex`, `AppliedIndex`, `LastIndex`, `SnapshotIndex`) already
 cover `docs/roadmap.md` §Observability's node/Raft-health bullets and
@@ -142,6 +197,19 @@ for the full metric list; `cmd/chronicledb-node/main.go`'s
 `handleMetrics` is the single source of truth for exact names/help
 text.
 
+**Histogram output (`v0.6.0`).** `internal/metrics.HistogramSnapshot`
+gained `WriteProm(w, name, help)`: one `# HELP`/`# TYPE ... histogram`
+preamble, one cumulative `name_bucket{le="<bound>"}` line per configured
+bound plus the `+Inf` bucket, then `name_sum` and `name_count` —
+Prometheus' standard histogram shape, matching the plain `Counter`/
+`Gauge` lines' own `# HELP`/`# TYPE` preamble convention. `le` is the
+only label this line ever carries, and its value set is fixed at
+`Histogram` construction time (§9's amended label rule). As of this
+writing no call site actually invokes `WriteProm` from
+`handleMetrics` — see §2.1a's "not currently exposed" note for exactly
+which histogram (`chronicledb_raft_message_process_seconds`) this
+affects.
+
 ## 6. Logging
 
 Unchanged from Phase 5-8's existing `*log.Logger`-based diagnostics
@@ -208,9 +276,19 @@ All of the above pass under `go test -race`.
 
 - No high-cardinality label ever appears: no `RequestID`, SQL text,
   arbitrary key name, or client identifier is ever used as a metric
-  name or label (there are, in fact, no labels at all in this phase's
-  design — every metric is a single scalar per node, which is
-  sufficient at ChronicleDB V1's one-shard, static-three-node scope).
+  name or label. Through `v0.5.0`, every metric was in fact a single
+  scalar per node, with no labels at all. **Amended in `v0.6.0`**
+  (`docs/v0.6.0-plan.md` §11.1): a label is now permitted, but only
+  when its entire value set is fixed at compile time and bounded — the
+  one instance so far, `chronicledb_fsync_failures_total{path=...}`
+  (§2.1a), draws `path` from `internal/node.FsyncPath`'s closed,
+  four-value constant set, pre-built into the counter map at
+  construction (mirroring `internal/admission.Gate`'s own fixed
+  per-`Reason` counter set), never from any request-time or
+  caller-supplied string. The prohibition this bullet exists to state
+  — no *unbounded* or *high-cardinality* label — is unchanged; "no
+  labels at all" was simply a stronger, no-longer-accurate special
+  case of it.
 - No wall-clock value participates in any correctness decision;
   `internal/benchutil`'s use of `time.Now()` is confined to
   benchmark/test code, never production code.
@@ -218,3 +296,27 @@ All of the above pass under `go test -race`.
   directly in its owner (`Node`, `Manager`) — never copied after first
   use, exactly like the `sync.Mutex` values already throughout this
   codebase.
+
+## 10. `v0.6.0` metric catalog
+
+Every metric this release adds and actually emits via `/metrics`, in
+one place (see §2.1a for detail on each, and its own honesty note on
+what §11.2/§25 named but is not yet wired):
+
+| Metric | Type | Section |
+|---|---|---|
+| `chronicledb_storage_health` | gauge | §2.1a |
+| `chronicledb_disk_probe_failures_total` | counter | §2.1a |
+| `chronicledb_fsync_failures_total{path=...}` | counter | §2.1a, §9 |
+| `chronicledb_scrub_runs_total` | counter | §2.1a |
+| `chronicledb_scrub_findings_total` | counter | §2.1a |
+| `chronicledb_scrub_last_duration_seconds` | gauge | §2.1a |
+| `chronicledb_mvcc_keys` | gauge | §2.1a |
+| `chronicledb_mvcc_versions` | gauge | §2.1a |
+| `chronicledb_mvcc_gc_watermark` | gauge | §2.1a |
+| `chronicledb_mvcc_gc_passes_total` | counter | §2.1a |
+| `chronicledb_requestid_outcomes` | gauge | §2.1a |
+
+See `docs/admission-control.md` and `docs/storage-lifecycle.md` for the
+operational meaning of each (thresholds, runbooks, what a rising value
+means an operator should do).

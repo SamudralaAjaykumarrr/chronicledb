@@ -110,6 +110,28 @@ layout exists so that recovery ordering (metadata -> snapshot -> WAL,
 see [`docs/recovery.md`](recovery.md)) has a concrete shape to reason
 about.
 
+**`DiskUsage` (`v0.6.0`).** `DiskUsage(path) (freeBytes, totalBytes
+uint64, err error)` reports the free/total byte capacity of the
+filesystem containing `path`, via `syscall.Statfs` on Linux/Darwin
+(`diskusage_unix.go`, build-tagged `unix`) — standard library only, so
+[`docs/dependencies.md`](dependencies.md)'s zero-external-dependency
+policy is untouched. On any other platform (`diskusage_unsupported.go`,
+build-tagged `!unix`) it always returns `ErrDiskUsageUnsupported`;
+`internal/node` refuses to start if a disk-pressure threshold flag is
+set on such a platform, rather than silently running with no disk
+protection — see [`docs/admission-control.md`](admission-control.md)
+and [`docs/support-matrix.md`](support-matrix.md).
+
+**`OpenSegmentReadOnly` (`v0.6.0`).** Opens an existing segment with
+`os.O_RDONLY` (never `O_RDWR`); the resulting `*Segment`'s `Append`/
+`Sync`/`Truncate` all return `ErrReadOnlySegment` instead of touching
+the file. This is the *only* constructor `internal/wal.Scrub`,
+`internal/node.Scrub`'s storage-integrity verification, ever uses —
+making `SCRUB NON-DESTRUCTIVE` ([`docs/invariants.md`](invariants.md))
+a property of the file descriptor itself, not of reviewer discipline.
+`ReadAt`/`Size`/`ID`/`Path`/`Close` behave identically to a normal
+`OpenSegment` result.
+
 ## 5. Append and fsync semantics
 
 - `Append(bytes) -> (offset, error)` writes to the OS page cache for
@@ -166,6 +188,14 @@ about.
   level in [`docs/failure-model.md`](failure-model.md); the exact
   error surfaced by a given OS/filesystem combination is an
   implementation detail validated in Phase 1 testing.
+- **Resolved (`v0.6.0`)**: disk accounting (free/total byte reporting)
+  is `DiskUsage` above, `syscall.Statfs`-based, Linux/Darwin only by
+  build tag and Linux-amd64-only as a *tested* platform — see
+  [`docs/support-matrix.md`](support-matrix.md). It answers "how much
+  free space does the filesystem containing this path report right
+  now," sampled on a fixed interval by `internal/admission.PressureMonitor`,
+  never probed from a request-handling or event-loop code path — see
+  [`docs/admission-control.md`](admission-control.md) §6.1.
 
 ### Phase 1 implementation decisions (resolved)
 

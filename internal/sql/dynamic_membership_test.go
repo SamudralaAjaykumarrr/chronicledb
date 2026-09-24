@@ -8,6 +8,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/SamudralaAjaykumarrr/chronicledb/internal/fsm"
 	"github.com/SamudralaAjaykumarrr/chronicledb/internal/node"
 	"github.com/SamudralaAjaykumarrr/chronicledb/internal/raft"
 )
@@ -245,23 +246,71 @@ func TestDynamicMembershipWithConcurrentSQLReads(t *testing.T) {
 	c.addrs[learnerID] = learnerAddr
 	clusterMu.Unlock()
 
-	addCtx, addCancel := context.WithTimeout(context.Background(), 5*time.Second)
-	if _, err := leader.AddLearner(addCtx, "dm16-add-n4", learnerID, learnerAddr); err != nil {
-		t.Fatalf("AddLearner: %v", err)
+	// Same structural staleness risk as every membership call below:
+	// re-fetch whichever node currently holds leadership on each
+	// attempt rather than assuming the leader captured at the top of
+	// this test is still it.
+	var addErr error
+	awaitConditionSQL(t, 5*time.Second, "AddLearner(n4) eventually succeeds", func() bool {
+		cur := currentSQLLeader(c, &clusterMu)
+		if cur == nil {
+			return false
+		}
+		actx, acancel := context.WithTimeout(context.Background(), time.Second)
+		defer acancel()
+		_, err := cur.AddLearner(actx, "dm16-add-n4", learnerID, learnerAddr)
+		if err != nil {
+			var nle *node.NotLeaderError
+			if errors.As(err, &nle) || errors.Is(err, node.ErrLeadershipLost) || isRetryableConfigChangeRefusal(err) {
+				return false
+			}
+			addErr = err
+			return true
+		}
+		return true
+	})
+	if addErr != nil {
+		t.Fatalf("AddLearner: %v", addErr)
 	}
-	addCancel()
 	awaitConditionSQL(t, 5*time.Second, "n4 catches up", func() bool {
 		return learner.Status().AppliedIndex >= uint64(leader.Status().LastIndex)
 	})
 
+	// Re-fetch the current leader on every attempt, exactly like the
+	// background reader above (currentSQLLeader) — the background
+	// reader keeps every node ticking under real timers throughout this
+	// test, so the original leader can genuinely, transiently lose
+	// leadership to a spontaneous election before this promote is ever
+	// issued (a real CI-timing race, not specific to any deliberate
+	// failover later in this test). Retrying PromoteToVoter against the
+	// stale, no-longer-leader node would only ever reproduce
+	// *node.NotLeaderError forever; retrying against whichever node
+	// currently holds leadership is this file's own established pattern
+	// for that class of staleness (isCleanSQLReadFailure, above).
+	// isRetryableConfigChangeRefusal's two errors are retried for the
+	// same reason a fresh leader may not yet be able to accept a config
+	// change (§2.2a/ADR-0014's election no-op gate) — the identical
+	// class the post-failover RemoveServer loop below already retries
+	// on. Any other error is unexpected and fails the test immediately,
+	// exactly as before.
 	var promoteErr error
 	awaitConditionSQL(t, 5*time.Second, "PromoteToVoter(n4) eventually succeeds", func() bool {
+		cur := currentSQLLeader(c, &clusterMu)
+		if cur == nil {
+			return false
+		}
 		pctx, pcancel := context.WithTimeout(context.Background(), time.Second)
 		defer pcancel()
-		_, err := leader.PromoteToVoter(pctx, "dm16-promote-n4", learnerID, 0)
+		_, err := cur.PromoteToVoter(pctx, "dm16-promote-n4", learnerID, 0)
 		if err != nil {
 			var lag *node.ErrLearnerNotCaughtUp
-			if errors.As(err, &lag) {
+			var nle *node.NotLeaderError
+			// ErrLeadershipLost ("outcome unknown, retry by RequestID
+			// against the current leader") is that sentinel's own
+			// documented recovery instruction — exactly what re-fetching
+			// cur and reusing the same RequestID on the next attempt
+			// does.
+			if errors.As(err, &lag) || errors.As(err, &nle) || errors.Is(err, node.ErrLeadershipLost) || isRetryableConfigChangeRefusal(err) {
 				return false
 			}
 			promoteErr = err
@@ -277,7 +326,12 @@ func TestDynamicMembershipWithConcurrentSQLReads(t *testing.T) {
 	})
 
 	// Remove one of the three original voters (not the current leader),
-	// leaving 3 voters — no confirmation required.
+	// leaving 3 voters — no confirmation required. Same structural
+	// staleness risk as the PromoteToVoter/self-removal calls above (a
+	// captured leader variable, real timers, the background reader
+	// still driving real traffic): re-fetch whichever node currently
+	// holds leadership on each attempt. removeTarget itself is
+	// independent of who currently leads, so it is computed once.
 	var removeTarget raft.NodeID
 	for _, id := range c.ids {
 		if id != leaderID && id != learnerID {
@@ -285,11 +339,28 @@ func TestDynamicMembershipWithConcurrentSQLReads(t *testing.T) {
 			break
 		}
 	}
-	removeCtx, removeCancel := context.WithTimeout(context.Background(), 5*time.Second)
-	if _, err := leader.RemoveServer(removeCtx, "dm16-remove-1", removeTarget, 0); err != nil {
-		t.Fatalf("RemoveServer(%s): %v", removeTarget, err)
+	var removeErr error
+	awaitConditionSQL(t, 5*time.Second, "RemoveServer(original voter) eventually succeeds", func() bool {
+		cur := currentSQLLeader(c, &clusterMu)
+		if cur == nil {
+			return false
+		}
+		rctx, rcancel := context.WithTimeout(context.Background(), time.Second)
+		defer rcancel()
+		_, err := cur.RemoveServer(rctx, "dm16-remove-1", removeTarget, 0)
+		if err != nil {
+			var nle *node.NotLeaderError
+			if errors.As(err, &nle) || errors.Is(err, node.ErrLeadershipLost) || isRetryableConfigChangeRefusal(err) {
+				return false
+			}
+			removeErr = err
+			return true
+		}
+		return true
+	})
+	if removeErr != nil {
+		t.Fatalf("RemoveServer(%s): %v", removeTarget, removeErr)
 	}
-	removeCancel()
 	awaitConditionSQL(t, 5*time.Second, "cluster converges on 3 voters after removal", func() bool {
 		return leader.Status().VoterCount == 3
 	})
@@ -338,15 +409,50 @@ func TestDynamicMembershipWithConcurrentSQLReads(t *testing.T) {
 
 	// The new leader removes itself (self-removal, §4.2/§4.2a) with the
 	// background SQL reader still running, against a healthy, fully
-	// reachable remaining voter.
-	selfRemoveCtx, selfRemoveCancel := context.WithTimeout(context.Background(), 5*time.Second)
-	outcome, err := newLeader.RemoveServer(selfRemoveCtx, "dm16-self-remove", newLeaderID, 1)
-	selfRemoveCancel()
-	if err != nil {
-		t.Fatalf("self-removal: %v", err)
+	// reachable remaining voter. Structurally identical staleness risk
+	// to the PromoteToVoter loop above (a captured leader variable,
+	// real timers, the background reader still driving real traffic).
+	// But unlike those calls, the proposer is not interchangeable here:
+	// a different leader removing newLeaderID is an ordinary follower
+	// removal, and would pass every assertion below without ever
+	// exercising self-removal. So only newLeader itself may propose,
+	// until newLeader has returned ErrLeadershipLost for this exact
+	// RequestID — its self-removal proposal's outcome is then unknown,
+	// and retrying the SAME RequestID against whichever node now leads
+	// is that sentinel's own documented recovery (it deduplicates to
+	// the original outcome). If newLeader merely stops leading without
+	// that, keep waiting for it to lead again; the outer bound fails
+	// closed if the self-removal path is never exercised.
+	var selfRemoveOutcome fsm.Outcome
+	var selfRemoveErr error
+	selfRemoveOutcomeUnknown := false
+	awaitConditionSQL(t, 5*time.Second, "self-removal of the new leader eventually succeeds", func() bool {
+		cur := currentSQLLeader(c, &clusterMu)
+		if cur == nil || (cur != newLeader && !selfRemoveOutcomeUnknown) {
+			return false
+		}
+		pctx, pcancel := context.WithTimeout(context.Background(), time.Second)
+		defer pcancel()
+		o, err := cur.RemoveServer(pctx, "dm16-self-remove", newLeaderID, 1)
+		if cur == newLeader && errors.Is(err, node.ErrLeadershipLost) {
+			selfRemoveOutcomeUnknown = true
+		}
+		if err != nil {
+			var nle *node.NotLeaderError
+			if errors.As(err, &nle) || errors.Is(err, node.ErrLeadershipLost) || isRetryableConfigChangeRefusal(err) {
+				return false
+			}
+			selfRemoveErr = err
+			return true
+		}
+		selfRemoveOutcome = o
+		return true
+	})
+	if selfRemoveErr != nil {
+		t.Fatalf("self-removal: %v", selfRemoveErr)
 	}
-	if outcome.Status.String() != "committed" {
-		t.Fatalf("self-removal outcome = %+v, want committed", outcome)
+	if selfRemoveOutcome.Status.String() != "committed" {
+		t.Fatalf("self-removal outcome = %+v, want committed", selfRemoveOutcome)
 	}
 	awaitConditionSQL(t, 5*time.Second, "the self-removed node steps down", func() bool {
 		return newLeader.Status().Role != raft.Leader

@@ -1,341 +1,212 @@
 # ADR-0019: Admission Control / Resource Protection Architecture
 
-Status: **Proposed** (planning only — `docs/v0.6.0-plan.md` Part A; no
-production code implements this yet, and this ADR moves to Accepted
-only when that implementation lands)
+Status: Accepted
 
 ## Context
 
-Through `v0.5.0`, ChronicleDB has no admission control of any kind.
-Measured against the tree at `481ff93`:
-
-- Every `internal/node.Node` request channel is **unbuffered**
-  (`proposeCh`, `controlCh`, `readIndexCh`, `backupCh`, `precheckCh`,
-  `membershipCh`, `membershipStatusCh`). The de facto request queue is
-  therefore the set of *blocked caller goroutines*, one per in-flight
-  HTTP request, each retaining its decoded `fsm.CommitTxnCommand` (up
-  to the existing 1 MiB body limit) for as long as it waits. That set
-  is unbounded.
-- `len(Node.waiters)` — the true proposed-but-unapplied set — has no
-  cap.
-- `cmd/chronicledb-node` constructs `&http.Server{Addr, Handler}` with
-  no `ReadTimeout`, `WriteTimeout`, `IdleTimeout`,
-  `ReadHeaderTimeout`, or `MaxHeaderBytes`, and no bound on concurrent
-  connections.
-- `internal/transport.acceptLoop` spawns one goroutine per inbound
-  peer connection, with no limit and no read deadline.
-- There is no disk-headroom or memory-pressure signal anywhere in the
-  tree.
-- **A caller that cancels its context does not withdraw the state it
-  left behind.** `Propose` returns on `ctx.Done()`
-  (`internal/node/node.go:1172`) but its waiter (`:1450`) survives
-  until the entry applies, the node steps down, or it shuts down;
-  `BeginReadIndex` returns the same way but its `pendingRead`
-  (`:1479`) survives until the read resolves or leadership is lost.
-  Any caller-side concurrency limit therefore bounds *goroutines*,
-  not those sets.
-- **`checkPendingReads` runs on the consensus path.** It iterates the
-  whole `pendingReads` slice after every `processOutput` (`:1596`),
-  so that slice's length is a term in per-inbound-message cost.
-- **`FSM.mu` is an exclusive `sync.Mutex`.** `Apply` (`fsm.go:184`),
-  `Precheck` (`:111`) and `GetOutcome` (`:133`) all take it in write
-  mode. `GetOutcome` backs `/outcome`, the documented recovery path
-  from an overload rejection.
-
-`docs/enterprise-v1-plan.md` §9 designates `v0.6.0` as the resolution
-point, and adds a requirement the codebase has never had to reason
-about: Raft's own internal traffic must never be starved by client
-overload.
-
-One structural fact dominates the design. `internal/node` runs a
-**single event-loop goroutine** that owns `raft.Core`, `WALStorage`,
-`fsm.FSM`, and the snapshot manager. Go's `select` already dispatches
-fairly among ready cases, so client channel readiness does not starve
-`tr.Recv()` in the scheduling sense. What is genuinely unbounded is
-(a) the number of goroutines parked holding payloads, and (b) the
-service time the loop spends on work a client caused — including the
-two long, self-initiated durable operations (`maybeSnapshot`,
-`handleBackup`) that already run to completion on that loop, a
-documented `v0.1.0`-era tradeoff.
+Through `v0.5.0`, `internal/node`'s event loop admitted every client
+`Propose`/`BeginReadIndex` call unconditionally: the only bound on
+concurrent client work was whatever the caller's own goroutine pool
+happened to be. A client that opened enough connections, or a single
+misbehaving client retrying aggressively, could grow `n.waiters`/
+`n.pendingReads` without limit, and nothing distinguished "the cluster
+is out of capacity" from "you lost a write-write conflict" in the error
+a client received. `docs/enterprise-v1-plan.md` §9 ("Admission Control /
+Resource Protection") is the designated resolution point, targeted at,
+and released as, `v0.6.0`. This ADR records the architecture actually
+implemented for that phase; `ADR-0020` and `ADR-0021` record the
+companion Storage Lifecycle half of the same release.
 
 ## Decision
 
-**Four lanes, physically separate, with separate capacities — not
-priority levels on one queue.**
+### The one-sentence model
 
-- **Lane K (consensus)**: `run()`'s `ticker.C` and `tr.Recv()` cases
-  and everything reachable from them. **Structurally ungated**: no
-  identifier from `internal/admission` is reachable from `(*Node).run`,
-  enforced by an AST-based call-graph test
-  (`TestAdmissionNeverReachableFromEventLoop`), not by convention.
-  Follower-side replication, snapshot installation, and voting are
-  Lane K and are never refused for local capacity reasons.
-- **Lane A1 (control plane)**: membership, upgrade, TLS reload. Its
-  own small gate (`-max-admin-concurrency`, default 2), never shared
-  with client work, so a client flood can never prevent an operator
-  from acting on a sick cluster.
-- **Lane A2 (maintenance)**: backup and scrub, on a separate
-  `maintenanceGate` (`-max-maintenance-concurrency`, default 2) plus
-  a single slot per kind. These are the only caller-initiated
-  operations whose duration is unbounded in the *input* rather than
-  the request — a scrub of 200 GiB at the default
-  `-scrub-bytes-per-sec` runs ~50 minutes. Had they shared Lane A1's
-  capacity-2 gate, one scrub plus one backup would have returned
-  `503 admin_operation_in_progress` to an emergency
-  `/admin/membership/remove` for that entire window: the release's
-  own new feature blocking the action Lane A exists to protect. The
-  split is structural (**Rule CP-3**: neither lane's entry points
-  reference the other's gate) and is asserted by the same AST test
-  that enforces Lane K's separation.
-- **Lane B (client)**: `Propose` and `BeginReadIndex`, each with its
-  own gate. `/status`, `/health`, `/metrics`, and `/outcome` are
-  deliberately ungated — the overload signal and the documented
-  recovery path from a rejection must not themselves be sheddable.
+Every unit of work this node ever performs is assigned to exactly one
+of four lanes, and admission is a property of the lane, never of a
+global counter:
 
-**The gate is a fixed-capacity structure, not a rate limiter.**
-`admission.Gate` holds two channels: `slots` (cap `MaxConcurrent`) and
-`queue` (cap `MaxQueueDepth`). The total number of goroutines that can
-be inside `Acquire` is their sum, by channel capacity. Worst-case
-resident client payload is therefore arithmetic:
-`(MaxConcurrent + MaxQueueDepth) × 1 MiB`.
+- **Lane K (consensus)**: `AppendEntries`/`RequestVote`/heartbeat
+  processing. **Has no gate at all, structurally** — there is no
+  `internal/admission` identifier reachable from `run()`, `step()`, or
+  anything either calls (`TestAdmissionNeverReachableFromEventLoop`,
+  an AST test, proves this rather than merely documenting it).
+- **Lane A1 (control)**: membership changes, upgrade precheck/finalize,
+  TLS reload. Bounded, but never queued behind client load.
+- **Lane A2 (maintenance)**: backup, scrub. Bounded independently of
+  Lane A1, so a stuck backup cannot block a membership change, and vice
+  versa (`§3.2a`, Rule CP-3).
+- **Lane B (client)**: `Propose` (writes) and `BeginReadIndex` (reads),
+  gated separately from each other.
 
-**The authoritative bounds are enforced on the event-loop
-goroutine** — three of them, not one:
-`len(n.waiters) >= maxClientWaiters` inside `handlePropose`, and
-`len(n.pendingReads)` and the live-read-lease count inside
-`handleReadIndex`. These are the places that cannot be bypassed and
-need no lock. They apply to *client* work only; control and
-membership proposals and the election no-op never consult them, which
-is how Lane A and Lane K priority is expressed: as the **absence** of
-a check.
+### `internal/admission.Gate` — a bounded-capacity primitive, not a rate limiter
 
-**The gate and the ceiling are not interchangeable, and the ceiling
-fires in normal operation.** Because a canceled caller frees its gate
-slot while its waiter or pending read survives, the gate bounds
-goroutines and resident payload memory while the ceilings bound
-admitted work. A client population using deadlines shorter than apply
-latency will drive the ceiling continuously — that is a *cancellation*
-signal, documented as such, not a bug signal, and the corresponding
-counter is expected to be nonzero under those workloads.
+A rate limiter (token bucket, leaky bucket) bounds *arrival rate*; it
+says nothing about how many callers are concurrently inside the
+protected section. `Gate` instead bounds the literal count: the total
+number of goroutines simultaneously inside `Acquire` — running with a
+held slot, or still waiting for one — never exceeds
+`MaxConcurrent+MaxQueueDepth`, enforced by two Go channels' fixed
+capacities, not by counting. This is the direct implementation of
+`BOUNDED ADMITTED WORK` (`docs/invariants.md` §27.1): the property
+`v0.6.0` needs is "how much work can be in flight at once," which a
+concurrency bound answers directly and a rate limiter only answers
+indirectly (and incorrectly, if service time varies).
 
-**Fail-closed configuration.** `MaxConcurrent <= 0` is a startup error.
-There is no flag value meaning "unlimited" and no way to disable
-admission.
+`internal/admission` is a leaf package — it imports only
+`internal/metrics` and the standard library — specifically so
+`internal/node`'s own dependency graph never runs through it in the
+other direction, and so `internal/sql`'s statement gate (`§9.2`) can
+depend on it without pulling in Raft/FSM machinery it has no business
+needing.
 
-**`FSM.mu` becomes a `sync.RWMutex`.** Leaving `/outcome` ungated is
-only defensible if `GetOutcome` is actually cheap, and today it takes
-`FSM.mu` in *write* mode — the same mutex the event loop's `Apply`
-takes. Ungated plus exclusive would hand unbounded client concurrency
-a lock on the consensus path, which is the precise hazard this ADR
-cites elsewhere as a reason to gate. `Apply` and the mutating control
-applies keep `Lock()`; `Precheck`, `GetOutcome` and the read-only
-lookups take `RLock()`. Go's `RWMutex` blocks new readers once a
-writer waits, so the event loop cannot be starved by a reader stream.
-This is what makes "ungated" mean "cheap" rather than "unprotected".
+### Structural separation over a priority queue
 
-**The gate still runs before `Precheck`.** The `RWMutex` change
-weakens the original lock-contention argument but does not reverse
-the decision, which rests on two independent grounds: `Precheck`
-calls `fingerprintOf` (`internal/fsm/fsm.go:19`), hashing the full
-mutation set on every call — unbounded client-caused CPU work before
-admission — and even a shared-mode reader population forces the
-event loop's writer to wait for the current cohort to drain on every
-`Apply`. The consequence — under overload, a duplicate `RequestID` can
-be shed with `503` instead of returning its recorded outcome — is safe
-and is documented in the error contract, with the ungated
-`GET /outcome` as the resolution path.
+`docs/enterprise-v1-plan.md` §9 asks for "control-plane/consensus
+priority... processed on a priority path never blocked behind a full
+client-work queue." A priority queue was rejected: it requires an
+explicit, ongoing judgment about relative priority under every future
+combination of lanes, and a bug in that judgment (a control message
+misclassified, a priority inversion under a specific interleaving) is
+silent until an incident surfaces it. Structural separation — Lane K
+has no gate, Lane A1/A2 have their own independent gates, Lane B's own
+saturation can only ever block Lane B — makes the corresponding safety
+property (`CONTROL-PLANE NON-STARVATION`, `§27.2`) a fact about the
+dependency graph an AST test can check, not a claim about scheduler
+behavior under load that can only be observed, never proven, in
+production.
 
-**Pressure is sampled, never probed in the hot path.** One monitor
-goroutine samples disk headroom (`syscall.Statfs`, standard library,
-`unix` build tag) and heap (`runtime/metrics`, never
-`runtime.ReadMemStats`, which can stop the world) on a fixed interval
-into an atomic snapshot. Three states — `Normal`, `LowSpace`,
-`Critical` — tighten or refuse **client writes only**, with 10%
-hysteresis on de-escalation. Consensus traffic is unaffected in every
-state.
+### The gate runs *before* `Precheck`
 
-**`CONTROL-PLANE NON-STARVATION` is scoped to what is actually
-proven**: Raft message-processing and heartbeat-dispatch latency are
-not functions of client queue depth, concurrency, or rejection rate.
-It explicitly does **not** claim the event loop is never blocked.
-Snapshot creation, backup export, and snapshot installation still run
-on it; `v0.6.0` bounds how often they can be triggered (backup and
-scrub are Lane A2 and singly serialized), pre-empts follower election
-timers with a forced heartbeat round immediately before each, and
-**measures** the residual as
-`chronicledb_event_loop_block_seconds`. Moving those operations off
-the loop is named as a later-release item, not claimed here.
+`Propose`'s admission gate is acquired before `fsm.FSM.Precheck`, which
+computes a full mutation-set fingerprint on every call — unbounded
+client-caused CPU work. Admitting before doing per-request work is the
+general rule this release applies everywhere a gate exists. The
+consequence, documented rather than hidden: under overload, a retry of
+an already-decided `RequestID` can itself be shed with a `503` rather
+than returning its recorded outcome — safe, because a rejection never
+records anything (`REJECTION SAFETY`, `§27.3`), and the deliberately
+ungated `GET /outcome` remains the correct way to resolve a known
+`RequestID` under load.
 
-Three structures in the tree would falsify even that scoped claim if
-left alone, so the claim is made true rather than narrowed further:
-`FSM.mu`'s exclusivity behind the ungated `/outcome` (fixed above);
-`checkPendingReads`' unbounded per-message scan (fixed by the
-`pendingReads` ceiling); and `ApplyAdvanceGCWatermark`'s
-`O(total keys)` walk (fixed by [ADR-0020](0020-mvcc-gc-replicated-watermark.md)'s
-`MaxKeys` bound).
+### `ADMISSION FAILS CLOSED`
+
+There is no "unlimited" admission configuration reachable from either
+the direct Go API or the CLI. `admission.NewGate` refuses
+`MaxConcurrent <= 0` outright; `cmd/chronicledb-node` additionally
+refuses `0` for every admission-control flag whose own default is never
+`0` (an operator reaching `0` there did so explicitly, and it is
+treated as a startup error rather than "unlimited"). `internal/node.Config`
+keeps a separate, ergonomic "0 means package default" convention for
+direct Go-API callers — the two conventions are deliberately different
+because they answer different questions (§10.3 of the plan discusses
+this at length): `Config`'s zero value must keep every pre-`v0.6.0` test
+working unmodified; the CLI's own flag defaults are never `0`, so a `0`
+there is never ambiguous.
+
+### Resource pressure: sampling, never probing in the hot path
+
+Disk and heap headroom are sampled by a single dedicated goroutine
+(`admission.PressureMonitor`) on a fixed interval (`-resource-poll-interval`,
+default 5s), storing an immutable snapshot in an `atomic.Pointer` — no
+request path and no event-loop code ever makes a `syscall.Statfs` or a
+`runtime/metrics.Read` call directly. This is what lets a deterministic
+test inject a fake `PressureSource` and drive the hysteresis state
+machine (`internal/node/pressure.go`) without ever touching a real
+filesystem or sleeping for a real interval
+(`SetPressureSourceForTest`, `internal/node/pressure_test.go`).
+
+Three states, with 10% de-escalation hysteresis so a workload hovering
+at a threshold does not flap on every poll: **Normal** (full
+`MaxConcurrent`), **LowSpace** (`MaxInflightProposals/4`, floored at 1;
+reads/admin/consensus unaffected), **Critical** (all client writes
+refused, `disk_critical`). Heap pressure can only ever produce
+LowSpace, never Critical — `-max-heap-bytes` is an admission threshold,
+never an allocator limit (`GOMEMLIMIT` is the real mechanism an
+operator should also set). Entering LowSpace or Critical triggers an
+immediate GC pass proposal if GC is enabled (`ADR-0020`) — the one
+automatic action pressure ever takes, and it deletes only what
+`docs/mvcc.md` §6's rule already permits.
+
+### The stable error contract
+
+Every admission rejection is a `*admission.RejectedError` carrying a
+fixed, documented `Reason` string (`internal/admission/reason.go`) and
+a `Retry-After` hint — never a bare `503` a client has to guess about.
+A client that cannot distinguish "the cluster is at capacity" from "you
+lost a conflict" retries the wrong thing forever; the `Reason`
+vocabulary exists specifically so it never has to guess.
 
 ## Alternatives Considered
 
-1. **One shared queue with priority levels for consensus, admin, and
-   client work.** Rejected: a priority flag on a shared structure is a
-   configuration away from being wrong, and a shared structure's
-   saturation is still shared. Separate objects with separate
-   capacities cannot be misconfigured into starving each other, and
-   the property is checkable by a static call-graph test rather than
-   by reasoning about scheduling.
-2. **Rate limiting (requests/second, token bucket) instead of
-   concurrency limiting.** Rejected: the resource actually at risk is
-   memory and event-loop service time, both of which scale with
-   *concurrency*, not with arrival rate. A token bucket sized for a
-   fast disk over-admits catastrophically on a slow one; a concurrency
-   bound is self-calibrating because slots are released only when work
-   completes.
-3. **Buffering the node's request channels instead of adding gates.**
-   Rejected: it moves the unbounded set from "parked goroutines" to
-   "channel buffer" without bounding total memory, gives the caller no
-   explicit rejection, and would make latency degrade silently — the
-   exact behavior `docs/enterprise-v1-plan.md` §9 forbids.
-4. **Gating only at the HTTP layer.** Rejected: `internal/node` is
-   also used directly as a library (`internal/sql`'s
-   `replicatedEngine`, every test harness), so an HTTP-only gate would
-   leave the real entry point unprotected and would make
-   `BOUNDED ADMITTED WORK` untrue for embedded use.
-5. **Exempting duplicate `RequestID` retries from the gate.** Rejected:
-   determining whether a request is a duplicate requires hashing the
-   full command and consulting the outcome table — the very work the
-   gate exists to bound.
-5a. **Relying on the caller-side gates alone to bound admitted work.**
-   Rejected because it is simply untrue on this codebase: a canceled
-   caller frees its gate slot while its waiter and pending read
-   survive, so `len(waiters)` and `len(pendingReads)` grow without
-   bound under a cancel-heavy or never-committing workload. The
-   event-loop ceilings are the authoritative mechanism; an earlier
-   draft called them a redundant backstop whose counter "must stay
-   zero", which would have been an unsatisfiable release gate.
-5b. **Leaving the read path's per-node state uncapped because the
-   read gate releases at the door.** Rejected. Releasing the
-   `readGate` slot when `BeginReadIndex` returns is right — a
-   long-running reader must not hold admission capacity — but it
-   means the gate bounds nothing that outlives the call. A leader
-   isolated into a minority resolves no reads at all, so a flood of
-   timing-out `BeginReadIndex` calls grows `pendingReads` without
-   bound while `checkPendingReads` scans it on every inbound Raft
-   message. Two event-loop ceilings and an `O(1)` `minLease`
-   structure close it.
-5c. **One admin lane for both control and maintenance operations.**
-   Rejected — see Lane A2 above. This is the one place where the
-   release's own new feature (scrub) could have denied service to
-   the operator action the lane exists to guarantee.
-6. **Moving snapshot/backup off the event loop in this release.**
-   Rejected *for `v0.6.0`*: it requires a copy-on-snapshot of FSM state
-   and a re-proof of `SNAPSHOT SAFETY`, putting a `v0.5.0` guarantee at
-   risk for a liveness gain. Deferred with an explicit owner release
-   rather than silently skipped.
-7. **Per-credential / per-tenant fair-share admission.** Rejected for
-   V1: ChronicleDB has no tenant concept at all, consistent with
-   `docs/non-goals.md`. Node-global only.
-8. **Adaptive/self-tuning admission (latency gradient, CoDel).**
-   Rejected for V1: fixed, operator-configured thresholds are
-   explainable and testable; an adaptive controller is neither, and
-   `docs/enterprise-v1-plan.md` §9 names it as a non-goal.
+- **A single global semaphore across all lanes.** Rejected: it
+  reintroduces exactly the priority-inversion risk structural
+  separation exists to remove — a client-write burst would still be
+  able to starve a membership change sharing the same counter.
+- **A token-bucket rate limiter instead of a bounded-concurrency
+  gate.** Rejected (see "a bounded-capacity primitive, not a rate
+  limiter" above): the actual failure mode `v0.6.0` protects against is
+  unbounded *concurrent* work (memory held by in-flight proposals), not
+  unbounded arrival rate; a rate limiter bounds the wrong quantity.
+- **Probing disk/heap synchronously inside the admission check itself.**
+  Rejected: a `syscall.Statfs` or a stop-the-world-risking memory stat
+  on every `Propose` call would make admission's own overhead scale
+  with load, defeating its purpose under exactly the conditions it
+  exists to handle.
+- **A priority queue with configurable weights.** Rejected: see
+  "Structural separation over a priority queue" above — every weight
+  scheme this project considered was a claim about behavior under a
+  specific load shape, not a structural guarantee.
 
 ## Consequences
 
-- One new leaf package, `internal/admission`, importing only the
-  standard library and `internal/metrics`, keeping
-  `docs/architecture.md` §5's dependency direction acyclic.
-- A new client-facing `503` response with a `Retry-After` header and a
-  fixed, documented `reason` vocabulary — additive, MINOR-compatible,
-  and distinct from every existing status (`409` not-leader, `200`
-  with `ABORTED` for an SI conflict).
-- `internal/metrics` gains a `Histogram`, the first in the catalog,
-  resolving the deferral `docs/observability.md` §9 recorded at
-  Phase 9. `docs/observability.md` §9's "no labels at all" rule is
-  amended to the accurate rule — only compile-time-bounded label sets
-  (`le`, `cert`, `gate`, `path`, `op`, `reason`) — which the existing
-  `chronicledb_cert_expiry_seconds{cert="peer"}` metric already
-  required.
-- HTTP timeouts and connection caps become the single
-  default-behavior change in `v0.6.0`; everything else is opt-in.
-- Admission state is per-process, in-memory, never persisted and never
-  replicated: a restart resets it, and a new leader inherits no stale
-  count.
-- `internal/fsm`'s `mu` changes from `Mutex` to `RWMutex`. No format,
-  determinism or ordering implication — the event loop remains the
-  only writer — but it is a prerequisite for leaving `/outcome`
-  ungated.
-- Two new flags beyond the original set:
-  `-max-maintenance-concurrency` (Lane A2) and
-  `-max-live-read-leases` (the lease ceiling).
-  `-max-concurrent-reads` now binds both the read gate and the
-  `pendingReads` ceiling, exactly as `-max-inflight-proposals` binds
-  both the write gate and the `waiters` ceiling.
-- `chronicledb_admission_defense_rejections_total` is documented as a
-  **client-cancellation** signal, not a bug signal, and carries a
-  `ceiling="waiters|pending_reads"` label.
+- A client integrating against `v0.6.0` for the first time may observe
+  `503` responses it never saw before, each carrying a `Reason` and a
+  `Retry-After` — this is the one client-visible behavior addition this
+  release makes on the admission side (the HTTP timeout/connection-cap
+  defaults are the other, unrelated one, `§10.4`).
+- Every future phase that adds a new kind of client-facing work now has
+  an established lane to place it in, rather than needing to invent
+  admission control from scratch.
+- `CONTROL-PLANE NON-STARVATION`'s own proof is permanently scoped to
+  what `§4.3`/`§4.4` of the plan actually claims: Go's own fair
+  `select` dispatch, plus the absence of a Lane B gate anywhere
+  reachable from the event loop. It does **not** claim the event loop
+  itself never blocks for a long-running operation it performs
+  synchronously (snapshot creation, backup export) — that residual
+  exposure is measured, not hidden, and is the first of the three named
+  `v1.0.0`-blocker items (`docs/roadmap.md`).
 
 ## Correctness Implications
 
-- **`BOUNDED ADMITTED WORK`** (new): the gate's channel capacities
-  bound goroutines and resident payload memory; three event-loop
-  ceilings (`waiters`, `pendingReads`, live read leases) bound
-  admitted work. These are complementary, **not** interchangeable —
-  the gates do not bound state that outlives a canceled call.
-- **`CONTROL-PLANE NON-STARVATION`** (new, precisely scoped above).
-- **`REJECTION SAFETY`** (new): every gate acquisition strictly
-  precedes the channel send into the event loop, and therefore
-  precedes `Core.Step(InputPropose)`. A rejected request is
-  indistinguishable, in every durable and replicated artifact, from a
-  request that was never made — so it extends `IDEMPOTENCY` rather
-  than qualifying it.
-- **`ADMISSION FAILS CLOSED`** (new): the same posture
-  `AUDIT COMPLETENESS` already takes.
-- **Nothing is weakened.** Admission sits strictly outside
-  `fsm.Apply`, records nothing, and never touches `internal/raft`;
-  `DURABILITY`, `IDEMPOTENCY`, `REQUEST OUTCOME STABILITY`, and every
-  Raft invariant are untouched. Disk pressure never refuses consensus
-  work, so `QUORUM SAFETY` and `LEADER COMPLETENESS` are unaffected.
+See `docs/invariants.md`'s new "Admission Control / Storage Lifecycle
+invariants (`v0.6.0`)" section for the complete, itemized argument:
+`BOUNDED ADMITTED WORK` (§27.1), `CONTROL-PLANE NON-STARVATION` (§27.2),
+`REJECTION SAFETY` (§27.3), and `ADMISSION FAILS CLOSED` (§27.4) are
+this ADR's four correctness claims, each with its own proof tier and
+negative control.
 
 ## Testing and Proof Obligations
 
-`docs/v0.6.0-plan.md` §30.1 (AC-1…AC-22) and §30.3. In particular:
-
-- AC-1/AC-2: the exact concurrency boundary, and a 1000-iteration
-  `-race` acquire/release storm.
-- AC-6 plus the **negative control** AC-7: with lane separation
-  disabled by a test-only hook, the harness must *detect* the
-  heartbeat starvation the separation prevents. A test that passes
-  identically with and without the mechanism does not count
-  (`docs/testing-strategy.md` §11).
-- **Declared proof-tier substitution.** `internal/fault` imports only
-  `internal/raft` — it has no `Node`, no event loop and no admission
-  gates — so AC-6 and AC-7 **cannot** run in it, despite
-  `docs/enterprise-v1-plan.md` §9 naming that simulator. Both move to
-  the `internal/node` `testCluster` tier, with the election-clock
-  freeze plus an explicit forced-heartbeat driver replacing the
-  logical tick and the comparison made on
-  `chronicledb_raft_message_process_seconds` bucket counts rather
-  than wall-clock sleeps. Recorded as deviation D10 in
-  `docs/v0.6.0-plan.md` §26, and explained in §29.3.
-- **AC-19**: `-max-http-connections` worth of concurrent `/outcome`
-  and `/status` against a leader under sustained Raft traffic, with a
-  negative control that reverts `FSM.mu` to an exclusive mutex and
-  must *detect* the p99 regression.
-- **AC-20**: a cancel-heavy workload proving `len(n.waiters)` stays
-  within its ceiling *and* that the defense counter does rise — the
-  calibration that makes its zero value elsewhere meaningful.
-- **AC-21**: a minority-partitioned leader flooded with
-  never-resolving `BeginReadIndex` calls, proving both read-side
-  ceilings hold and that `minLease` cost does not grow with the
-  number of open readers.
-- **AC-22**: a concurrent backup and scrub (Lane A2 saturated) while
-  a membership add/promote/remove is issued, proving Rule CP-3.
-- AC-8: a 50%-rejection stress with recycled `RequestID`s, checked by
-  `internal/oracle` for zero duplicate effects.
-- AC-10/AC-11/AC-12: sustained real-cluster saturation with zero
-  elections, plus saturation crossed with leader failover and with an
-  in-flight membership change.
-- AC-13: real disk pressure on a real small filesystem, proving
-  admission tightens *before* any write failure.
-- AC-18: the AST call-graph test that makes lane separation a property
-  the code cannot silently lose.
+- Deterministic: `internal/admission`'s own unit/`-race`/fuzz suite
+  (`AC-1`, `AC-2`, `AC-4`, `AC-17`).
+- Real-disk/real-TCP `internal/node` `testCluster`: `AC-3`, `AC-5`
+  through `AC-14`, `AC-18` through `AC-22` — including the two
+  structural AST tests (`TestAdmissionNeverReachableFromEventLoop` for
+  Rule CP-2/CP-3, and its negative control) and the injected-fake-gate
+  negative control for `AC-7`.
+- Real-filesystem: `AC-13` (a small dedicated filesystem filled toward
+  each threshold in turn, via `internal/testfs`'s unprivileged
+  user+mount-namespace harness — never a mocked `DiskUsage`).
+- Chaos: `AC-10` (60s sustained saturation, scaled via
+  `CHRONICLEDB_AC10_DURATION`), `AC-11` (saturation plus leader
+  failover — both an ungraceful `Stop` and an isolate/heal `SteppedDown`
+  transition — no gate-token leak, the new leader's own ceiling applies
+  immediately), `AC-12` (saturation plus a full
+  add/promote/remove membership sequence — the admin lane is never
+  blocked).
+- §29.3's `internal/fault` limitation (D10, `docs/v0.6.0-plan.md` §29.3):
+  `internal/fault` imports only `internal/raft` and has no event loop,
+  no admission gates, and no GC — `AC-6`/`AC-7` (lane separation) and
+  the GC chaos obligations `ADR-0020` names both run at the
+  `internal/node` `testCluster` tier instead, a deliberate, declared
+  retiering rather than a silent gap.

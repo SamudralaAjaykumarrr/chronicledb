@@ -116,7 +116,7 @@ func TestStripSnapshotConfigurationClearsV2Configuration(t *testing.T) {
 	if snap.Meta.LastIncludedIndex != 1 || snap.Meta.LastIncludedTerm != 1 {
 		t.Fatalf("stripping must preserve the consensus boundary exactly, got %+v", snap.Meta)
 	}
-	if _, found := snap.FSM.Store().Visible("k", 1); !found {
+	if _, found, _ := snap.FSM.Store().Visible("k", 1); !found {
 		t.Fatal("stripping must preserve FSM state exactly")
 	}
 }

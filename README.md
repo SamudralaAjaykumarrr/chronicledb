@@ -26,7 +26,12 @@ currently zero entries). See [`docs/roadmap.md`](docs/roadmap.md)
 §Maturity Model for exactly why that distinction matters here.
 `v0.5.0` (Dynamic Membership) is the current published release; see
 [`CHANGELOG.md`](CHANGELOG.md) for the full release history since
-`v0.1.0`.
+`v0.1.0`. Admission Control / Resource Protection and Storage Lifecycle
+(target `v0.6.0`) is implemented and proven on the
+`v0.6.0-implementation` branch as of this writing, not yet tagged/
+released — see `CHANGELOG.md`'s `[Unreleased]` entry and
+[`docs/admission-control.md`](docs/admission-control.md)/
+[`docs/storage-lifecycle.md`](docs/storage-lifecycle.md).
 
 ## Quickstart
 

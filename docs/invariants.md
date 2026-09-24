@@ -124,6 +124,12 @@ applied uniformly by `internal/mvcc`.
 **Threatened by**: Off-by-one errors in the `CommitSeq <= StartSeq`
 comparison; own-write shadowing bugs; tombstone mishandling.
 
+*(`v0.6.0`)* Narrowed in domain, not weakened, by MVCC GC: this rule now
+applies to snapshots at or above the applied GC watermark, and a read
+below the horizon returns an explicit `ErrSnapshotTooOld` rather than a
+value — a refused read is not a wrong read (see the new "Admission
+Control / Storage Lifecycle invariants" section below).
+
 **Proof/test obligations**: Property-based tests generating random
 interleavings of writers and readers, checked against a reference
 model of the visibility rule (`docs/scenario-corpus.md` §Transactions).
@@ -403,6 +409,13 @@ proof obligations and its own ADR before any such claim changes.
 **Threatened by**: Marketing-style language creeping into README or
 docs ahead of implementation evidence — see
 [`docs/vision.md`](vision.md) §Guiding principle.
+
+*(`v0.6.0`)* Strengthened, not threatened, by MVCC GC: a naive GC
+implementation reclaiming a version a live snapshot still needed would
+have made the system quietly less isolated than it claims, and the
+horizon guard (`internal/mvcc`'s `Visible`/`ScanVisible`) forbids that
+structurally (see the new "Admission Control / Storage Lifecycle
+invariants" section below).
 
 **Proof/test obligations**: Documentation review checklist item in
 every future architecture change; write-skew example test
@@ -1317,3 +1330,357 @@ shifted read — `TestV2RejectsInvalidHasConfigByte`,
 `TestV2RejectsHasConfigFalseWithNonZeroLen`). The `FormatVersion`
 surface's mechanism changes from equality to a bounded range; the
 invariant's statement is unchanged.
+
+## Admission Control / Storage Lifecycle invariants (`v0.6.0`)
+
+See [`docs/admission-control.md`](admission-control.md) and
+[`docs/storage-lifecycle.md`](storage-lifecycle.md) for the full
+architecture, and [`ADR-0019`](adr/0019-admission-control-architecture.md)/
+[`ADR-0020`](adr/0020-mvcc-gc-replicated-watermark.md)/
+[`ADR-0021`](adr/0021-storage-lifecycle-retention-and-scrub.md) for the
+design decisions. Ten new entries below; `NO SILENT FORMAT
+MISINTERPRETATION` (above) is amended in place, not re-added; two
+existing invariants (`MVCC VISIBILITY`, `ISOLATION TRUTHFULNESS`) each
+gain one sentence.
+
+### BOUNDED ADMITTED WORK
+
+**Statement**: The number of client proposals concurrently
+proposed-but-unapplied on a node never exceeds
+`-max-inflight-proposals`; the number of pending `ReadIndex` requests
+never exceeds `-max-concurrent-reads`; the number of live read leases
+never exceeds `-max-live-read-leases`; and the number of goroutines
+concurrently inside any admission gate never exceeds that gate's
+`MaxConcurrent + MaxQueueDepth`.
+
+**Scope**: Every node, every moment, replicated mode.
+
+**Why it matters**: An unbounded admitted set is an unbounded memory
+commitment and an unbounded event-loop backlog — the failure mode that
+turns a slow cluster into a dead one.
+
+**Mechanism**: Fixed-capacity channels in `internal/admission.Gate`
+bound goroutines and resident payload memory. Three independent
+event-loop ceilings — `len(n.waiters)`, `len(n.pendingReads)`, and the
+live-lease count — bound the per-node state a request leaves behind.
+These are not interchangeable: the gate does **not** bound `waiters` or
+`pendingReads`, because a caller that cancels its context frees its
+gate slot while its waiter/pending-read entry survives until it
+resolves. The event-loop ceilings are the authoritative mechanism for
+this invariant; the gates are the authoritative mechanism for the
+admission-side memory bound.
+
+**Threatened by**: A new client entry point added without a gate; a
+gate constructed with `MaxConcurrent <= 0`; a `release` that is not
+deferred; a new piece of per-request node state introduced without its
+own event-loop ceiling.
+
+**Proof/test obligations**: AC-1 (exact boundary), AC-2 (`-race`, 1000
+iterations), AC-3 (`len(waiters)` never exceeds the bound under real
+saturation), AC-14 (the defense counter stays 0 with no client
+cancellation), AC-20 (cancel-heavy workload: the defense counter *does*
+fire and the ceiling still holds), AC-21 (`pendingReads`/lease ceilings
+hold under a never-resolving minority-partition read flood, `minLease`
+is `O(1)`), AC-18 (structural AST test asserting no admission
+identifier is reachable from the event loop).
+
+### CONTROL-PLANE NON-STARVATION
+
+**Statement**: The latency of processing one inbound Raft message, and
+of dispatching one heartbeat round, is not a function of client
+admission-queue depth, client request concurrency, or client rejection
+rate. This invariant does not claim the event loop is never blocked:
+snapshot creation, backup export, and snapshot installation still run
+to completion on it, bounded and measured but not eliminated.
+
+**Scope**: `internal/node`'s event loop, replicated mode.
+
+**Why it matters**: `RAFT ELECTION SAFETY` is a safety property, but
+Raft's availability depends on timely heartbeat processing; starving
+it because of client load turns an overload into an election storm.
+
+**Mechanism**: Structural lane separation with no shared structure
+between Lane K (consensus, no gate at all), Lane A1/A2 (control/
+maintenance), and Lane B (client reads/writes); no admission identifier
+reachable from the event loop. Plus three preconditions that would
+otherwise make the statement false: `FSM.mu` as an `RWMutex` (so the
+ungated `/outcome`/`/status` read path never blocks behind a client
+write holding it exclusively), the `pendingReads` ceiling bounding the
+per-message pending-reads scan, and `MaxKeys`-bounded GC `Apply`.
+
+**Threatened by**: Adding a gate acquisition inside the event loop "for
+symmetry"; sharing one gate between Lane A and Lane B, or merging Lane
+A1 and Lane A2 back together; adding an ungated endpoint that takes
+`FSM.mu` in exclusive mode; adding per-message loop work proportional
+to an unbounded set.
+
+**Proof/test obligations**: AC-6 (`internal/node` `testCluster` —
+saturated client gate vs. heartbeat latency), AC-10 (real cluster, zero
+elections under sustained saturation), AC-19 (ungated `/outcome`/
+`/status` flood vs. Raft message-processing p99), AC-21
+(`checkPendingReads` cost bounded), AC-22 (concurrent backup + scrub
+does not delay a membership change), SL-2b (GC Apply cost flat in
+total key count), AC-18 (AST, lane separation), plus the negative
+controls AC-7 (lane separation disabled by a test hook produces
+elections) and AC-19's exclusive-mutex control.
+
+### REJECTION SAFETY
+
+**Statement**: A request rejected for capacity has never been
+proposed, replicated, or applied; no `RequestID` was recorded; the
+rejection is always safe to retry and never produces a duplicate
+effect.
+
+**Scope**: Every admission rejection, every lane.
+
+**Why it matters**: Extends `IDEMPOTENCY` to the new rejection path
+explicitly. A rejection that might have partially happened is worse
+than no rejection at all.
+
+**Mechanism**: Every gate acquisition strictly precedes the channel
+send into the event loop, and therefore strictly precedes
+`Core.Step(InputPropose)`.
+
+**Threatened by**: Moving a gate acquisition after the propose;
+recording a metric keyed by `RequestID` on the rejection path.
+
+**Proof/test obligations**: AC-8 (50%-rejection stress with recycled
+`RequestID`s, checked by `internal/oracle` for zero duplicate effects
+and zero `RequestID`s with two outcomes), AC-9 (a rejected request's
+`RequestID` is `ErrRequestIDUnknown` at `/outcome`).
+
+### ADMISSION FAILS CLOSED
+
+**Statement**: Any failure, misconfiguration, or absence of the
+admission mechanism results in rejecting work, never in admitting
+unbounded work.
+
+**Scope**: Configuration parsing, gate construction, and every request
+path.
+
+**Why it matters**: An availability cost is preferred over resource
+exhaustion — the same posture `AUDIT COMPLETENESS` already takes for
+the audit log.
+
+**Mechanism**: `MaxConcurrent <= 0` is a startup error; there is no
+"unlimited" value; the event-loop ceiling rejects independently of the
+gate; `Acquire` never returns a nil error without a held slot.
+
+**Threatened by**: Adding a `-disable-admission` flag; treating a
+gate-construction error as a warning rather than fatal.
+
+**Proof/test obligations**: AC-4 (each invalid configuration refuses
+startup with a specific message), AC-5 (a deliberately no-op gate
+injected via a test hook still cannot exceed the bound, because the
+event-loop ceiling holds).
+
+### GC SAFETY
+
+**Statement**: A version is removed only when
+[`docs/mvcc.md`](mvcc.md) §6's rule permits it, and no transaction ever
+observes a version GC has removed: any read or commit whose `StartSeq`
+is below the applied GC watermark is refused, never silently served
+from the surviving chain.
+
+**Scope**: `internal/mvcc`, `internal/fsm`, every replica, all time.
+
+**Why it matters**: Reclaiming a version a live snapshot still needs is
+the canonical MVCC-GC correctness bug, and — worse than an error — it
+manifests as a silent Snapshot Isolation violation.
+
+**Mechanism**: The reclamation predicate applied inside `fsm.Apply`
+against the post-`max()` `f.gcWatermark` (the single authoritative
+horizon); the horizon guard inside `mvcc.Store` under the same lock as
+the chain read, reached by every committed-read path including prefix
+scans; the equality `Store.GCWatermark() == FSM.gcWatermark` after
+restore, install, and restart; deterministic commit-side abort
+(`StatusAbortedStale`).
+
+**Threatened by**: A read path reaching `chains` without going through
+`Visible`/`ScanVisible` (`Store.Export` is the one that historically
+did, which is why it is restricted to snapshot encoding and asserted
+structurally); a restored `Store` left at watermark 0; lowering the
+watermark; computing the watermark from anything but committed state;
+reclaiming against `cmd.Watermark` rather than `f.gcWatermark`.
+
+**Proof/test obligations**: SL-1 (property test: randomized chains ×
+randomized snapshot sets × randomized watermarks, asserting no
+surviving snapshot's required version was removed and every
+removed-version read is refused), SL-2/SL-12 (the same property under
+combined chaos with GC active), SL-3 (negative control: with the
+horizon guard disabled by a test hook, the property test detects the
+silent stale read).
+
+### GC DETERMINISM
+
+**Statement**: The set of versions reclaimed by a node, and its
+resulting GC cursor and watermark, are a pure function of the
+committed log prefix that node has applied — identical on every
+replica, and identical across replay, restart, and snapshot restore.
+
+**Scope**: `internal/fsm.ApplyAdvanceGCWatermark`, `internal/mvcc`.
+
+**Why it matters**: It is what keeps `STATE MACHINE SAFETY` and
+`DETERMINISM BOUNDARY` true after GC exists.
+
+**Mechanism**: Reclamation only inside `Apply`; explicitly sorted key
+iteration via `Store.KeysFrom`; both `MaxVersions` and `MaxKeys`
+carried in the replicated command rather than read from local config;
+the post-`max()` `f.gcWatermark` as the single comparison horizon;
+monotone `max()` on the watermark; `gcPassSeq` advanced in `Apply` so
+the leader's next `RequestID` is itself a function of replicated
+state.
+
+**Threatened by**: A background goroutine mutating `Store`; map
+iteration order; reading `-gc-max-versions-per-pass`/
+`-gc-max-keys-per-pass` inside `Apply`; a per-node "skip GC when busy"
+heuristic; deriving the GC `RequestID` from anything a replica cannot
+recompute from its own applied state.
+
+**Proof/test obligations**: SL-4 (two independently constructed FSMs
+fed the identical history including GC commands produce byte-identical
+`EncodeState`), SL-4a (a command whose `Watermark` is below
+`f.gcWatermark` reclaims against the current watermark, not the
+command's), SL-2b (Apply cost flat as total key count grows 10×),
+SL-12 (chaos: every live node's `EncodeState` at the same applied
+index is byte-identical, with GC active), SL-13 (a node that caught up
+by `InstallSnapshot` and one that caught up by log replay agree byte
+for byte, including `gcPassSeq` and the `Store`/`FSM` watermark
+equality).
+
+### SNAPSHOT HORIZON ENFORCEMENT
+
+**Statement**: Every read of committed MVCC state, and every commit
+decision, is refused if its `StartSeq` is below the applied GC
+watermark — structurally, at the `internal/mvcc` boundary, with no
+bypass.
+
+**Scope**: `internal/mvcc.Store` (all read entry points),
+`internal/fsm.Apply`.
+
+**Why it matters**: It is the mechanism that makes `GC SAFETY`
+unconditional rather than "sound as long as the leader knew about
+every reader."
+
+**Mechanism**: `Visible`/`ScanVisible` return `ErrSnapshotTooOld`;
+`Apply` returns `StatusAbortedStale`; both read the watermark under the
+same lock as the data. `Store.Export` is restricted to snapshot
+encoding and `internal/sql`'s duplicate visibility helper is deleted,
+so there is exactly one implementation of the rule. `DecodeState`
+propagates the watermark into the restored `Store`, so the guard is
+live on a restored or snapshot-installed node from its first read.
+
+**Threatened by**: A new read accessor added to `Store` without the
+check; a caller re-deriving visibility from `Export` outside
+`internal/mvcc`; exposing `chains` directly; a restored `Store`
+constructed without a watermark.
+
+**Proof/test obligations**: SL-5 (ordering: idempotency before horizon
+before conflict), SL-6 (every committed-read entry point the product
+actually has — `replicatedTxn.Get`/`ScanPrefix`,
+`standaloneTxn.Get`/`ScanPrefix`, and every exported `mvcc.Store` read
+method — refuses below the horizon), SL-6a (`Store.GCWatermark() ==
+FSM.gcWatermark` as a `DecodeState` post-condition), SL-6b
+(`TestExportOnlyCalledFromSnapshotEncoding`, AST), SL-7 (a stale
+transaction's commit aborts identically on every replica and is
+recorded stably).
+
+### RECLAMATION BOUNDARY
+
+**Statement**: No durable WAL segment or snapshot file is deleted
+before the snapshot that supersedes it is fully written, fsync'd,
+recorded in durable WAL metadata, and has had `HardState`
+re-affirmed; and nothing above that boundary is ever deleted.
+
+**Scope**: `internal/wal.CompactBefore`/`CompactBeforeRetaining`,
+`internal/snapshot.Manager.Prune`, `WALStorage.InstallSnapshot`.
+
+**Why it matters**: This is `LOG COMPACTION SAFETY` restated at the
+exact ordering level, made explicit because `v0.6.0` introduces new
+retention knobs touching the same code.
+
+**Mechanism**: The unchanged six-step `maybeSnapshot` ordering
+(asserted by a call-order test); prune-after-durable in
+`Manager.Prune`; whole-segments-only; never the current segment.
+
+**Threatened by**: An "optimization" that compacts before the pointer
+write; a retain count of 0; partial-segment reclamation.
+
+**Proof/test obligations**: SL-8 (crash injection at each of the six
+ordering points, restart, assert recoverable and no committed entry
+lost, using the `internal/node` crash-injection facility — not
+`internal/fault`, which has no snapshot manager, no `internal/wal`,
+and no `internal/storage`), SL-26 (crash at each of the three
+`handleInstallSnapshot` points), SL-9 (`-snapshot-retain-count=0`
+refuses startup).
+
+### DISK-FULL EXPLICITNESS
+
+**Statement**: An out-of-space condition is always surfaced as an
+explicit, distinguishable failure — never conflated with a transaction
+conflict, a generic I/O error, or an admission rejection — and never
+silently treated as success.
+
+**Scope**: `internal/wal`, `internal/storage`, `internal/node`, the
+HTTP surface.
+
+**Why it matters**: A client that cannot distinguish "the cluster is
+full" from "you lost a conflict" will retry the wrong thing forever.
+
+**Mechanism**: `errors.Is(err, syscall.ENOSPC)` classification into
+`wal.ErrOutOfSpace`/`storage.ErrOutOfSpace`, reclassified rather than
+lost at each package boundary; the distinct `disk_critical` admission
+reason; distinct `/health` and `/status` fields.
+
+**Threatened by**: Wrapping an `ENOSPC` into a generic
+`fmt.Errorf("write failed: %w")` that loses the classification at a
+package boundary.
+
+**Proof/test obligations**: SL-14 (real small filesystem, real
+`ENOSPC`: the classified error reaches the client and `/health`),
+SL-14b (`ENOSPC` is never reported as an SI abort), SL-15 (recovery
+after space is freed, with no restart).
+
+### SCRUB NON-DESTRUCTIVE
+
+**Statement**: The integrity-verification scrub never modifies on-disk
+state; running it against a live node is always safe.
+
+**Scope**: `internal/node.Scrub` and everything it calls.
+
+**Why it matters**: A verification tool that can damage what it
+verifies will not be run when it is most needed.
+
+**Mechanism**: `storage.OpenSegmentReadOnly` (`O_RDONLY`;
+`Append`/`Sync`/`Truncate` return `ErrReadOnlySegment`); no `FSM.mu`,
+no `Core` access; scrub runs on the caller's own goroutine, touching
+only directory paths, never a live `*wal.WAL`/`*snapshot.Manager`.
+
+**Threatened by**: A future "scrub can also fix the torn tail" idea.
+
+**Proof/test obligations**: SL-10 (directory hashed before and after a
+scrub over corrupted and clean data — byte-identical), plus
+`TestScrubOnlyOpensReadOnly` (AST, with a negative control).
+
+### NO SILENT FORMAT MISINTERPRETATION (extended by `v0.6.0`)
+
+Amended in place, never re-added. The `v0.6.0` extension: control-kind
+byte `2` (`AdvanceGCWatermark`, disjoint from `controlKindSetClusterVersion
+= 1` and asserted so by `TestControlKindRangesNeverCollide`), outcome
+status byte `3` (`StatusAbortedStale`), and the generation-3 snapshot
+trailing block (`gcWatermark`/`gcCursor`/`gcPassSeq`) are each rejected
+— never guessed at — by any binary that does not understand them; and
+`v0.6.0`'s own `DecodeState` newly rejects any unrecognized status
+byte, closing a gap in the `v0.5.0` decoder.
+
+### `MVCC VISIBILITY` and `ISOLATION TRUTHFULNESS` (amended by `v0.6.0`)
+
+`MVCC VISIBILITY` (above) is narrowed in domain, not weakened: it now
+applies to snapshots at or above the GC horizon, and below the horizon
+the answer is an explicit `ErrSnapshotTooOld`/`StatusAbortedStale`
+rather than a value — a refused read is not a wrong read.
+`ISOLATION TRUTHFULNESS` (above) is strengthened: a naive GC
+implementation would have made the system quietly less isolated than
+it claims by resurrecting a version a live snapshot still needed, and
+the horizon guard (`internal/mvcc`'s `Visible`/`ScanVisible`) forbids
+it structurally.

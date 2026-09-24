@@ -17,6 +17,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strconv"
+	"syscall"
 )
 
 const (
@@ -28,6 +29,33 @@ const (
 // segment than were requested. Callers use this to distinguish a torn/
 // incomplete read from a genuine I/O error.
 var ErrShortRead = errors.New("storage: short read (insufficient bytes remain in segment)")
+
+// ErrOutOfSpace classifies a write/sync/create failure caused by
+// syscall.ENOSPC (docs/v0.6.0-plan.md §19.3, DISK-FULL EXPLICITNESS,
+// §27.9): every write-shaped operation in this package (Append, Sync,
+// Truncate, CreateSegment, WriteFileDurable, EnsureDir) checks
+// errors.Is(err, syscall.ENOSPC) and, when true, wraps this sentinel
+// alongside the underlying error (both remain reachable via errors.Is)
+// rather than folding it into a generic fmt.Errorf-wrapped message that
+// would lose the classification at this package's boundary — the exact
+// failure mode §27.9 names as the threat. internal/wal reclassifies this
+// into its own wal.ErrOutOfSpace at its own boundary, so a caller of
+// internal/wal never needs to know this package's error type at all.
+var ErrOutOfSpace = errors.New("storage: no space left on device")
+
+// classifyWriteErr wraps err with ErrOutOfSpace when it was caused by
+// ENOSPC, leaving every other error untouched. Called at every point in
+// this package where an os-level write/sync/create call can plausibly
+// exhaust disk space.
+func classifyWriteErr(err error) error {
+	if err == nil {
+		return nil
+	}
+	if errors.Is(err, syscall.ENOSPC) {
+		return fmt.Errorf("%w: %w", ErrOutOfSpace, err)
+	}
+	return err
+}
 
 // SegmentFileName returns the on-disk file name for the segment with the
 // given id. The name encodes id as a fixed-width, zero-padded decimal
@@ -49,7 +77,7 @@ func SegmentPath(dir string, id uint64) string {
 // itself is durable.
 func EnsureDir(dir string) error {
 	if err := os.MkdirAll(dir, 0o755); err != nil {
-		return fmt.Errorf("storage: create dir %s: %w", dir, err)
+		return classifyWriteErr(fmt.Errorf("storage: create dir %s: %w", dir, err))
 	}
 	return syncDir(filepath.Dir(dir))
 }
@@ -63,7 +91,7 @@ func syncDir(path string) error {
 	}
 	defer d.Close()
 	if err := d.Sync(); err != nil {
-		return fmt.Errorf("storage: sync dir %s: %w", path, err)
+		return classifyWriteErr(fmt.Errorf("storage: sync dir %s: %w", path, err))
 	}
 	return nil
 }
@@ -104,7 +132,7 @@ func CreateSegment(dir string, id uint64) (*Segment, error) {
 	path := SegmentPath(dir, id)
 	f, err := os.OpenFile(path, os.O_RDWR|os.O_CREATE|os.O_EXCL, 0o644)
 	if err != nil {
-		return nil, fmt.Errorf("storage: create segment %s: %w", path, err)
+		return nil, classifyWriteErr(fmt.Errorf("storage: create segment %s: %w", path, err))
 	}
 	if err := syncDir(dir); err != nil {
 		f.Close()
@@ -146,6 +174,11 @@ type Segment struct {
 	path string
 	file *os.File
 	size int64
+	// readOnly is set only by OpenSegmentReadOnly (segment_readonly.go)
+	// — see ErrReadOnlySegment's doc comment for why this, plus opening
+	// with O_RDONLY, is what makes SCRUB NON-DESTRUCTIVE (§27.10) a
+	// structural property rather than a convention.
+	readOnly bool
 }
 
 // ID returns the segment's id.
@@ -162,11 +195,14 @@ func (s *Segment) Path() string { return s.path }
 // page cache) but not persisted: only a subsequent successful Sync
 // guarantees the bytes survive a crash (docs/architecture.md §4).
 func (s *Segment) Append(p []byte) (offset int64, err error) {
+	if s.readOnly {
+		return s.size, ErrReadOnlySegment
+	}
 	offset = s.size
 	n, err := s.file.WriteAt(p, offset)
 	s.size += int64(n)
 	if err != nil {
-		return offset, fmt.Errorf("storage: append to segment %s: %w", s.path, err)
+		return offset, classifyWriteErr(fmt.Errorf("storage: append to segment %s: %w", s.path, err))
 	}
 	if n != len(p) {
 		return offset, fmt.Errorf("storage: short write to segment %s: wrote %d of %d bytes: %w", s.path, n, len(p), io.ErrShortWrite)
@@ -178,8 +214,11 @@ func (s *Segment) Append(p []byte) (offset int64, err error) {
 // after Sync returns successfully are the bytes appended since the
 // previous successful Sync persisted (docs/storage.md §5).
 func (s *Segment) Sync() error {
+	if s.readOnly {
+		return ErrReadOnlySegment
+	}
 	if err := s.file.Sync(); err != nil {
-		return fmt.Errorf("storage: sync segment %s: %w", s.path, err)
+		return classifyWriteErr(fmt.Errorf("storage: sync segment %s: %w", s.path, err))
 	}
 	return nil
 }
@@ -218,8 +257,11 @@ func (s *Segment) ReadAt(p []byte, offset int64) (int, error) {
 // It exists exclusively to repair a torn final record left by a crash
 // during an in-progress append (docs/wal.md §6.1).
 func (s *Segment) Truncate(size int64) error {
+	if s.readOnly {
+		return ErrReadOnlySegment
+	}
 	if err := s.file.Truncate(size); err != nil {
-		return fmt.Errorf("storage: truncate segment %s to %d: %w", s.path, size, err)
+		return classifyWriteErr(fmt.Errorf("storage: truncate segment %s to %d: %w", s.path, size, err))
 	}
 	s.size = size
 	return s.Sync()

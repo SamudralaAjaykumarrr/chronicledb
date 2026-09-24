@@ -4,6 +4,108 @@ All notable changes to ChronicleDB are documented here. Format loosely
 follows [Keep a Changelog](https://keepachangelog.com/); versioning
 follows [`docs/versioning.md`](docs/versioning.md) (SemVer, pre-1.0).
 
+## [Unreleased]
+
+Admission Control / Resource Protection and Storage Lifecycle — the
+fifth phase of the `docs/enterprise-v1-plan.md` Enterprise V1 roadmap
+(§9-§10, target release `v0.6.0`). See `docs/v0.6.0-plan.md` and
+`docs/adr/0019-admission-control-architecture.md`/
+`docs/adr/0020-mvcc-gc-replicated-watermark.md`/
+`docs/adr/0021-storage-lifecycle-retention-and-scrub.md` for the
+complete design, `docs/admission-control.md` and
+`docs/storage-lifecycle.md` for the operator runbooks. Implementation
+and its proof obligations are complete on the `v0.6.0-implementation`
+branch as of this entry; **not yet tagged** — this section's header
+becomes `## [0.6.0] - <date>` at actual release time, per this file's
+own established convention (see the `[0.5.0]` entry below).
+
+### Behavior changes
+
+Three additive (MINOR-compatible, `docs/versioning.md`), but real,
+changes existing clients should be prepared to handle:
+
+1. `503` (with `Retry-After`) is now a possible response to `/propose`
+   and every `/admin/*` endpoint — this release's admission control
+   rejecting a request under sustained overload or genuine resource
+   pressure (`disk_pressure`, `disk_critical`, `queue_full`,
+   `queue_timeout`, `concurrency_limit`, `memory_pressure`,
+   `read_lease_limit`, `admin_operation_in_progress`, `shutting_down` —
+   `docs/admission-control.md` §8.2). Previously impossible; always
+   safe to retry (a `503` from this release's admission control never
+   records a `RequestID` outcome).
+2. `status: "ABORTED_STALE"` is a new possible value in the `/propose`
+   and `/outcome` response `status` field — a transaction whose
+   `StartSeq` fell below the applied MVCC GC watermark. Previously
+   impossible, and still impossible unless GC is enabled
+   (`-gc-interval` > `0`, off by default in this release).
+3. HTTP server timeouts and connection caps are enforced by default
+   (`-http-read-header-timeout`, `-http-read-timeout`,
+   `-http-write-timeout`, `-http-idle-timeout`, `-max-http-connections`,
+   `-max-peer-connections`) — see `docs/upgrades.md` §8c. This is the
+   **only** default-behavior change this release makes; every other
+   new flag defaults to exactly `v0.5.0`'s prior behavior.
+
+### Added
+
+- Bounded admission control: a four-lane model (client writes, client
+  reads, control-plane admin, maintenance) with per-lane concurrency
+  ceilings, a bounded waiting room, and a stable `503`/`Reason`/
+  `Retry-After` contract — `internal/admission`, wired through
+  `internal/node` and `internal/sql`.
+- Disk/heap resource-pressure sampling and a `Healthy`/`LowSpace`/
+  `Critical` state machine with 10% de-escalation hysteresis, tightening
+  or refusing client writes and triggering an immediate GC pass on
+  entering pressure.
+- MVCC version garbage collection for replicated mode: a leader-
+  proposed, Raft-replicated watermark, bounded and resumable per Apply
+  call (two independent bounds: keys examined, versions removed), with
+  read leases protecting a live transaction's snapshot from reclamation
+  out from under it. Ships disabled by default (`-gc-interval=0`).
+  `internal/fsm`'s generation-3 `AdvanceGCWatermark` control command;
+  `internal/version.MaxSupportedGeneration` 2 -> 3.
+- `ENOSPC` classification (`wal.ErrOutOfSpace`/`storage.ErrOutOfSpace`),
+  never conflated with a generic I/O error or a transaction conflict;
+  automatic recovery once space is freed, with no restart.
+- fsync-failure health: the Raft durable path still halts
+  unconditionally on a persist failure (unchanged since `v0.1.0`), now
+  classified and audited first; non-Raft-path failures (snapshot
+  creation, backup export, audit-log writes) mark the node
+  storage-unhealthy at a configurable consecutive-failure threshold
+  without halting, recovering automatically on the next success.
+  `/health` now reports `503` (not-ready) when a node is disk-`Critical`
+  or storage-unhealthy, while remaining alive.
+- Storage-integrity scrub: a read-only, rate-limited, admin-gated,
+  audited check (`POST /admin/storage/scrub`) of every retained WAL
+  segment, snapshot file, and the audit-log hash chain, reporting
+  findings without ever repairing them.
+- WAL/snapshot retention knobs (`-wal-retain-extra-segments`,
+  `-snapshot-retain-count`) shrinking the window in which a lagging
+  follower must fall back to a full snapshot transfer.
+- New metrics: see `docs/observability.md` §2.1a/§10 for the complete
+  list (`chronicledb_storage_health`, `chronicledb_mvcc_*`,
+  `chronicledb_scrub_*`, `chronicledb_fsync_failures_total{path=...}`,
+  `chronicledb_requestid_outcomes`, and others).
+- New `docs/admission-control.md` and `docs/storage-lifecycle.md`
+  operator guides, `ADR-0019`/`ADR-0020`/`ADR-0021`, and ten new
+  `docs/invariants.md` entries.
+
+### Fixed
+
+- A crash-injection facility (`internal/node/faultpoint.go`) exposed a
+  real ordering bug in `maybeSnapshot`'s snapshot-file pruning: a crash
+  between the new snapshot becoming durable and the old one being
+  pruned could, on a specific interleaving, leave zero valid snapshots
+  on disk. Pruning now runs strictly after every other durability step
+  in the sequence has completed.
+- The pressure state machine's first draft escalated straight to
+  `Critical` on a disk-usage probe failure (a transient sampling error)
+  instead of `LowSpace`, rejecting all client writes rather than merely
+  tightening them — caught by a dedicated fail-safe-direction test
+  before it shipped.
+- `Config.setDefaults` silently overrode an explicit, deliberate zero
+  value for a GC tuning field with its non-zero package default,
+  defeating a caller's own explicit "0 means off/strict" configuration.
+
 ## [0.5.0] - 2026-09-20
 
 Dynamic Membership — the fourth phase of the

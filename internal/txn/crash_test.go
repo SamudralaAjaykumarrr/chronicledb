@@ -287,7 +287,7 @@ func TestRestart_VersionOrderingPreserved(t *testing.T) {
 // arbitrary StartSeq without going through a full Txn (useful for
 // probing intermediate historical snapshots directly).
 func (m *Manager) readAt(key string, startSeq uint64) ([]byte, bool, error) {
-	v, ok := m.fsm.Store().Visible(key, startSeq)
+	v, ok, _ := m.fsm.Store().Visible(key, startSeq)
 	return v, ok, nil
 }
 

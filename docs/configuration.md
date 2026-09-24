@@ -79,6 +79,77 @@ read-only dry run.
 |---|---|---|
 | `-upgrade-precheck` | No | Dry-run only: query an already-running node's HTTP control-plane address (`host:port`) for `/admin/upgrade/precheck` and print the result, then exit. Never opens `-datadir` and never calls `node.Open`. Plain HTTP only in this release — see [`docs/upgrades.md`](upgrades.md) §7. |
 
+### Admission control flags (`v0.6.0`, `docs/admission-control.md`)
+
+See [`docs/admission-control.md`](admission-control.md) for the full
+four-lane model, the `503` `reason` vocabulary, and sizing guidance.
+Every default below reproduces `v0.5.0`'s exact observable behavior
+unless noted; `0` is a startup error for every concurrency-ceiling flag
+here (there is no "unlimited" admission configuration), never merely
+"use the default."
+
+| Flag | Required | Meaning |
+|---|---|---|
+| `-max-inflight-proposals` | No (default `256`) | Lane B write concurrency, and the event-loop `len(waiters)` ceiling. |
+| `-max-concurrent-reads` | No (default `512`) | Lane B `BeginReadIndex` concurrency, and the event-loop `len(pendingReads)` ceiling. |
+| `-max-live-read-leases` | No (default `4096`) | Ceiling on simultaneously live read leases. |
+| `-admission-queue-depth` | No (default `256`) | Lane B waiting-room capacity beyond the concurrency limits above (`0` = reject immediately, never wait — a legitimate permanent configuration, not merely unset). |
+| `-admission-max-wait` | No (default `500ms`) | Upper bound on queued wait before `queue_timeout` (`0` = bounded only by the caller's own context). |
+| `-max-admin-concurrency` | No (default `2`) | Lane A1 (control: membership, upgrade precheck/finalize, TLS reload) concurrency. |
+| `-max-maintenance-concurrency` | No (default `2`) | Lane A2 (maintenance: backup, scrub) concurrency; each kind is additionally single-slot. |
+| `-max-peer-connections` | No (default `64`) | Bounded accept on the Raft peer listener (`0` = unlimited, `v0.5.0` behavior). |
+| `-peer-idle-timeout` | No (default `60s`) | Read deadline on an inbound peer connection, re-armed per frame (`0` = no deadline, `v0.5.0` behavior). |
+| `-disk-pressure-threshold` | No (default `""`, off) | Free-space floor (absolute `2GiB` or percentage `10%`) below which admission tightens. `""` disables disk-pressure admission entirely. |
+| `-disk-critical-threshold` | No (default `""`, off) | Free-space floor below which client writes are refused outright. Must be strictly less than `-disk-pressure-threshold`, and requires it to also be set. |
+| `-max-heap-bytes` | No (default `0`, off) | Heap ceiling above which admission tightens exactly as disk `LowSpace` does — an admission threshold, never an allocator limit (set `GOMEMLIMIT` for that). |
+| `-resource-poll-interval` | No (default `5s`) | Disk/heap pressure sampling cadence. |
+| `-max-http-connections` | No (default `1024`) | Bounded accept on the control-plane HTTP listener (`0` = unlimited). |
+| `-http-read-header-timeout` | No (default `5s`) | `http.Server.ReadHeaderTimeout`. |
+| `-http-read-timeout` | No (default `30s`) | `http.Server.ReadTimeout`. |
+| `-http-write-timeout` | No (default `60s`) | `http.Server.WriteTimeout`. |
+| `-http-idle-timeout` | No (default `120s`) | `http.Server.IdleTimeout`. |
+
+**`v0.6.0`'s one default-behavior change**: the four `-http-*-timeout`
+flags and the two `-max-*-connections` flags are **on by default** —
+"no timeouts at all" was never a behavior worth preserving
+compatibility with. Every other flag in both new tables on this page
+defaults to exactly `v0.5.0`'s prior, unbounded/off behavior. See
+[`docs/upgrades.md`](upgrades.md) §8c.
+
+**Not yet exposed as a flag**: `docs/v0.6.0-plan.md` §10.1 also
+specifies `-max-concurrent-transactions`/`-max-concurrent-sql-statements`
+binding `internal/sql`'s own statement-admission gate
+(`internal/sql/engine.go`'s `newSQLGate`), with "both flags set together"
+as a startup error. The gate itself exists and is wired into
+`internal/sql`, but `cmd/chronicledb-node` does not yet register either
+flag — the gate always uses its built-in default
+(`defaultMaxConcurrentSQLStatements = 256`), not independently
+configurable in this release. See [`docs/sql.md`](sql.md) §8.
+
+### Storage lifecycle flags (`v0.6.0`, `docs/storage-lifecycle.md`)
+
+See [`docs/storage-lifecycle.md`](storage-lifecycle.md) for the GC
+model, retention knobs, the disk-full state machine, and the scrub
+runbook.
+
+| Flag | Required | Meaning |
+|---|---|---|
+| `-gc-interval` | No (default `0`, disabled) | How often the leader evaluates and, if warranted, proposes a GC watermark advance. `0` disables GC entirely — `v0.6.0` ships with GC off by default. |
+| `-gc-min-retain-seqs` | No (default `1024`) | Lag floor: the proposed watermark never exceeds `appliedCommitSeq` minus this. |
+| `-gc-min-advance-seqs` | No (default `256`) | Do not propose a watermark *advance* unless it would advance by at least this much (does not gate a continuation pass at an unchanged watermark). |
+| `-gc-max-versions-per-pass` | No (default `4096`) | Bound on versions *removed* by one `AdvanceGCWatermark` Apply. |
+| `-gc-max-keys-per-pass` | No (default `16384`) | Bound on keys *examined* by one `AdvanceGCWatermark` Apply. |
+| `-wal-retain-extra-segments` | No (default `0`) | Stop WAL segment compaction this many otherwise-eligible segments early, giving a lagging follower more time to catch up by log replication instead of a full `InstallSnapshot`. `0` is exactly `v0.5.0`'s behavior. |
+| `-snapshot-retain-count` | No (default `1`) | How many of the newest snapshot files to retain on disk (must be `>= 1`). `1` is exactly `v0.5.0`'s behavior. |
+| `-fsync-failure-threshold` | No (default `3`) | Consecutive non-Raft-path (snapshot/backup/audit) fsync failures before this node marks itself storage-unhealthy. |
+| `-scrub-bytes-per-sec` | No (default `64MiB`) | `POST /admin/storage/scrub`'s combined WAL+snapshot+audit read-rate cap. `0` = unlimited. |
+
+`-wal-retain-extra-segments` and `-snapshot-retain-count` already
+existed as of `v0.6.0` slice 10 (retention knobs landed before the rest
+of the storage-lifecycle flags); they are listed here together with
+the newer ones because they belong to the same operator-facing surface
+`docs/storage-lifecycle.md` documents as a whole.
+
 ## Example: a real three-node cluster on one machine
 
 Three separate `-datadir` values and three separate ports, run as

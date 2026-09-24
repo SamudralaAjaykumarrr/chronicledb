@@ -220,6 +220,20 @@ internal/benchutil           Phase 9: a latency-percentile recorder
                           used only by benchmarks/tests (docs/
                           benchmarks.md), never by production code.
 
+internal/admission            `v0.6.0`: bounded-capacity admission
+                          primitives (Gate, the Reason rejection
+                          vocabulary, resource-pressure sampling
+                          types). A leaf package — depends only on
+                          internal/metrics and the standard library, so
+                          it introduces no new dependency direction any
+                          other package must avoid; imported by
+                          internal/node (the four-lane admission model)
+                          and internal/sql (the standalone statement
+                          gate). Never imports internal/raft,
+                          internal/node, or internal/fsm — it knows
+                          nothing about proposals, leadership, or
+                          replicated state. See docs/admission-control.md.
+
 internal/backup              `v0.3.0`; modified by `v0.5.0` (Dynamic
                           Membership, docs/dynamic-membership-plan.md
                           §7.6): self-contained backup export/restore
@@ -244,6 +258,16 @@ exist):
   ordered commands to state.
 - `internal/mvcc` **must not** import anything beyond the standard
   library. It has no knowledge of networking, SQL, or Raft.
+  **`v0.6.0`**: it now carries a GC watermark (`Store.gcWatermark`),
+  but the watermark is set only from `internal/fsm.
+  ApplyAdvanceGCWatermark` (via `Store.SetGCWatermark`) — never from
+  `internal/node` directly, and never from the leader-local pressure/
+  cadence decision that proposes advancing it. The decision to *propose*
+  a new watermark is leader-local and pressure-aware; the actual
+  *mutation* happens only inside the replicated `Apply` path, so every
+  replica computes the identical watermark from the identical committed
+  command (the `DETERMINISM BOUNDARY` argument — see
+  [`ADR-0020`](adr/0020-mvcc-gc-replicated-watermark.md)).
 - `internal/wal` **must not** know about SQL syntax, transactions, or
   Raft semantics — it frames and persists opaque byte records.
 - `internal/sql` (Phase 8, now implemented) **must not** bypass

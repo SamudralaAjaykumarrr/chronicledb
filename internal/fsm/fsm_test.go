@@ -30,7 +30,7 @@ func TestApplyCommitsNonConflicting(t *testing.T) {
 	if outcome.Status != StatusCommitted || outcome.CommitSeq != 1 {
 		t.Fatalf("outcome = %+v, want Committed CommitSeq=1", outcome)
 	}
-	v, found := f.Store().Visible("K", 1)
+	v, found, _ := f.Store().Visible("K", 1)
 	if !found || string(v) != "v1" {
 		t.Fatalf("Visible(K,1) = %q,%v, want v1,true", v, found)
 	}
@@ -49,7 +49,7 @@ func TestApplyConflictAborts(t *testing.T) {
 	if outcome.ConflictKey != "K" || outcome.ConflictLatestSeq != 1 {
 		t.Fatalf("outcome = %+v, want ConflictKey=K ConflictLatestSeq=1", outcome)
 	}
-	v, found := f.Store().Visible("K", 2)
+	v, found, _ := f.Store().Visible("K", 2)
 	if !found || string(v) != "first" {
 		t.Fatalf("Visible(K,2) = %q,%v, want first,true (loser's write must not apply)", v, found)
 	}
@@ -74,7 +74,7 @@ func TestIdempotentRetrySameOutcomeNoReapply(t *testing.T) {
 	}
 
 	chain := f.Store()
-	v, found := chain.Visible("K", 1)
+	v, found, _ := chain.Visible("K", 1)
 	if !found || string(v) != "v1" {
 		t.Fatalf("Visible(K,1) = %q,%v, want v1,true", v, found)
 	}
@@ -210,8 +210,8 @@ func TestDeterministicReplayEquivalence(t *testing.T) {
 
 	for _, key := range []string{"A", "B", "C"} {
 		for _, seq := range []uint64{0, 1, 2, 3, 4, 5} {
-			v1, ok1 := f1.Store().Visible(key, seq)
-			v2, ok2 := f2.Store().Visible(key, seq)
+			v1, ok1, _ := f1.Store().Visible(key, seq)
+			v2, ok2, _ := f2.Store().Visible(key, seq)
 			if ok1 != ok2 || string(v1) != string(v2) {
 				t.Fatalf("key %q at StartSeq %d diverged: (%q,%v) vs (%q,%v)", key, seq, v1, ok1, v2, ok2)
 			}

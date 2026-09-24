@@ -74,6 +74,18 @@ const (
 	// three roles) rather than the stricter admin-only precedent of the
 	// three mutating endpoints above.
 	EndpointMembershipStatus = "admin.membership.status"
+	// EndpointStorageScrub gates POST /admin/storage/scrub
+	// (docs/v0.6.0-plan.md §21.1: "admin role only, audited") — a full
+	// scrub reads (and rate-limits reading) every retained WAL segment
+	// and snapshot file, the kind of bulk, resource-consuming operation
+	// this project's RBAC model reserves for admin, like /fault and
+	// membership changes.
+	EndpointStorageScrub = "admin.storage.scrub"
+	// EndpointStorageStatus gates GET /admin/storage/status
+	// (docs/v0.6.0-plan.md §21.1: "operator+, read-only") — the last
+	// scrub's report, a read-only diagnostic like
+	// EndpointMembershipStatus.
+	EndpointStorageStatus = "admin.storage.status"
 )
 
 // AllEndpoints lists every endpoint the decision table below covers —
@@ -88,6 +100,7 @@ var AllEndpoints = []string{
 	EndpointBackup,
 	EndpointUpgradePrecheck, EndpointUpgradeFinalize,
 	EndpointMembershipAdd, EndpointMembershipPromote, EndpointMembershipRemove, EndpointMembershipStatus,
+	EndpointStorageScrub, EndpointStorageStatus,
 }
 
 // AllRoles lists every fixed V1 role.
@@ -130,6 +143,11 @@ var decisionTable = map[string]map[Role]bool{
 	EndpointMembershipPromote: {RoleAdmin: true, RoleOperator: false, RoleReadOnly: false},
 	EndpointMembershipRemove:  {RoleAdmin: true, RoleOperator: false, RoleReadOnly: false},
 	EndpointMembershipStatus:  {RoleAdmin: true, RoleOperator: true, RoleReadOnly: true},
+	// §21.1: scrub is admin-only (a bulk, rate-limited read of every
+	// retained file); its last report is operator+ read-only, mirroring
+	// EndpointMembershipStatus's own status/action split.
+	EndpointStorageScrub:  {RoleAdmin: true, RoleOperator: false, RoleReadOnly: false},
+	EndpointStorageStatus: {RoleAdmin: true, RoleOperator: true, RoleReadOnly: false},
 }
 
 // Allowed reports whether role may call endpoint, per the fixed V1 RBAC

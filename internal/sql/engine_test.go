@@ -171,7 +171,11 @@ func TestMergeScanSharedHelperDeterministicOrder(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("ApplyCommit: %v", err)
 	}
-	kvs := mergeScan("p/", 1, store, nil)
+	committed, err := store.ScanVisible("p/", 1)
+	if err != nil {
+		t.Fatalf("ScanVisible: %v", err)
+	}
+	kvs := mergeLocalWrites("p/", committed, nil)
 	if len(kvs) != 3 {
 		t.Fatalf("got %d results, want 3", len(kvs))
 	}

@@ -30,6 +30,22 @@ A release artifact is a binary that **compiles** for that
 `scripts/build-release.sh`. It does not mean the binary has been run,
 tested, or benchmarked on that platform — only Linux amd64 has.
 
+## Disk-pressure admission (`v0.6.0`)
+
+`internal/storage.DiskUsage` (`docs/admission-control.md` §6.2,
+`-disk-pressure-threshold`/`-disk-critical-threshold`) is build-tag
+gated: `diskusage_unix.go` (`//go:build unix`, `syscall.Statfs`-based)
+covers Linux and Darwin; `diskusage_unsupported.go`
+(`//go:build !unix`, including Windows) always returns
+`ErrDiskUsageUnsupported`, and `internal/node.Open` refuses to start if
+either threshold flag is set on such a platform (fail-closed at
+configuration time, never a silently-inert protection). Per the
+platform table above, only Linux amd64 is actually developed and
+tested against — disk-pressure admission on Darwin is, like every
+other Darwin behavior in this document, believed-correct by code
+inspection (same `syscall.Statfs` code path as Linux) but not
+independently verified.
+
 ## Storage/filesystem assumptions
 
 `internal/storage`/`internal/wal`'s durability contract
