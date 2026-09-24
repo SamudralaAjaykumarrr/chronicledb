@@ -169,25 +169,45 @@ func TestCrashInjection_HandleInstallSnapshotThreePoints_SL26(t *testing.T) {
 				t.Fatalf("restarted follower reports a fatal error: %v", err)
 			}
 
-			// Let the cluster fully re-converge: the restarted node must
-			// finish catching up (by replay or a fresh InstallSnapshot;
-			// either is legitimate) and every node must quiesce on one
-			// applied index before the byte-comparison below.
-			awaitCondition(t, 20*time.Second, "restarted follower converges on the leader's applied index", func() bool {
-				return restarted.Status().AppliedIndex == leader.Status().AppliedIndex
-			})
-			awaitCondition(t, 10*time.Second, "restarted follower converges on the leader's GC watermark", func() bool {
-				return restarted.FSM().GCWatermark() == leader.FSM().GCWatermark()
-			})
-
-			if got, want := restarted.FSM().Store().GCWatermark(), restarted.FSM().GCWatermark(); got != want {
-				t.Fatalf("restarted follower: Store.GCWatermark()=%d != FSM.GCWatermark()=%d (docs/v0.6.0-plan.md §15.2b), crash at FaultPoint %d", got, want, p)
+			// Let the cluster fully re-converge before the byte-comparison
+			// below. A two-step "wait for applied-index/GC-watermark
+			// equality, THEN separately re-read EncodeState()" check is a
+			// genuine TOCTOU race here: tc.pauseTicking() only freezes
+			// election ticks (node.go's tick() gates the election
+			// countdown behind electionTicksPaused, but calls
+			// maybeProposeGC unconditionally on its own gcIntervalTicks
+			// countdown), so gcTuningOverride's 15ms background GC
+			// proposer keeps committing continuation passes throughout —
+			// a pass can land on the leader between the equality polls
+			// above succeeding and the sequential EncodeState() reads
+			// below, before it replicates to the restarted follower.
+			// Mirror sl12_gc_chaos_test.go's checkConverged pattern: only
+			// a same-iteration, all-fresh-reads comparison is race-free.
+			ok := false
+			var mismatch string
+			deadline := time.Now().Add(20 * time.Second)
+			for time.Now().Before(deadline) {
+				wantIndex := leader.Status().AppliedIndex
+				wantState := leader.FSM().EncodeState()
+				mismatch = ""
+				switch {
+				case restarted.Status().AppliedIndex != wantIndex:
+					mismatch = fmt.Sprintf("restarted follower applied index not yet settled to leader's %d", wantIndex)
+				default:
+					if got, want := restarted.FSM().Store().GCWatermark(), restarted.FSM().GCWatermark(); got != want {
+						mismatch = fmt.Sprintf("restarted follower: Store.GCWatermark()=%d != FSM.GCWatermark()=%d (docs/v0.6.0-plan.md §15.2b)", got, want)
+					} else if got := restarted.FSM().EncodeState(); string(got) != string(wantState) {
+						mismatch = fmt.Sprintf("restarted follower's FSM.EncodeState() diverges from the leader's (len %d vs %d)", len(got), len(wantState))
+					}
+				}
+				if mismatch == "" {
+					ok = true
+					break
+				}
+				time.Sleep(5 * time.Millisecond)
 			}
-
-			leaderState := leader.FSM().EncodeState()
-			restartedState := restarted.FSM().EncodeState()
-			if string(leaderState) != string(restartedState) {
-				t.Fatalf("restarted follower's FSM.EncodeState() diverges from the leader's after a crash at FaultPoint %d (len %d vs %d)", p, len(restartedState), len(leaderState))
+			if !ok {
+				t.Fatalf("cluster never reached a stable converged instant within 20s after a crash at FaultPoint %d: %s", p, mismatch)
 			}
 
 			// The node must still work normally afterward: a fresh
