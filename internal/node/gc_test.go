@@ -304,6 +304,20 @@ func TestGCStateSurvivesLogReplayAndInstallSnapshotIdentically(t *testing.T) {
 	// sl12_gc_chaos_test.go's checkConverged helper documents and avoids
 	// for this same GC feature. Only a same-iteration, all-fresh-reads
 	// comparison is race-free; mirror that established pattern here.
+	//
+	// The §15.2b Store-vs-FSM watermark equality check (below) must live
+	// in this same retry loop, not in a separate pass after it exits:
+	// Store.GCWatermark() and FSM.gcWatermark are independently locked
+	// (internal/mvcc's Store.mu vs FSM's own mutex), and
+	// ApplyAdvanceGCWatermark sets the FSM field before it calls
+	// Store.SetGCWatermark() at the very end of the same Apply call
+	// (internal/fsm/gc.go). A continuation pass landing between two
+	// unsynchronized post-loop reads — FSM already advanced,
+	// Store not yet — produces exactly the off-by-one-pass mismatch this
+	// loop guards against (surfaced once in CI: node n3
+	// Store.GCWatermark()=32 != FSM.GCWatermark()=33). Checking it inside
+	// the loop means a mismatched iteration just retries like any other,
+	// instead of being a hard failure taken from an unsettled instant.
 	ok := false
 	var mismatch string
 	deadline := time.Now().Add(10 * time.Second)
@@ -311,10 +325,16 @@ func TestGCStateSurvivesLogReplayAndInstallSnapshotIdentically(t *testing.T) {
 		wantIndex := leader.Status().AppliedIndex
 		wantState := leader.FSM().EncodeState()
 		mismatch = ""
+		if got, want := leader.FSM().Store().GCWatermark(), leader.FSM().GCWatermark(); got != want {
+			mismatch = fmt.Sprintf("leader: Store.GCWatermark()=%d != FSM.GCWatermark()=%d (docs/v0.6.0-plan.md §15.2b equality)", got, want)
+		}
 		for _, follower := range []struct {
 			id    raft.NodeID
 			label string
 		}{{replayFollower, "replay-follower"}, {snapshotFollower, "snapshot-follower"}} {
+			if mismatch != "" {
+				break
+			}
 			n := tc.node(follower.id)
 			if n.Status().AppliedIndex != wantIndex {
 				mismatch = fmt.Sprintf("%s applied index not yet settled to leader's %d", follower.label, wantIndex)
@@ -323,6 +343,10 @@ func TestGCStateSurvivesLogReplayAndInstallSnapshotIdentically(t *testing.T) {
 			got := n.FSM().EncodeState()
 			if string(got) != string(wantState) {
 				mismatch = fmt.Sprintf("%s FSM.EncodeState() diverges from leader's (len %d vs %d)", follower.label, len(got), len(wantState))
+				break
+			}
+			if got, want := n.FSM().Store().GCWatermark(), n.FSM().GCWatermark(); got != want {
+				mismatch = fmt.Sprintf("%s: Store.GCWatermark()=%d != FSM.GCWatermark()=%d (docs/v0.6.0-plan.md §15.2b equality)", follower.label, got, want)
 				break
 			}
 		}
@@ -334,12 +358,5 @@ func TestGCStateSurvivesLogReplayAndInstallSnapshotIdentically(t *testing.T) {
 	}
 	if !ok {
 		t.Fatalf("cluster never reached a stable converged instant within 10s: %s", mismatch)
-	}
-
-	for _, id := range []raft.NodeID{leaderID, replayFollower, snapshotFollower} {
-		n := tc.node(id)
-		if got, want := n.FSM().Store().GCWatermark(), n.FSM().GCWatermark(); got != want {
-			t.Fatalf("node %s: Store.GCWatermark()=%d != FSM.GCWatermark()=%d (docs/v0.6.0-plan.md §15.2b equality)", id, got, want)
-		}
 	}
 }
