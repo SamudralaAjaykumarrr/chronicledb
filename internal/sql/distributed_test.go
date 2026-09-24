@@ -262,6 +262,33 @@ func TestDistributedSQLSnapshotCompactionSurvivesRestart(t *testing.T) {
 	leaderID := c.awaitLeader(10 * time.Second)
 	leader := c.nodes[leaderID]
 
+	// This test holds leader across a real multi-round-trip sequence
+	// (CREATE TABLE + 20 INSERTs) that deliberately crosses
+	// SnapshotThreshold=5 several times over — each crossing triggers a
+	// real, synchronous, fsync-heavy internal/snapshot creation on the
+	// event loop (docs/snapshots.md), which is exactly the class of
+	// operation documented (internal/node's mustFinalizeToMax, 82397b4;
+	// internal/sql's own finalizeSQLClusterToGeneration2) as able to
+	// occasionally blow even configFor's snapshot-scaled election
+	// budget (30 ticks/10ms, ample for ordinary fsync latency but not
+	// for a follower descheduled on a loaded host) and trigger a
+	// legitimate re-election — which would depose leader mid-loop and
+	// surface here as "not leader (leader unknown)," indistinguishable
+	// from this test's own point of view from a real defect. Freeze the
+	// election clock across the whole sequence instead of widening that
+	// budget, exactly as those two precedents do; heartbeat ticks keep
+	// running so the follower's own replication/catch-up/snapshot-
+	// creation and the later crash/restart/catch-up phase are
+	// unaffected.
+	for _, n := range c.nodes {
+		n.PauseTicksForTest()
+	}
+	defer func() {
+		for _, n := range c.nodes {
+			n.ResumeTicksForTest()
+		}
+	}()
+
 	s := NewSession(NewReplicatedEngine(leader))
 	mustExec(t, s, "CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)", "create")
 	for i := 0; i < rows; i++ {
